@@ -20,17 +20,9 @@ echo "==> Creating kind cluster..."
 kind create cluster --name kropath-test --config "${SCRIPT_DIR}/fixtures/kind-config.yaml"
 
 echo "==> Installing kro operator (v0.9.2)..."
-helm repo add kro https://kro.run/charts
-helm repo update kro
-helm install kro kro/kro --version 0.9.2 \
-  --namespace kro-system \
-  --create-namespace \
-  --wait
+kubectl create namespace kro-system
+kubectl apply -f https://github.com/kubernetes-sigs/kro/releases/download/v0.9.2/kro-core-install-manifests.yaml
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
-
-echo "==> Installing kropath-controller (pinned bae1953)..."
-kubectl apply -f https://raw.githubusercontent.com/kropath/kropath-controller/bae1953888518fd04851598c794a56ca3303b038/deploy/install.yaml
-kubectl rollout status deployment/kropath-controller -n kropath-system --timeout=120s
 
 echo "==> Installing ACK IAM CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/iam/"
