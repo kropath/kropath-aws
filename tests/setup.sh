@@ -28,6 +28,10 @@ helm install kro kro/kro --version 0.9.2 \
   --wait
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
 
+echo "==> Installing kropath-controller (pinned bae1953)..."
+kubectl apply -f https://raw.githubusercontent.com/kropath/kropath-controller/bae1953888518fd04851598c794a56ca3303b038/deploy/install.yaml
+kubectl rollout status deployment/kropath-controller -n kropath-system --timeout=120s
+
 echo "==> Installing ACK IAM CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/iam/"
 
