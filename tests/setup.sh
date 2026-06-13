@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "==> Creating kind cluster..."
+kind create cluster --name kropath-test --config "${SCRIPT_DIR}/fixtures/kind-config.yaml"
+
+echo "==> Installing kro operator (v0.9.2)..."
+helm repo add kro https://kro.run/charts
+helm repo update kro
+helm install kro kro/kro --version 0.9.2 \
+  --namespace kro-system \
+  --create-namespace \
+  --wait
+kubectl rollout status deployment/kro -n kro-system --timeout=120s
+
+echo "==> Installing kropath-controller (pinned bae1953)..."
+kubectl apply -f https://raw.githubusercontent.com/kropath/kropath-controller/bae1953888518fd04851598c794a56ca3303b038/deploy/install.yaml
+kubectl rollout status deployment/kropath-controller -n kropath-system --timeout=120s
+
+echo "==> Installing ACK IAM CRD definitions..."
+kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/iam/"
+
+echo "==> Installing ACK EKS CRD definitions..."
+kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/eks/"
+
+echo "==> Test environment ready."
