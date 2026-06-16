@@ -30,4 +30,7 @@ kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/iam/"
 echo "==> Installing ACK EKS CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/eks/"
 
+echo "==> Installing ACK S3 CRD definitions..."
+kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/s3/"
+
 echo "==> Test environment ready."
