@@ -1,0 +1,190 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-iam-02 Chainsaw tests for AWSIAMRole.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awsiamrole
+spec:
+  steps:
+    - name: seed-effective-config
+      try:
+        - apply:
+            file: 00-awsiamconfig.yaml
+        - script:
+            content: |
+              kubectl patch awsiamconfig role-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"team":"platform"}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    - name: ec2-role-with-instance-profile
+      try:
+        - apply:
+            file: 01-ec2-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ec2-role
+                namespace: default
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ec2-role
+              spec:
+                name: default-ec2-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies:
+                  - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: InstanceProfile
+              metadata:
+                name: ec2-role
+                namespace: default
+              spec:
+                name: default-ec2-role
+                role: default-ec2-role
+
+    - name: lambda-role-standard-metadata
+      try:
+        - apply:
+            file: 02-lambda-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: lambda-role
+                namespace: default
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: lambda-role
+                  kropath.run/environment: production
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                  kropath.run/team: platform
+                ownerReferences:
+                  - apiVersion: kropath.run/v1alpha1
+                    kind: AWSIAMRole
+                    name: lambda-role
+                    controller: true
+              spec:
+                name: default-lambda-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies:
+                  - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+                tags:
+                  - key: kropath.run/environment
+                    value: production
+                  - key: kropath.run/team
+                    value: platform
+
+
+    - name: eks-role-variants
+      try:
+        - apply:
+            file: 03-eks-irsa-role.yaml
+        - apply:
+            file: 04-eks-pod-identity-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: irsa-role
+                namespace: default
+              spec:
+                name: default-irsa-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::123:oidc-provider/oidc.eks.ap-southeast-2.amazonaws.com/id/EXAMPLE"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"sts.amazonaws.com:sub":"system:serviceaccount:payments-prod:app"}}}]}'
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: podid-role
+                namespace: default
+              spec:
+                clusterName: my-cluster
+                namespace: ns
+                serviceAccount: sa
+                roleARN: arn:aws:iam::123456789012:role/default-podid-role
+
+    - name: policy-document-refs
+      try:
+        - apply:
+            file: 05-policy-document.yaml
+        - apply:
+            file: 06-policy-document-trust.yaml
+        - apply:
+            file: 07-policy-ref.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ref-role
+                namespace: default
+              spec:
+                name: default-ref-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sts.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                inlinePolicies:
+                  inline-read: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"*"}]}'
+
+    - name: policy-arn-reference
+      try:
+        - apply:
+            file: 08-my-policy.yaml
+        - script:
+            content: |
+              kubectl patch awsiampolicy my-policy -n default \
+                --subresource=status --type=merge \
+                -p '{"status":{"arn":"arn:aws:iam::123456789012:policy/MyPolicy"}}'
+        - apply:
+            file: 09-policy-ref-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: policy-ref-role
+                namespace: default
+              spec:
+                name: default-policy-ref-role
+                policies:
+                  - arn: arn:aws:iam::123456789012:policy/MyPolicy
+
+  cleanup:
+    - delete:
+        file: 09-policy-ref-role.yaml
+    - delete:
+        file: 08-my-policy.yaml
+    - delete:
+        file: 07-policy-ref.yaml
+    - delete:
+        file: 06-policy-document-trust.yaml
+    - delete:
+        file: 05-policy-document.yaml
+    - delete:
+        file: 04-eks-pod-identity-role.yaml
+    - delete:
+        file: 03-eks-irsa-role.yaml
+    - delete:
+        file: 02-lambda-role.yaml
+    - delete:
+        file: 01-ec2-role.yaml
+    - delete:
+        file: 00-awsiamconfig.yaml
