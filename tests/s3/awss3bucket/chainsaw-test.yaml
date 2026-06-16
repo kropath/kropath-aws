@@ -1,0 +1,317 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# AWSS3Bucket core RGD tests.
+# Each test scenario runs against a dedicated namespace supplied by Chainsaw.
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awss3bucket-core-encryption-public-access
+spec:
+  steps:
+    - name: apply-rgd-and-config
+      try:
+        - script:
+            content: |
+              kubectl apply -f ../../../rgds/awss3bucket.kropath.run.yaml
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Config
+              metadata:
+                name: general-policy
+                namespace: default
+              spec:
+                mandatory: {}
+                defaults: {}
+              EOF
+              kubectl patch awss3config general-policy -n default --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":true,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionAlgorithm":"aws:kms","kmsKeyArn":"","blockPublicAccess":true,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Bucket
+              metadata:
+                name: core-bucket
+                namespace: default
+              spec:
+                configRef: general-policy
+                nameOverride: ""
+                deletionPolicy: retain
+                region: ""
+                tags: {}
+                syncedLabels: {}
+                syncedAnnotations: {}
+                encryption:
+                  algorithm: ""
+                  kmsKeyArn: ""
+                  bucketKeyEnabled: true
+                blockPublicAccess: true
+                versioning: ""
+                enforceHttpsOnly: false
+                objectOwnership: BucketOwnerEnforced
+              EOF
+    - name: assert-encryption-and-public-access
+      try:
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: core-bucket
+                namespace: default
+              spec:
+                encryption:
+                  rules:
+                    - applyServerSideEncryptionByDefault:
+                        sseAlgorithm: aws:kms
+                      bucketKeyEnabled: true
+                publicAccessBlock:
+                  blockPublicACLs: true
+                  blockPublicPolicy: true
+                  ignorePublicACLs: true
+                  restrictPublicBuckets: true
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awss3bucket-naming-region-versioning-https
+spec:
+  steps:
+    - name: apply-rgd-and-config
+      try:
+        - script:
+            content: |
+              kubectl apply -f ../../../rgds/awss3bucket.kropath.run.yaml
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Config
+              metadata:
+                name: general-policy
+                namespace: default
+              spec:
+                mandatory: {}
+                defaults: {}
+              EOF
+              kubectl patch awss3config general-policy -n default --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"Enabled","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":true,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - script:
+            content: |
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Bucket
+              metadata:
+                name: artifacts
+                namespace: default
+              spec:
+                configRef: general-policy
+                nameOverride: ""
+                deletionPolicy: retain
+                region: ap-southeast-2
+                tags: {}
+                syncedLabels: {}
+                syncedAnnotations: {}
+                encryption:
+                  algorithm: ""
+                  kmsKeyArn: ""
+                  bucketKeyEnabled: true
+                blockPublicAccess: false
+                versioning: Suspended
+                enforceHttpsOnly: false
+                objectOwnership: BucketOwnerEnforced
+              EOF
+    - name: assert-naming-region-versioning-https
+      try:
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Bucket
+              metadata:
+                name: artifacts
+                namespace: default
+              status:
+                resourceName: default-artifacts-123456789012
+                namingStatus: valid
+                predictedArn: arn:aws:s3:::default-artifacts-123456789012
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: artifacts
+                namespace: default
+              spec:
+                createBucketConfiguration:
+                  locationConstraint: ap-southeast-2
+                versioning:
+                  status: Enabled
+                policy: '{"Version":"2012-10-17","Statement":[{"Sid":"DenyNonTLSAccess","Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::default-artifacts-123456789012","arn:aws:s3:::default-artifacts-123456789012/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}]}'
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awss3bucket-tags-labels-annotations
+spec:
+  steps:
+    - name: apply-rgd-and-config
+      try:
+        - script:
+            content: |
+              kubectl apply -f ../../../rgds/awss3bucket.kropath.run.yaml
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Config
+              metadata:
+                name: general-policy
+                namespace: default
+              spec:
+                mandatory: {}
+                defaults: {}
+              EOF
+              kubectl patch awss3config general-policy -n default --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"team":"data"}},"defaults":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{"team":"storage"},"syncedLabels":{"data-class":"internal"},"syncedAnnotations":{"runbook":"https://example.invalid"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Bucket
+              metadata:
+                name: tagged-bucket
+                namespace: default
+              spec:
+                configRef: general-policy
+                nameOverride: ""
+                deletionPolicy: retain
+                region: ""
+                tags:
+                  app: data-pipeline
+                syncedLabels: {}
+                syncedAnnotations: {}
+                encryption:
+                  algorithm: ""
+                  kmsKeyArn: ""
+                  bucketKeyEnabled: true
+                blockPublicAccess: false
+                versioning: ""
+                enforceHttpsOnly: false
+                objectOwnership: BucketOwnerEnforced
+              EOF
+    - name: assert-tags-labels-annotations
+      try:
+        - script:
+            content: |
+              python3 - <<'PY'
+              import json, subprocess, sys
+              raw = subprocess.check_output([
+                  "kubectl", "get", "bucket", "tagged-bucket", "-n", "default", "-o", "json"
+              ])
+              obj = json.loads(raw)
+              labels = obj["metadata"].get("labels", {})
+              annotations = obj["metadata"].get("annotations", {})
+              tagset = {item["key"]: item["value"] for item in obj["spec"]["tagging"]["tagSet"]}
+              expected_label = "production"
+              if labels.get("kropath.run/environment") != expected_label:
+                  raise SystemExit("missing synced label environment")
+              if labels.get("kropath.run/data-class") != "internal":
+                  raise SystemExit("missing synced label data-class")
+              if annotations.get("kropath.run/team") != "data":
+                  raise SystemExit("missing synced annotation team")
+              if annotations.get("kropath.run/runbook") != "https://example.invalid":
+                  raise SystemExit("missing synced annotation runbook")
+              for key, value in {
+                  "cost-centre": "platform",
+                  "team": "storage",
+                  "app": "data-pipeline",
+                  "environment": "production",
+                  "data-class": "internal",
+                  "runbook": "https://example.invalid",
+              }.items():
+                  if tagset.get(key) != value:
+                      raise SystemExit(f"missing tag {key}={value}")
+              PY
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awss3bucket-metadata-ownership-deletion-policy
+spec:
+  steps:
+    - name: apply-rgd-and-config
+      try:
+        - script:
+            content: |
+              kubectl apply -f ../../../rgds/awss3bucket.kropath.run.yaml
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Config
+              metadata:
+                name: general-policy
+                namespace: default
+              spec:
+                mandatory: {}
+                defaults: {}
+              EOF
+              kubectl patch awss3config general-policy -n default --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              cat <<'EOF' | kubectl apply -f -
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSS3Bucket
+              metadata:
+                name: locked-bucket
+                namespace: default
+              spec:
+                configRef: general-policy
+                nameOverride: ""
+                deletionPolicy: delete
+                region: ""
+                tags: {}
+                syncedLabels: {}
+                syncedAnnotations: {}
+                encryption:
+                  algorithm: ""
+                  kmsKeyArn: ""
+                  bucketKeyEnabled: true
+                blockPublicAccess: false
+                versioning: ""
+                enforceHttpsOnly: false
+                objectOwnership: ObjectWriter
+              EOF
+    - name: assert-metadata-and-ownership
+      try:
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: locked-bucket
+                namespace: default
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: locked-bucket
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+                ownerReferences:
+                  - apiVersion: kropath.run/v1alpha1
+                    kind: AWSS3Bucket
+                    name: locked-bucket
+                    controller: true
+                    blockOwnerDeletion: true
+              spec:
+                objectOwnership: ObjectWriter
+                ownershipControls:
+                  rules:
+                    - objectOwnership: ObjectWriter
