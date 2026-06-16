@@ -1,0 +1,108 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awsiamrole-boundary-and-naming
+spec:
+  steps:
+    - name: seed-boundary-effective-config
+      try:
+        - apply:
+            file: 00-awsiamconfig-boundary.yaml
+        - script:
+            content: |
+              kubectl patch awsiamconfig boundary-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"arn:aws:iam::123456789012:policy/OrgBoundary","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"arn:aws:iam::123456789012:policy/DefaultBoundary","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":7200,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    - name: mandatory-boundary-wins-and-duration-clamps
+      try:
+        - apply:
+            file: 08-boundary-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: boundary-role
+                namespace: default
+              spec:
+                name: default-boundary-role
+                permissionsBoundary: arn:aws:iam::123456789012:policy/OrgBoundary
+                maxSessionDuration: 3600
+
+    - name: defaults-boundary-can-be-opted-out
+      try:
+        - apply:
+            file: 09-boundary-optout-role.yaml
+        - script:
+            content: |
+              boundary="$(kubectl get role boundary-optout-role -n default -o jsonpath='{.spec.permissionsBoundary}')"
+              test -z "$boundary"
+
+    - name: nameoverride-bypasses-template
+      try:
+        - apply:
+            file: 10-nameoverride-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: nameoverride-role
+                namespace: default
+              spec:
+                name: custom-role-name
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMRole
+              metadata:
+                name: nameoverride-role
+                namespace: default
+              status:
+                resourceName: custom-role-name
+                predictedArn: arn:aws:iam::123456789012:role/custom-role-name
+
+    - name: unresolved-tag-token-flags-invalid-name
+      try:
+        - script:
+            content: |
+              kubectl patch awsiamconfig boundary-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 11-invalid-naming-role.yaml
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMRole
+              metadata:
+                name: invalid-naming-role
+                namespace: default
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+  cleanup:
+    - delete:
+        file: 11-invalid-naming-role.yaml
+    - delete:
+        file: 10-nameoverride-role.yaml
+    - delete:
+        file: 09-boundary-optout-role.yaml
+    - delete:
+        file: 08-boundary-role.yaml
+    - delete:
+        file: 00-awsiamconfig-boundary.yaml

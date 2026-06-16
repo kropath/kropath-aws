@@ -1,0 +1,271 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: awsiamrole.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: kropath.run
+    kind: AWSIAMRole
+    scope: Namespaced
+    spec:
+      configRef: string | default="general-policy"
+      type: string | required=true
+      description: string | default=""
+      nameOverride: string | default=""
+      deletionPolicy: string | default="retain" enum="retain,delete"
+      tags: "map[string]string | default={}"
+      syncedLabels: "map[string]string | default={}"
+      syncedAnnotations: "map[string]string | default={}"
+      policies: "[]RolePolicy | default=[]"
+      inlinePolicies: "[]InlinePolicy | default=[]"
+      trustPolicyRef: string | default=""
+      permissionsBoundaryArn: string | default=""
+      oidcProviderArn: string | default=""
+      serviceAccountNamespace: string | default=""
+      serviceAccountName: string | default=""
+      clusterName: string | default=""
+      servicePrincipal: string | default=""
+      trustPolicyJSON: string | default=""
+      addSsmPolicy: boolean | default=true
+      addEcsExecutionPolicy: boolean | default=true
+      addLambdaBasicPolicy: boolean | default=true
+      createInstanceProfile: boolean | default=true
+      maxSessionDuration: integer | default=0 minimum=0 maximum=43200
+    types:
+      RolePolicy:
+        arn: string | default=""
+        ref: string | default=""
+        inline:
+          name: string | default=""
+          documentJSON: string | default=""
+          documentRef: string | default=""
+      InlinePolicy:
+        name: string | required=true
+        documentRef: string | required=true
+    status:
+      resourceName: "${variables.effectiveName}"
+      namingStatus: "${variables._namingValid ? \"valid\" : \"invalid-unresolved-tokens\"}"
+      predictedArn: "${variables.predictedArn}"
+      conditions: "${role.status.conditions}"
+    additionalPrinterColumns:
+      - name: Type
+        type: string
+        jsonPath: .spec.type
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+      - name: Naming
+        type: string
+        jsonPath: .status.namingStatus
+  resources:
+    - id: role
+      includeWhen:
+        - ${variables._namingValid}
+      template:
+        apiVersion: iam.services.k8s.aws/v1alpha1
+        kind: Role
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name} + variables.prefixedSyncedLabels}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy} + variables.prefixedSyncedAnnotations}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMRole
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${variables.effectiveName}
+          description: ${schema.spec.description}
+          assumeRolePolicyDocument: ${variables.effectiveTrustPolicyJSON}
+          permissionsBoundary: >-
+            ${variables.effectiveBoundary != "" ? variables.effectiveBoundary : omit()}
+          maxSessionDuration: ${variables.effectiveMaxSession}
+          policies: ${variables.managedPolicyArns}
+          inlinePolicies: ${variables.inlinePolicyMap}
+          tags: >-
+            ${variables.sortedCloudMetadataKeys.transformList(i, key, {key: key, value: variables.allCloudMetadata.?[key].orValue("")})}
+
+    - id: instanceProfile
+      includeWhen:
+        - ${variables._namingValid && schema.spec.type == "ec2" && schema.spec.createInstanceProfile}
+      template:
+        apiVersion: iam.services.k8s.aws/v1alpha1
+        kind: InstanceProfile
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name} + variables.prefixedSyncedLabels}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy} + variables.prefixedSyncedAnnotations}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMRole
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${variables.effectiveName}
+          role: ${variables.effectiveName}
+
+    - id: podIdentityAssociation
+      includeWhen:
+        - ${variables._namingValid && schema.spec.type == "eks-pod-identity"}
+      template:
+        apiVersion: eks.services.k8s.aws/v1alpha1
+        kind: PodIdentityAssociation
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name} + variables.prefixedSyncedLabels}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy} + variables.prefixedSyncedAnnotations}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMRole
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          clusterName: ${schema.spec.clusterName}
+          namespace: ${schema.spec.serviceAccountNamespace}
+          serviceAccount: ${schema.spec.serviceAccountName}
+          roleARN: ${variables.predictedArn}
+
+  variables:
+    _rsrcCfg: "${resources.get(schema.metadata.namespace, \"AWSIAMConfig\", schema.spec.configRef)}"
+    effCfg: "${variables._rsrcCfg.status.effectiveConfig}"
+
+    mergedTags: >-
+      ${variables.effCfg.mandatory.tags + schema.spec.tags + variables.effCfg.defaults.tags}
+    mergedSyncedLabels: >-
+      ${variables.effCfg.mandatory.syncedLabels + schema.spec.syncedLabels + variables.effCfg.defaults.syncedLabels}
+    mergedSyncedAnnotations: >-
+      ${variables.effCfg.mandatory.syncedAnnotations + schema.spec.syncedAnnotations + variables.effCfg.defaults.syncedAnnotations}
+    prefixedSyncedLabels: >-
+      ${variables.mergedSyncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v})}
+    prefixedSyncedAnnotations: >-
+      ${variables.mergedSyncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v})}
+    allCloudMetadata: >-
+      ${variables.mergedTags + variables.prefixedSyncedLabels + variables.prefixedSyncedAnnotations}
+    sortedCloudMetadataKeys: >-
+      ${variables.allCloudMetadata.transformList(k, v, k).sort()}
+
+    effectiveBoundary: >-
+      ${variables.effCfg.mandatory.permissionsBoundaryArn != ""
+        ? variables.effCfg.mandatory.permissionsBoundaryArn
+        : (schema.spec.permissionsBoundaryArn == "none"
+            ? ""
+            : (schema.spec.permissionsBoundaryArn != ""
+                ? schema.spec.permissionsBoundaryArn
+                : variables.effCfg.defaults.permissionsBoundaryArn))}
+
+    _instanceDuration: >-
+      ${schema.spec.maxSessionDuration != 0
+        ? schema.spec.maxSessionDuration
+        : variables.effCfg.defaults.maxSessionDurationSeconds}
+    effectiveMaxSession: >-
+      ${variables.effCfg.mandatory.maxSessionDurationSeconds > 0
+        && variables._instanceDuration > variables.effCfg.mandatory.maxSessionDurationSeconds
+        ? variables.effCfg.mandatory.maxSessionDurationSeconds
+        : (variables._instanceDuration > 0 ? variables._instanceDuration : 3600)}
+
+    _namingTemplate: >-
+      ${variables.effCfg.mandatory.namingTemplate != ""
+        ? variables.effCfg.mandatory.namingTemplate
+        : variables.effCfg.defaults.namingTemplate}
+    effectiveName: >-
+      ${schema.spec.nameOverride != ""
+        ? schema.spec.nameOverride
+        : (variables._namingTemplate != ""
+            ? variables._namingTemplate
+                .split("{tag.")
+                .transformList(i, part,
+                  i == 0 ? part
+                         : ((variables.mergedTags.?[part.split("}")[0]].orValue("") != ""
+                              ? variables.mergedTags.?[part.split("}")[0]].orValue("")
+                              : "{tag." + part.split("}")[0] + "}") +
+                            (size(part.split("}")) > 1
+                              ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                              : "")))
+                .join("")
+                .replace("{name}", schema.metadata.name)
+                .replace("{namespace}", schema.metadata.namespace)
+                .replace("{account_id}", variables.effCfg.aws.accountId ?? "")
+                .replace("{region}", variables.effCfg.aws.region ?? "")
+                .replace("{configRef}", schema.spec.configRef)
+            : schema.metadata.name)}
+    _namingValid: "${!variables.effectiveName.contains(\"{\")}"
+    predictedArn: >-
+      ${"arn:aws:iam::" + (variables.effCfg.aws.accountId ?? "") + ":role/" + variables.effectiveName}
+
+    ec2TrustPolicy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+    ecsTaskTrustPolicy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+    lambdaTrustPolicy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+    podIdentityTrustPolicy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    effectiveTrustPolicyJSON: >-
+      ${schema.spec.trustPolicyRef != ""
+        ? resources.get(schema.metadata.namespace, "AWSPolicyDocument", schema.spec.trustPolicyRef).spec.documentJSON
+        : (schema.spec.type == "ec2"
+            ? variables.ec2TrustPolicy
+            : (schema.spec.type == "ecs-task"
+                ? variables.ecsTaskTrustPolicy
+                : (schema.spec.type == "lambda"
+                    ? variables.lambdaTrustPolicy
+                    : (schema.spec.type == "eks-irsa"
+                        ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"' + schema.spec.oidcProviderArn + '"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"sts.amazonaws.com:sub":"system:serviceaccount:' + schema.spec.serviceAccountNamespace + ':' + schema.spec.serviceAccountName + '"}}}]}'
+                        : (schema.spec.type == "eks-pod-identity"
+                            ? variables.podIdentityTrustPolicy
+                            : (schema.spec.type == "aws-service"
+                                ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"' + schema.spec.servicePrincipal + '"},"Action":"sts:AssumeRole"}]}'
+                                : schema.spec.trustPolicyJSON)))))}
+
+    managedPolicyArns: >-
+      ${(
+        (schema.spec.type == "ec2" && schema.spec.addSsmPolicy
+          ? ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+          : []) +
+        (schema.spec.type == "ecs-task" && schema.spec.addEcsExecutionPolicy
+          ? ["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"]
+          : []) +
+        (schema.spec.type == "lambda" && schema.spec.addLambdaBasicPolicy
+          ? ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
+          : []) +
+        schema.spec.policies.filter(p, p.arn != "" || p.ref != "").transformList(i, p,
+          p.arn != "" ? p.arn : resources.get(schema.metadata.namespace, "AWSIAMPolicy", p.ref).status.arn)
+      )}
+    inlinePolicyMap: >-
+      ${(
+        schema.spec.inlinePolicies +
+        schema.spec.policies.filter(p, p.inline.name != "").transformList(i, p, p.inline)
+      ).transformMapEntry(i, p,
+        {p.name: (p.documentRef != ""
+          ? resources.get(schema.metadata.namespace, "AWSPolicyDocument", p.documentRef).spec.documentJSON
+          : p.documentJSON)})}
