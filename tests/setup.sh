@@ -33,4 +33,7 @@ kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/eks/"
 echo "==> Installing ACK S3 CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/s3/"
 
+echo "==> Installing kro RBAC grants for AWS S3 graphs..."
+kubectl apply -f "${SCRIPT_DIR}/fixtures/rbac/"
+
 echo "==> Test environment ready."
