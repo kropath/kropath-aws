@@ -18,15 +18,15 @@
 #
 # Environment variables:
 #   ACK_SERVICES   Space-separated list of ACK services (default: see below)
-#   ACK_VERSION    ACK chart version prefix, e.g. "v1" (default: v1)
-#   SKIP_ACK       Set to "true" to skip ACK CRD installation
+#   ACK_CHART_VERSION    ACK chart version prefix, e.g. "v1"
+#   SKIP_ACK       Set to "true" to skip ACK CRD installation (default: false)
 #   SKIP_KCC       Set to "true" to skip KCC CRD installation (default: true)
 #   SKIP_ASO       Set to "true" to skip ASO CRD installation (default: true)
 
 set -euo pipefail
 
-ACK_SERVICES="${ACK_SERVICES:-s3 iam ec2 eks rds elasticache sqs sns}"
-ACK_VERSION="${ACK_VERSION:-v1}"
+ACK_SERVICES="${ACK_SERVICES:-s3 iam}"
+ACK_CHART_VERSION="${ACK_CHART_VERSION:-}"
 SKIP_ACK="${SKIP_ACK:-false}"
 SKIP_KCC="${SKIP_KCC:-true}"
 SKIP_ASO="${SKIP_ASO:-true}"
@@ -34,16 +34,29 @@ SKIP_ASO="${SKIP_ASO:-true}"
 ACK_REGISTRY="public.ecr.aws/aws-controllers-k8s"
 ACK_NAMESPACE="ack-system"
 
+resolve_ack_chart_version() {
+  local svc="$1"
+
+  if [[ -n "${ACK_CHART_VERSION}" ]]; then
+    echo "${ACK_CHART_VERSION}"
+    return 0
+  fi
+
+  curl -fsSL "https://api.github.com/repos/aws-controllers-k8s/${svc}-controller/releases/latest" \
+    | jq -r '.tag_name | ltrimstr("v")'
+}
+
 # ── ACK CRDs ──────────────────────────────────────────────────────────────────
 if [ "${SKIP_ACK}" = "false" ]; then
   echo "Installing ACK CRDs (services: ${ACK_SERVICES})..."
   kubectl create namespace "${ACK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
   for service in ${ACK_SERVICES}; do
+    version=$(resolve_ack_chart_version "${service}")
     echo "  -> ACK ${service}..."
     # Extract CRDs only from the Helm chart (no controller pod required locally).
     helm show crds "oci://${ACK_REGISTRY}/${service}-chart" \
-      --version "${ACK_VERSION}" 2>/dev/null \
+      --version "${version}" 2>/dev/null \
       | kubectl apply --server-side -f - \
       || echo "    WARNING: Could not install ACK CRDs for ${service} — chart may not exist at this version."
   done
