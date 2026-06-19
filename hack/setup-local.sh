@@ -23,9 +23,9 @@ set -euo pipefail
 
 CLUSTER_NAME="kro-aws"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KRO_VERSION="${KRO_VERSION:-v0.3.0}"
-SKIP_KRO=false
-SKIP_CRDS=false
+KRO_VERSION="${KRO_VERSION:-0.9.2}"
+SKIP_KRO="${SKIP_KRO:-false}"
+SKIP_CRDS="${SKIP_CRDS:-false}"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 for arg in "$@"; do
@@ -63,10 +63,10 @@ echo "Waiting for all nodes to be Ready..."
 kubectl wait --for=condition=Ready nodes --all --timeout=120s
 
 # ── kro installation ──────────────────────────────────────────────────────────
-if [ "${SKIP_KRO}" = false ]; then
+if [ "${SKIP_KRO}" = "false" ]; then
   echo "Installing kro ${KRO_VERSION}..."
-  helm upgrade --install kro \
-    "oci://ghcr.io/awslabs/kro/charts/kro" \
+  helm install kro \
+    "oci://registry.k8s.io/kro/charts/kro" \
     --version "${KRO_VERSION}" \
     --namespace kro \
     --create-namespace \
