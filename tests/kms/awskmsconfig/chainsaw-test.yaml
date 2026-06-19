@@ -1,0 +1,252 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-kms-01 Chainsaw tests — one scenario per acceptance criterion.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awskmsconfig
+spec:
+  steps:
+    - name: ac1-general-policy-accepted
+      try:
+        - apply:
+            file: 01-general-policy.yaml
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: general-policy
+                namespace: kro-system
+              spec:
+                defaults:
+                  enableKeyRotation: true
+                  keySpec: SYMMETRIC_DEFAULT
+                  keyUsage: ENCRYPT_DECRYPT
+                  namingTemplate: "{namespace}-{name}"
+      cleanup:
+        - delete:
+            file: 01-general-policy.yaml
+
+    - name: ac2-reject-both-tiers-keyspec
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              tmp_err="$(mktemp)"
+              if kubectl apply -f 02-invalid-both-tiers-keyspec.yaml > /tmp/awskmsconfig-ac2.out 2>"${tmp_err}"; then
+                echo "expected kubectl apply to fail" >&2
+                cat "${tmp_err}" >&2
+                exit 1
+              fi
+              grep -F "keySpec cannot be set in both mandatory and defaults" "${tmp_err}"
+
+    - name: ac3-reject-both-tiers-rotation
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              tmp_err="$(mktemp)"
+              if kubectl apply -f 03-invalid-both-tiers-rotation.yaml > /tmp/awskmsconfig-ac3.out 2>"${tmp_err}"; then
+                echo "expected kubectl apply to fail" >&2
+                cat "${tmp_err}" >&2
+                exit 1
+              fi
+              grep -F "enableKeyRotation cannot be set to true in both mandatory and defaults" "${tmp_err}"
+
+    - name: ac4-reject-both-tiers-allowedkeys
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              tmp_err="$(mktemp)"
+              if kubectl apply -f 04-invalid-both-tiers-allowedkeys.yaml > /tmp/awskmsconfig-ac4.out 2>"${tmp_err}"; then
+                echo "expected kubectl apply to fail" >&2
+                cat "${tmp_err}" >&2
+                exit 1
+              fi
+              grep -F "allowedKeySpecs cannot be set in both mandatory and defaults" "${tmp_err}"
+
+    - name: ac5-reject-both-tiers-keyusage
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              tmp_err="$(mktemp)"
+              if kubectl apply -f 05-invalid-both-tiers-keyusage.yaml > /tmp/awskmsconfig-ac5.out 2>"${tmp_err}"; then
+                echo "expected kubectl apply to fail" >&2
+                cat "${tmp_err}" >&2
+                exit 1
+              fi
+              grep -F "keyUsage cannot be set in both mandatory and defaults" "${tmp_err}"
+
+    - name: ac6-effectiveconfig-merges-global-local-configs
+      try:
+        - apply:
+            file: 06-global-kropathconfig.yaml
+        - apply:
+            file: 07-global-general-policy.yaml
+        - apply:
+            file: 08-payments-prod-namespace.yaml
+        - apply:
+            file: 09-local-general-policy.yaml
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: general-policy
+                namespace: payments-prod
+              status:
+                effectiveConfig:
+                  mandatory:
+                    enableKeyRotation: true
+                  defaults:
+                    enableKeyRotation: true
+                    namingTemplate: "{namespace}-{name}"
+            timeout: 60s
+
+    - name: ac7-naming-template-propagates
+      try:
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: general-policy
+                namespace: payments-prod
+              status:
+                effectiveConfig:
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+            timeout: 60s
+
+    - name: ac8-pci-profile-accepted
+      try:
+        - apply:
+            file: 10-pci.yaml
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: pci
+                namespace: kro-system
+              spec:
+                mandatory:
+                  enableKeyRotation: true
+                  allowedKeySpecs:
+                    - SYMMETRIC_DEFAULT
+                    - RSA_4096
+                  tags:
+                    classification: pci
+      cleanup:
+        - delete:
+            file: 10-pci.yaml
+
+    - name: ac9-invalid-keyspec-not-in-allowed-list
+      try:
+        - apply:
+            file: 11-invalid-pci.yaml
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: pci
+                namespace: kro-system
+              status:
+                conditions:
+                  - type: Valid
+                    status: "False"
+                    reason: InvalidKeySpecNotInAllowedList
+            timeout: 60s
+        - script:
+            content: |
+              set -euo pipefail
+              valid_message="$(kubectl get awskmsconfig pci -n kro-system -o jsonpath='{.status.conditions[?(@.type=="Valid")].message}')"
+              test "$(kubectl get awskmsconfig pci -n kro-system -o jsonpath='{.status.conditions[?(@.type=="Valid")].status}')" = "False"
+              test "$(kubectl get awskmsconfig pci -n kro-system -o jsonpath='{.status.conditions[?(@.type=="Valid")].reason}')" = "InvalidKeySpecNotInAllowedList"
+              printf '%s' "${valid_message}" | grep -F "RSA_2048"
+              printf '%s' "${valid_message}" | grep -F "SYMMETRIC_DEFAULT"
+              test -z "$(kubectl get awskmsconfig pci -n kro-system -o jsonpath='{.status.effectiveConfig}' 2>/dev/null)"
+      cleanup:
+        - delete:
+            file: 11-invalid-pci.yaml
+
+    - name: ac10-tags-merge-and-kropathconfig-wins
+      try:
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: general-policy
+                namespace: payments-prod
+              status:
+                effectiveConfig:
+                  mandatory:
+                    tags:
+                      cost-centre: security
+                      key-type: encryption
+                  defaults:
+                    tags:
+                      team: platform
+            timeout: 60s
+
+    - name: ac11-synced-labels-propagate-through-effectiveconfig
+      try:
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: general-policy
+                namespace: payments-prod
+              status:
+                effectiveConfig:
+                  mandatory:
+                    syncedLabels:
+                      data-class: restricted
+            timeout: 60s
+      cleanup:
+        - delete:
+            file: 09-local-general-policy.yaml
+        - delete:
+            file: 08-payments-prod-namespace.yaml
+        - delete:
+            file: 07-global-general-policy.yaml
+        - delete:
+            file: 06-global-kropathconfig.yaml
+
+    - name: ac12-dev-profile-accepts-zero-key-spec-and-empty-allowlist
+      try:
+        - apply:
+            file: 12-dev.yaml
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSConfig
+              metadata:
+                name: dev
+                namespace: kro-system
+              spec:
+                defaults:
+                  enableKeyRotation: true
+                  keySpec: ""
+                  allowedKeySpecs: []
+      cleanup:
+        - delete:
+            file: 12-dev.yaml
