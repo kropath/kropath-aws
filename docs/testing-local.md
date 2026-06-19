@@ -55,7 +55,7 @@ The cluster is defined in `hack/kind-config.yaml`:
 - **Name**: `kro-aws`
 - **Topology**: 1 control-plane node + 2 worker nodes
 - **Context**: `kind-kro-aws`
-- **Port mappings**: `8080->80`, `8443->443` for ingress testing
+- **Port mappings**: `18080->80`, `18443->443` for ingress testing
 
 To create or recreate the cluster manually:
 
