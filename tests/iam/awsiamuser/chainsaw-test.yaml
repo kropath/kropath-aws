@@ -1,0 +1,533 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-iam-06 Chainsaw tests.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: awsiamuser
+spec:
+  steps:
+    - name: seed-config
+      try:
+        - apply:
+            file: 00-awsiamconfig.yaml
+
+    - name: ac1-no-access-key-default
+      try:
+        - apply:
+            file: 01-user-default.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: basic-user
+                namespace: default
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: basic-user
+              spec:
+                name: default-basic-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: basic-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+        - script:
+            content: |
+              kubectl get secret basic-user-access-key -n default >/dev/null 2>&1
+              test $? -ne 0
+
+    - name: ac2-access-key-created
+      try:
+        - apply:
+            file: 02-user-access-key.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: key-user
+                namespace: default
+              spec:
+                name: default-key-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: key-user-access-key
+                namespace: default
+                ownerReferences:
+                  - apiVersion: kropath.run/v1alpha1
+                    kind: AWSIAMUser
+                    name: key-user
+                    controller: true
+              type: Opaque
+              data:
+                accessKeyId: QUtJQUVYQU1QTEUwMDAwMDAwMA==
+                secretAccessKey: c2VjcmV0LWFjY2Vzcy1rZXktZXhhbXBsZS0wMDAwMDA=
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: key-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac3-access-key-blocked-global
+      try:
+        - script:
+            content: |
+              kubectl patch awsiamconfig user-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":true,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 03-user-access-key-blocked.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: blocked-user
+                namespace: default
+              spec:
+                name: default-blocked-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: blocked-user
+                namespace: default
+              status:
+                accessKeyBlocked: true
+                conditions:
+                  - type: AccessKeyBlockedByGovernance
+                    status: "True"
+        - script:
+            content: |
+              kubectl get secret blocked-user-access-key -n default >/dev/null 2>&1
+              test $? -ne 0
+
+    - name: ac4-access-key-blocked-namespace
+      try:
+        - script:
+            content: |
+              kubectl patch awsiamconfig user-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":true,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 04-user-access-key-blocked-namespace.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: ns-blocked-user
+                namespace: default
+              spec:
+                name: default-ns-blocked-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: ns-blocked-user
+                namespace: default
+              status:
+                accessKeyBlocked: true
+                conditions:
+                  - type: AccessKeyBlockedByGovernance
+                    status: "True"
+
+    - name: ac5-no-access-key-requested
+      try:
+        - script:
+            content: |
+              kubectl patch awsiamconfig user-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":true,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 05-user-no-access-key-blocked.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: no-key-user
+                namespace: default
+              spec:
+                name: default-no-key-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: no-key-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac6-groups-declared
+      try:
+        - apply:
+            file: 06-user-groups.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: ops-user
+                namespace: default
+                annotations:
+                  kropath.run/groups: ops-admins
+              spec:
+                name: default-ops-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: ops-user
+                namespace: default
+              spec:
+                groups:
+                  - ops-admins
+              status:
+                accessKeyBlocked: false
+
+    - name: ac7-managed-policy-arn
+      try:
+        - apply:
+            file: 07-user-policy-arn.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: arn-user
+                namespace: default
+              spec:
+                name: default-arn-user
+                path: "/"
+                policies:
+                  - arn: arn:aws:iam::aws:policy/ReadOnlyAccess
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: arn-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac8-policy-ref
+      try:
+        - apply:
+            file: 16-team-policy.yaml
+        - script:
+            content: |
+              kubectl patch awsiampolicy team-policy -n default --subresource=status --type=merge -p '{"status":{"arn":"arn:aws:iam::123456789012:policy/team-read"}}'
+        - apply:
+            file: 08-user-policy-ref.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: ref-user
+                namespace: default
+              spec:
+                name: default-ref-user
+                path: "/"
+                policies:
+                  - arn: arn:aws:iam::123456789012:policy/team-read
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: ref-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac9-inline-policy-json
+      try:
+        - apply:
+            file: 09-user-inline-policy-json.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: inline-json-user
+                namespace: default
+              spec:
+                name: default-inline-json-user
+                path: "/"
+                policies: []
+                inlinePolicies:
+                  s3-write: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"*"}]}'
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: inline-json-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac9b-inline-policy-ref
+      try:
+        - apply:
+            file: 17-team-policy-doc.yaml
+        - apply:
+            file: 10-user-inline-policy-ref.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: inline-ref-user
+                namespace: default
+              spec:
+                name: default-inline-ref-user
+                path: "/"
+                policies: []
+                inlinePolicies:
+                  s3-write: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}'
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: inline-ref-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac10-name-template
+      try:
+        - script:
+            content: |
+              kubectl patch awsiamconfig user-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 11-user-name-template.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: named-user
+                namespace: payments-prod
+              spec:
+                name: payments-prod-named-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: named-user
+                namespace: payments-prod
+              status:
+                resourceName: payments-prod-named-user
+                predictedArn: arn:aws:iam::123456789012:user/payments-prod-named-user
+
+    - name: ac11-tags-merge
+      try:
+        - script:
+            content: |
+              kubectl patch awsiamconfig user-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"team":"platform"}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 12-user-tags.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: tagged-user
+                namespace: default
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: tagged-user
+                  kropath.run/environment: production
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                  kropath.run/team: platform
+              spec:
+                name: default-tagged-user
+                path: "/"
+                tags:
+                  - key: team
+                    value: ops
+                  - key: cost-centre
+                    value: platform
+                  - key: kropath.run/environment
+                    value: production
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: tagged-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac12-synced-labels
+      try:
+        - script:
+            content: |
+              kubectl patch awsiamconfig user-general-policy -n kro-system \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{"kropath.run/environment":"production"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"team":"platform"}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 13-user-synced-labels.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: labels-user
+                namespace: default
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: labels-user
+                  kropath.run/environment: production
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                  kropath.run/team: platform
+              spec:
+                name: default-labels-user
+                path: "/"
+                tags:
+                  - key: kropath.run/environment
+                    value: production
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: labels-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac13-standard-metadata
+      try:
+        - apply:
+            file: 14-user-standard-metadata.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: meta-user
+                namespace: default
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: meta-user
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: kropath.run/v1alpha1
+                    kind: AWSIAMUser
+                    name: meta-user
+                    controller: true
+              spec:
+                name: default-meta-user
+                path: "/"
+                policies: []
+                inlinePolicies: {}
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: meta-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
+
+    - name: ac14-access-key-secret-policy
+      try:
+        - apply:
+            file: 15-user-access-key-delete-policy.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: delete-user-access-key
+                namespace: default
+                ownerReferences:
+                  - apiVersion: kropath.run/v1alpha1
+                    kind: AWSIAMUser
+                    name: delete-user
+                    controller: true
+              type: Opaque
+              data:
+                accessKeyId: QUtJQUVYQU1QTEUwMDAwMDAwMA==
+                secretAccessKey: c2VjcmV0LWFjY2Vzcy1rZXktZXhhbXBsZS0wMDAwMDA=
+        - assert:
+            resource:
+              apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMUser
+              metadata:
+                name: delete-user
+                namespace: default
+              status:
+                accessKeyBlocked: false
