@@ -23,6 +23,43 @@ echo "==> Installing kro operator (v0.9.2)..."
 kubectl create namespace kro-system
 kubectl apply -f https://github.com/kubernetes-sigs/kro/releases/download/v0.9.2/kro-core-install-manifests.yaml
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
+kubectl apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kro:awss3bucket-watch
+rules:
+  - apiGroups:
+      - kropath.run
+    resources:
+      - buckets
+      - buckets/status
+      - awss3configs
+      - awss3configs/status
+      - awss3buckets
+      - awss3buckets/status
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+      - patch
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kro:awss3bucket-watch
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kro:awss3bucket-watch
+subjects:
+  - kind: ServiceAccount
+    name: kro
+    namespace: kro-system
+EOF
 
 echo "==> Installing ACK IAM CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/iam/"
