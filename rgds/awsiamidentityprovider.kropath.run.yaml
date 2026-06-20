@@ -1,0 +1,149 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: awsiamidentityprovider.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: kropath.run
+    kind: AWSIAMIdentityProvider
+    scope: Namespaced
+    spec:
+      configRef: string | default="general-policy"
+      type: string | required=true enum="oidc,saml"
+      nameOverride: string | default=""
+      deletionPolicy: string | default="retain" enum="retain,delete"
+      oidc: OIDCIdentityProviderSpec
+      saml: SAMLIdentityProviderSpec
+      tags: "map[string]string | default={}"
+      syncedLabels: "map[string]string | default={}"
+      syncedAnnotations: "map[string]string | default={}"
+    types:
+      OIDCIdentityProviderSpec:
+        url: string | required=true pattern="^https://.*"
+        thumbprints: "[]string | required=true"
+        audiences: "[]string | default=[\"sts.amazonaws.com\"]"
+      SAMLIdentityProviderSpec:
+        metadataDocument: string | required=true
+    status:
+      resourceName: "${variables.effectiveName}"
+      namingStatus: "${variables._namingValid ? \"valid\" : \"invalid-unresolved-tokens\"}"
+      providerArn: >-
+        ${spec.type == "oidc"
+          ? provider.status.ackResourceMetadata.arn
+          : samlProvider.status.ackResourceMetadata.arn}
+      conditions: >-
+        ${spec.type == "oidc"
+          ? provider.status.conditions
+          : samlProvider.status.conditions}
+    additionalPrinterColumns:
+      - name: Type
+        type: string
+        jsonPath: .spec.type
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: ProviderArn
+        type: string
+        jsonPath: .status.providerArn
+      - name: Naming
+        type: string
+        jsonPath: .status.namingStatus
+  resources:
+    - id: provider
+      includeWhen:
+        - "${variables._namingValid && spec.type == \"oidc\"}"
+      template:
+        apiVersion: iam.services.k8s.aws/v1alpha1
+        kind: OpenIDConnectProvider
+        metadata:
+          name: "${metadata.name}"
+          namespace: "${metadata.namespace}"
+          labels: "${{\"app.kubernetes.io/managed-by\": \"kro\", \"app.kubernetes.io/instance\": metadata.name} + variables.mergedSyncedLabels}"
+          annotations: "${{\"services.k8s.aws/deletion-policy\": spec.deletionPolicy} + variables.mergedSyncedAnnotations}"
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMIdentityProvider
+              name: ${metadata.name}
+              uid: ${metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          url: "${spec.oidc.url}"
+          clientIDs: "${spec.oidc.audiences}"
+          thumbprints: "${spec.oidc.thumbprints}"
+          tags: "${variables.allCloudMetadata.transformList(k, v, {key: k, value: v})}"
+    - id: samlProvider
+      includeWhen:
+        - "${variables._namingValid && spec.type == \"saml\"}"
+      template:
+        apiVersion: iam.services.k8s.aws/v1alpha1
+        kind: SAMLProvider
+        metadata:
+          name: "${metadata.name}"
+          namespace: "${metadata.namespace}"
+          labels: "${{\"app.kubernetes.io/managed-by\": \"kro\", \"app.kubernetes.io/instance\": metadata.name} + variables.mergedSyncedLabels}"
+          annotations: "${{\"services.k8s.aws/deletion-policy\": spec.deletionPolicy} + variables.mergedSyncedAnnotations}"
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMIdentityProvider
+              name: ${metadata.name}
+              uid: ${metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          metadataDocument: "${spec.saml.metadataDocument}"
+          tags: "${variables.allCloudMetadata.transformList(k, v, {key: k, value: v})}"
+  variables:
+    _rsrcCfg: "${resources.get(metadata.namespace, \"AWSIAMConfig\", spec.configRef)}"
+    effCfg: "${variables._rsrcCfg.status.effectiveConfig}"
+    mergedTags: >-
+      ${variables.effCfg.mandatory.tags + spec.tags + variables.effCfg.defaults.tags}
+    _rawSyncedLabels: >-
+      ${variables.effCfg.mandatory.syncedLabels + spec.syncedLabels + variables.effCfg.defaults.syncedLabels}
+    _rawSyncedAnnotations: >-
+      ${variables.effCfg.mandatory.syncedAnnotations + spec.syncedAnnotations + variables.effCfg.defaults.syncedAnnotations}
+    mergedSyncedLabels: >-
+      ${variables._rawSyncedLabels.transformMapEntry(k, v, {("kropath.run/" + k): v})}
+    mergedSyncedAnnotations: >-
+      ${variables._rawSyncedAnnotations.transformMapEntry(k, v, {("kropath.run/" + k): v})}
+    allCloudMetadata: >-
+      ${variables.mergedTags + variables.mergedSyncedLabels + variables.mergedSyncedAnnotations}
+    _namingTemplate: >-
+      ${variables.effCfg.mandatory.namingTemplate != ""
+        ? variables.effCfg.mandatory.namingTemplate
+        : variables.effCfg.defaults.namingTemplate}
+    effectiveName: >-
+      ${spec.nameOverride != ""
+        ? spec.nameOverride
+        : (variables._namingTemplate != ""
+            ? variables._namingTemplate
+                .split("{tag.")
+                .transformList(i, part,
+                  i == 0 ? part
+                         : (variables.mergedTags.?[part.split("}")[0]].orValue("") +
+                            (size(part.split("}")) > 1
+                              ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                              : "")))
+                .join("")
+                .replace("{name}", metadata.name)
+                .replace("{namespace}", metadata.namespace)
+                .replace("{account_id}", variables.effCfg.aws.accountId ?? "")
+                .replace("{region}", variables.effCfg.aws.region ?? "")
+                .replace("{configRef}", spec.configRef)
+            : metadata.name)}
+    _namingValid: "${!variables.effectiveName.contains(\"{\")}"
