@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: setup teardown test test-iam
+.PHONY: setup teardown test test-iam test-kms
 
 setup:
 	./setup.sh
@@ -26,3 +26,6 @@ test: setup
 
 test-iam:
 	chainsaw test iam/ --parallel 4 --report-format junit --report-path test-results/
+
+test-kms:
+	chainsaw test kms/ --parallel 4 --report-format junit --report-path test-results/
