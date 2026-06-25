@@ -14,20 +14,38 @@
 # limitations under the License.
 set -euo pipefail
 
+CLUSTER_NAME="${CLUSTER_NAME:-kropath-aws-test}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "==> Creating kind cluster..."
-kind create cluster --name kropath-test --config "${SCRIPT_DIR}/fixtures/kind-config.yaml"
+if kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
+  echo "Kind cluster '${CLUSTER_NAME}' already exists — skipping creation."
+else
+  echo "Creating Kind cluster: ${CLUSTER_NAME}..."
+  kind create cluster --name "${CLUSTER_NAME}" --config "${SCRIPT_DIR}/fixtures/kind-config.yaml"
+fi
+
+kubectl config use-context "kind-${CLUSTER_NAME}"
+
+if kubectl get ns kro-system &>/dev/null; then
+  echo "Namespace 'kro-system' already exists — skipping kro operator installation."
+else
+  echo "Creating namespace 'kro-system'..."
+  kubectl create namespace kro-system
+fi
 
 echo "==> Installing kro operator (v0.9.2)..."
-kubectl create namespace kro-system
 kubectl apply -f https://github.com/kubernetes-sigs/kro/releases/download/v0.9.2/kro-core-install-manifests.yaml
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
 
-echo "==> Installing ACK IAM CRD definitions..."
-kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/iam/"
+echo "==> Installing ACK CRD definitions..."
+source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 
-echo "==> Installing ACK EKS CRD definitions..."
-kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/eks/"
+echo "==> Installing kropath CRD definitions..."
+kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
+kubectl apply -f "${SCRIPT_DIR}/../crds/policy/awspolicydocument.yaml"
+
+echo "==> Installing kropath.run RGDS definitions..."
+kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"
 
 echo "==> Test environment ready."

@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+CLUSTER_NAME ?= kropath-aws-test
+
 .PHONY: setup teardown test test-iam test-kms
 
 setup:
-	./setup.sh
+	./setup.sh $(CLUSTER_NAME)
 
 teardown:
-	./teardown.sh
+	./teardown.sh $(CLUSTER_NAME)
 
 test: setup
 	chainsaw test . --parallel 4 --report-format junit --report-path test-results/
