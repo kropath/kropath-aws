@@ -28,18 +28,27 @@ Three layers per provider. **kropath-controller** pre-merges all sources and wri
 
 ## CEL Cascade Pattern (ADR-010)
 
-**One `resources.get()` call per RGD.** Controller pre-merges; RGD reads `effCfg`:
+**One `externalRef` lookup per RGD.** Controller pre-merges; RGD reads `effCfg` from a config CR:
 
 ```cel
-variables._rsrcCfg: "${resources.get(metadata.namespace, \"AWSS3BucketConfig\", spec.configRef)}"
-variables.effCfg:   "${variables._rsrcCfg.status.effectiveConfig}"
+resources:
+- id: rsrcCfg
+  externalRef:
+    apiVersion: kropath.run/v1alpha1
+    kind: AWSS3BucketConfig
+    metadata:
+      name: ${schema.spec.configRef}
+      namespace: ${schema.metadata.namespace}
 
-variables.mergedTags: >-
-  ${variables.effCfg.mandatory.tags + spec.tags + variables.effCfg.defaults.tags}
+- id: ackResource
+  template:
+    spec:
+      tags: ${rsrcCfg.status.effectiveConfig.mandatory.tags + schema.spec.tags + rsrcCfg.status.effectiveConfig.defaults.tags}
 ```
 
 Access pattern: `effCfg.mandatory.*`, `effCfg.defaults.*`, `effCfg.aws.*`.
 Never `effCfg.spec.*`.
+Status definitions live under `spec.schema.status`, not `spec.status`.
 
 ## Naming Convention
 
