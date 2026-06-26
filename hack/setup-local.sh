@@ -77,6 +77,8 @@ else
   echo "Skipping kro installation (--skip-kro)."
 fi
 
+kubectl apply -f "${SCRIPT_DIR}/../tests/fixtures/rbac/kro-controller.yaml"
+
 # ── Provider CRDs ─────────────────────────────────────────────────────────────
 if [ "${SKIP_CRDS}" = false ]; then
   echo "Installing provider CRDs..."

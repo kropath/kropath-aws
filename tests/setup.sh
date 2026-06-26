@@ -36,6 +36,7 @@ fi
 
 echo "==> Installing kro operator (v0.9.2)..."
 kubectl apply -f https://github.com/kubernetes-sigs/kro/releases/download/v0.9.2/kro-core-install-manifests.yaml
+kubectl apply -f "${SCRIPT_DIR}/fixtures/rbac/kro-controller.yaml"
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
 
 echo "==> Installing ACK CRD definitions..."
