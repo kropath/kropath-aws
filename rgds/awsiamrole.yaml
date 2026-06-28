@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
----
 apiVersion: kro.run/v1alpha1
 kind: ResourceGraphDefinition
 metadata:
@@ -41,10 +40,10 @@ spec:
       clusterName: string | default=""
       servicePrincipal: string | default=""
       trustPolicyJSON: string | default=""
-      addSsmPolicy: boolean | default=true
-      addEcsExecutionPolicy: boolean | default=true
-      addLambdaBasicPolicy: boolean | default=true
-      createInstanceProfile: boolean | default=true
+      addSsmPolicy: boolean
+      addEcsExecutionPolicy: boolean
+      addLambdaBasicPolicy: boolean
+      createInstanceProfile: boolean
       maxSessionDuration: integer | default=0
     types:
       RolePolicy:
@@ -59,13 +58,15 @@ spec:
         documentRef: string | required=true
     status:
       resourceName: >-
-        ${role.metadata.name}
-      namingStatus: >-
-        ${has(role.status) ? "valid" : "pending"}
+        ${role.?spec.?name.orValue("")}
       predictedArn: >-
-        ${role.status.?ackResourceMetadata.?arn.orValue("")}
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) && role.?spec.?name.orValue("") != "" ? "arn:aws:iam::" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":role/" + role.spec.name : ""}
+      namingStatus: >-
+        ${role.?spec.?name.orValue("").contains("{") ? "invalid-unresolved-tokens" : ""}
+      validationError: >-
+        ${has(maxSessionDurationError.data) ? maxSessionDurationError.data.error : ""}
       conditions: >-
-        ${role.status.?conditions.orValue([])}
+        ${role.?status.?conditions.orValue([])}
     additionalPrinterColumns:
       - name: Type
         type: string
@@ -76,44 +77,56 @@ spec:
       - name: PredictedArn
         type: string
         jsonPath: .status.predictedArn
-      - name: Naming
+      - name: NamingStatus
         type: string
         jsonPath: .status.namingStatus
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
   resources:
     - id: rsrcCfg
       externalRef:
         apiVersion: kropath.run/v1alpha1
         kind: AWSIAMConfig
         metadata:
-          name: ${schema.?spec.?configRef.orValue("general-policy")}
           namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              kropath.run/config-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
     - id: trustDoc
-      includeWhen:
-        - "${has(schema.spec) && has(schema.spec.trustPolicyRef) && schema.spec.trustPolicyRef != \"\"}"
+      # No includeWhen — sentinel selector ensures variable is always bound as []
       externalRef:
         apiVersion: kropath.run/v1alpha1
         kind: AWSPolicyDocument
         metadata:
-          name: ${schema.spec.trustPolicyRef}
           namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              kropath.run/resource-name: '${schema.spec.trustPolicyRef != "" ? schema.spec.trustPolicyRef : "kro-empty-fallback-sentinel"}'
+
     - id: firstPolicyRef
-      includeWhen:
-        - "${has(schema.spec) && has(schema.spec.policies) && schema.spec.policies.size() > 0 && has(schema.spec.policies[0].ref) && schema.spec.policies[0].ref != \"\"}"
+      # No includeWhen — sentinel selector ensures variable is always bound as []
       externalRef:
         apiVersion: kropath.run/v1alpha1
         kind: AWSIAMPolicy
         metadata:
-          name: ${schema.spec.policies[0].ref}
           namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              kropath.run/resource-name: '${has(schema.spec.policies) && schema.spec.policies.size() > 0 && schema.spec.policies[0].?ref.orValue("") != "" ? schema.spec.policies[0].ref : "kro-empty-fallback-sentinel"}'
+
     - id: firstInlineDoc
-      includeWhen:
-        - "${has(schema.spec) && has(schema.spec.inlinePolicies) && schema.spec.inlinePolicies.size() > 0 && has(schema.spec.inlinePolicies[0].documentRef) && schema.spec.inlinePolicies[0].documentRef != \"\"}"
+      # No includeWhen — sentinel selector ensures variable is always bound as []
       externalRef:
         apiVersion: kropath.run/v1alpha1
         kind: AWSPolicyDocument
         metadata:
-          name: ${schema.spec.inlinePolicies[0].documentRef}
           namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              kropath.run/resource-name: '${has(schema.spec.inlinePolicies) && schema.spec.inlinePolicies.size() > 0 && schema.spec.inlinePolicies[0].?documentRef.orValue("") != "" ? schema.spec.inlinePolicies[0].documentRef : "kro-empty-fallback-sentinel"}'
+
     - id: role
       template:
         apiVersion: iam.services.k8s.aws/v1alpha1
@@ -123,14 +136,14 @@ spec:
           namespace: ${schema.metadata.namespace}
           labels: >-
             ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
-              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
-              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
-              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
-              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
           ownerReferences:
             - apiVersion: kropath.run/v1alpha1
               kind: AWSIAMRole
@@ -139,30 +152,73 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          name: "${schema.spec.nameOverride != \"\" ? schema.spec.nameOverride : schema.metadata.name}"
+          name: >-
+            ${schema.spec.nameOverride != "" ? schema.spec.nameOverride :
+              (rsrcCfg.size() > 0 &&
+                ((has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "") ||
+                 (has(rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate) && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")) ?
+                (has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "" ?
+                  rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate :
+                  rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate)
+                .replace("{namespace}", schema.metadata.namespace)
+                .replace("{name}", schema.metadata.name)
+                .replace("{account_id}", has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "")
+                .replace("{kind}", "awsiamrole") :
+                schema.metadata.name)}
           description: "${schema.spec.description}"
           assumeRolePolicyDocument: >-
-            ${has(schema.spec.trustPolicyRef) && schema.spec.trustPolicyRef != "" ? trustDoc.spec.documentJSON : 
-             (schema.spec.type == "ec2" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' : 
-             (schema.spec.type == "ecs-task" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' : 
-             (schema.spec.type == "lambda" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' : 
-             (schema.spec.type == "eks-irsa" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"' + schema.spec.?oidcProviderArn.orValue("") + '"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"sts.amazonaws.com:sub":"system:serviceaccount:' + schema.spec.?serviceAccountNamespace.orValue("") + ':' + schema.spec.?serviceAccountName.orValue("") + '"}}}]}' : 
-             (schema.spec.type == "eks-pod-identity" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' : 
-             (schema.spec.type == "aws-service" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"' + schema.spec.?servicePrincipal.orValue("") + '"},"Action":"sts:AssumeRole"}]}' : 
+            ${trustDoc.size() > 0 && trustDoc[0].?spec.orValue(null) != null ? trustDoc[0].spec.documentJSON : (
+             schema.spec.type == "ec2" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' :
+             (schema.spec.type == "ecs-task" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' :
+             (schema.spec.type == "lambda" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' :
+             (schema.spec.type == "eks-irsa" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"' + schema.spec.?oidcProviderArn.orValue("") + '"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"sts.amazonaws.com:sub":"system:serviceaccount:' + schema.spec.?serviceAccountNamespace.orValue("") + ':' + schema.spec.?serviceAccountName.orValue("") + '"}}}]}' :
+             (schema.spec.type == "eks-pod-identity" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' :
+             (schema.spec.type == "aws-service" ? '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"' + schema.spec.?servicePrincipal.orValue("") + '"},"Action":"sts:AssumeRole"}]}' :
              schema.spec.trustPolicyJSON))))))}
-          permissionsBoundary: "${rsrcCfg.status.effectiveConfig.mandatory.permissionsBoundaryArn != \"\" ? rsrcCfg.status.effectiveConfig.mandatory.permissionsBoundaryArn : (schema.spec.permissionsBoundaryArn == \"none\" ? \"\" : (schema.spec.permissionsBoundaryArn != \"\" ? schema.spec.permissionsBoundaryArn : rsrcCfg.status.effectiveConfig.defaults.permissionsBoundaryArn))}"
+          permissionsBoundary: '${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.permissionsBoundaryArn) && rsrcCfg[0].status.effectiveConfig.mandatory.permissionsBoundaryArn != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.permissionsBoundaryArn : (schema.spec.permissionsBoundaryArn == "none" ? "" : (schema.spec.permissionsBoundaryArn != "" ? schema.spec.permissionsBoundaryArn : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.permissionsBoundaryArn) ? rsrcCfg[0].status.effectiveConfig.defaults.permissionsBoundaryArn : "")))}'
           maxSessionDuration: >-
-            ${(rsrcCfg.status.effectiveConfig.mandatory.maxSessionDurationSeconds > 0 && schema.spec.maxSessionDuration > rsrcCfg.status.effectiveConfig.mandatory.maxSessionDurationSeconds ? rsrcCfg.status.effectiveConfig.mandatory.maxSessionDurationSeconds : (schema.spec.maxSessionDuration > 0 ? schema.spec.maxSessionDuration : 3600))}
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.maxSessionDurationSeconds) && rsrcCfg[0].status.effectiveConfig.mandatory.maxSessionDurationSeconds > 0 && schema.spec.maxSessionDuration > rsrcCfg[0].status.effectiveConfig.mandatory.maxSessionDurationSeconds ? rsrcCfg[0].status.effectiveConfig.mandatory.maxSessionDurationSeconds : (schema.spec.maxSessionDuration > 0 ? schema.spec.maxSessionDuration : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.maxSessionDurationSeconds) ? rsrcCfg[0].status.effectiveConfig.defaults.maxSessionDurationSeconds : 3600)))}
           policies: >-
-            ${((schema.spec.type == "ec2" && schema.spec.addSsmPolicy ? ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"] : []) + (schema.spec.type == "ecs-task" && schema.spec.addEcsExecutionPolicy ? ["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"] : []) + (schema.spec.type == "lambda" && schema.spec.addLambdaBasicPolicy ? ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"] : []))}
+            ${(schema.spec.type == "ec2" && (
+                (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.addSsmPolicy) && rsrcCfg[0].status.effectiveConfig.mandatory.addSsmPolicy) ||
+                (has(schema.spec.addSsmPolicy) && schema.spec.addSsmPolicy) ||
+                (!has(schema.spec.addSsmPolicy) && rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.addSsmPolicy) && rsrcCfg[0].status.effectiveConfig.defaults.addSsmPolicy)) ?
+                ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"] : [])
+              + (schema.spec.type == "ecs-task" && (
+                (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.addEcsExecutionPolicy) && rsrcCfg[0].status.effectiveConfig.mandatory.addEcsExecutionPolicy) ||
+                (has(schema.spec.addEcsExecutionPolicy) && schema.spec.addEcsExecutionPolicy) ||
+                (!has(schema.spec.addEcsExecutionPolicy) && rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.addEcsExecutionPolicy) && rsrcCfg[0].status.effectiveConfig.defaults.addEcsExecutionPolicy)) ?
+                ["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"] : [])
+              + (schema.spec.type == "lambda" && (
+                (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.addLambdaBasicPolicy) && rsrcCfg[0].status.effectiveConfig.mandatory.addLambdaBasicPolicy) ||
+                (has(schema.spec.addLambdaBasicPolicy) && schema.spec.addLambdaBasicPolicy) ||
+                (!has(schema.spec.addLambdaBasicPolicy) && rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.addLambdaBasicPolicy) && rsrcCfg[0].status.effectiveConfig.defaults.addLambdaBasicPolicy)) ?
+                ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"] : [])
+              + (has(schema.spec.policies) && schema.spec.policies.size() > 0 && has(schema.spec.policies[0].arn) && schema.spec.policies[0].arn != "" ?
+                [schema.spec.policies[0].arn] : [])
+              + (firstPolicyRef.size() > 0 && has(firstPolicyRef[0].status) && has(firstPolicyRef[0].status.arn) && firstPolicyRef[0].status.arn != "" ?
+                [firstPolicyRef[0].status.arn] : [])}
+          inlinePolicies: >-
+            ${(firstInlineDoc.size() > 0 && has(schema.spec.inlinePolicies) && schema.spec.inlinePolicies.size() > 0 ?
+                {schema.spec.inlinePolicies[0].name: firstInlineDoc[0].spec.documentJSON} : {})
+              .merge(has(schema.spec.policies) && schema.spec.policies.size() > 0 &&
+                     schema.spec.policies[0].?inline.?documentJSON.orValue("") != "" ?
+                     {schema.spec.policies[0].inline.name: schema.spec.policies[0].inline.documentJSON} : {})}
           tags: >-
-            ${rsrcCfg.status.effectiveConfig.mandatory.tags.transformList(k, v, {"key": k, "value": v})
-              + schema.spec.tags.transformList(k, v, {"key": k, "value": v})
-              + rsrcCfg.status.effectiveConfig.defaults.tags.transformList(k, v, {"key": k, "value": v})}
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)) ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})
+              .transformList(k, v, {"key": k, "value": v})}
 
     - id: instanceProfile
       includeWhen:
-        - "${has(schema.spec) && schema.spec.type == \"ec2\" && schema.spec.createInstanceProfile}"
+        - '${schema.spec.type == "ec2" && (!has(schema.spec.createInstanceProfile) || schema.spec.createInstanceProfile)}'
       template:
         apiVersion: iam.services.k8s.aws/v1alpha1
         kind: InstanceProfile
@@ -171,14 +227,14 @@ spec:
           namespace: ${schema.metadata.namespace}
           labels: >-
             ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
-              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
-              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
-              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
-              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
           ownerReferences:
             - apiVersion: kropath.run/v1alpha1
               kind: AWSIAMRole
@@ -187,12 +243,12 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          name: "${schema.spec.nameOverride != \"\" ? schema.spec.nameOverride : schema.metadata.name}"
-          role: "${schema.spec.nameOverride != \"\" ? schema.spec.nameOverride : schema.metadata.name}"
+          name: ${role.spec.name}
+          role: ${role.spec.name}
 
     - id: podIdentityAssociation
       includeWhen:
-        - "${has(schema.spec) && has(schema.spec.type) && schema.spec.type == \"eks-pod-identity\"}"
+        - '${schema.spec.type == "eks-pod-identity"}'
       template:
         apiVersion: eks.services.k8s.aws/v1alpha1
         kind: PodIdentityAssociation
@@ -201,14 +257,14 @@ spec:
           namespace: ${schema.metadata.namespace}
           labels: >-
             ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
-              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
-              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
-              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
-              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
           ownerReferences:
             - apiVersion: kropath.run/v1alpha1
               kind: AWSIAMRole
@@ -217,7 +273,27 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          clusterName: "${schema.spec.clusterName}"
-          namespace: "${schema.spec.serviceAccountNamespace}"
-          serviceAccount: "${schema.spec.serviceAccountName}"
-          roleARN: "${role.status.?ackResourceMetadata.?arn.orValue(\"\")}"
+          clusterName: ${schema.spec.clusterName}
+          namespace: ${schema.spec.serviceAccountNamespace}
+          serviceAccount: ${schema.spec.serviceAccountName}
+          roleARN: >-
+            ${"arn:aws:iam::" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":role/" + role.spec.name}
+
+    - id: maxSessionDurationError
+      includeWhen:
+        - '${schema.spec.maxSessionDuration > 0 && schema.spec.maxSessionDuration < 900}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-maxsessionduration-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMRole
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "maxSessionDuration must be 0 (use config default) or in range [900, 43200]"
