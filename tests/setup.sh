@@ -34,10 +34,8 @@ else
   kubectl create namespace kro-system
 fi
 
-# echo "==> Installing kro operator (v0.9.2)..."
-# kubectl apply -f https://github.com/kubernetes-sigs/kro/releases/download/v0.9.2/kro-core-install-manifests.yaml
-echo "==> Installing kro operator (latest)..."
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/kro/refs/heads/main/helm/crds/kro.run_resourcegraphdefinitions.yaml
+echo "==> Installing kro operator (v0.9.2)..."
+kubectl apply -f https://github.com/kubernetes-sigs/kro/releases/download/v0.9.2/kro-core-install-manifests.yaml
 
 kubectl apply -f "${SCRIPT_DIR}/fixtures/rbac/kro-controller.yaml"
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
