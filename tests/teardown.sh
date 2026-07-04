@@ -15,5 +15,5 @@
 set -euo pipefail
 
 echo "==> Deleting kind cluster..."
-kind delete cluster --name kropath-test
+kind delete cluster --name ${CLUSTER_NAME:-kropath-aws-test}
 echo "==> Teardown complete."
