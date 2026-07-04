@@ -23,9 +23,9 @@ setup:
 teardown:
 	./teardown.sh $(CLUSTER_NAME)
 
-test: setup
+test:
 	chainsaw test . --parallel 4 --report-format JUNIT-TEST --report-path test-results/
-	$(MAKE) teardown
+# 	$(MAKE) teardown
 
 chainsaw-e2e:
 	chainsaw test chainsaw/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
