@@ -13,19 +13,26 @@
 # limitations under the License.
 #
 # aws-iam-05 Chainsaw tests — AWSIAMGroup RGD.
+# AC-7 note: AWS IAM Groups are non-taggable (ADR-015 §6.1 waiver).
+#   Cloud tags are accepted in schema but not forwarded to spec.tags.
+#   This test asserts on K8s labels only (syncedLabels) for the metadata
+#   wiring acceptance criterion.
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
   name: awsiamgroup
 spec:
+  namespace: awsiamgroup
   steps:
     - name: seed-config
       try:
         - apply:
+            file: 00-awsiamgroup-namespace.yaml
+        - apply:
             file: 00-awsiamconfig.yaml
         - script:
             content: |
-              kubectl patch awsiamconfig general-policy -n kro-system --subresource=status --type=merge \
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
 
     - name: ac1-no-policies
@@ -38,12 +45,12 @@ spec:
               kind: Group
               metadata:
                 name: basic-group
-                namespace: default
+                namespace: awsiamgroup
                 labels:
                   app.kubernetes.io/managed-by: kro
                   app.kubernetes.io/instance: basic-group
               spec:
-                name: default-basic-group
+                name: awsiamgroup-basic-group
                 path: "/"
                 policies: []
                 inlinePolicies: {}
@@ -61,9 +68,9 @@ spec:
               kind: Group
               metadata:
                 name: arn-group
-                namespace: default
+                namespace: awsiamgroup
               spec:
-                name: default-arn-group
+                name: awsiamgroup-arn-group
                 path: "/"
                 policies:
                   - arn:aws:iam::aws:policy/ReadOnlyAccess
@@ -77,8 +84,22 @@ spec:
             file: 03-awsiampolicy.yaml
         - script:
             content: |
-              kubectl patch awsiampolicy my-policy -n default --subresource=status --type=merge \
-                -p '{"status":{"arn":"arn:aws:iam::123456789012:policy/default-my-policy"}}'
+              # Wait for kro to create the underlying ACK Policy
+              for i in $(seq 1 30); do
+                kubectl get policies.iam.services.k8s.aws my-policy -n awsiamgroup 2>/dev/null && break
+                sleep 1
+              done
+              # Seed a fake ARN on the ACK Policy status — kro reads ackResourceMetadata.arn
+              # and propagates it to AWSIAMPolicy.status.arn
+              kubectl patch policies.iam.services.k8s.aws my-policy -n awsiamgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:iam::123456789012:policy/MyGroupPolicy","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+              # Wait for kro to propagate the ARN to AWSIAMPolicy.status.arn
+              for i in $(seq 1 30); do
+                arn=$(kubectl get awsiampolicy my-policy -n awsiamgroup -o jsonpath='{.status.arn}' 2>/dev/null)
+                [ -n "$arn" ] && break
+                sleep 1
+              done
         - apply:
             file: 03-group-ref.yaml
         - assert:
@@ -87,11 +108,11 @@ spec:
               kind: Group
               metadata:
                 name: ref-group
-                namespace: default
+                namespace: awsiamgroup
               spec:
-                name: default-ref-group
+                name: awsiamgroup-ref-group
                 policies:
-                  - arn:aws:iam::123456789012:policy/default-my-policy
+                  - arn:aws:iam::123456789012:policy/MyGroupPolicy
       cleanup:
         - delete:
             file: 03-group-ref.yaml
@@ -108,9 +129,9 @@ spec:
               kind: Group
               metadata:
                 name: inline-json-group
-                namespace: default
+                namespace: awsiamgroup
               spec:
-                name: default-inline-json-group
+                name: awsiamgroup-inline-json-group
                 inlinePolicies:
                   s3-list: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}'
       cleanup:
@@ -129,9 +150,9 @@ spec:
               kind: Group
               metadata:
                 name: inline-ref-group
-                namespace: default
+                namespace: awsiamgroup
               spec:
-                name: default-inline-ref-group
+                name: awsiamgroup-inline-ref-group
                 inlinePolicies:
                   s3-list: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}'
       cleanup:
@@ -142,9 +163,6 @@ spec:
 
     - name: ac5-naming
       try:
-        - script:
-            content: |
-              kubectl create namespace ops --dry-run=client -o yaml | kubectl apply -f -
         - apply:
             file: 05-group-naming.yaml
         - assert:
@@ -153,20 +171,20 @@ spec:
               kind: AWSIAMGroup
               metadata:
                 name: admins
-                namespace: ops
+                namespace: awsiamgroup
               status:
-                resourceName: ops-admins
+                resourceName: awsiamgroup-admins
                 namingStatus: valid
-                predictedArn: "arn:aws:iam::123456789012:group/ops-admins"
+                predictedArn: "arn:aws:iam::123456789012:group/awsiamgroup-admins"
         - assert:
             resource:
               apiVersion: iam.services.k8s.aws/v1alpha1
               kind: Group
               metadata:
                 name: admins
-                namespace: ops
+                namespace: awsiamgroup
               spec:
-                name: ops-admins
+                name: awsiamgroup-admins
                 path: "/"
       cleanup:
         - delete:
@@ -176,7 +194,9 @@ spec:
       try:
         - script:
             content: |
-              kubectl patch awsiamconfig general-policy -n kro-system --subresource=status --type=merge \
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
         - apply:
             file: 06-group-tags.yaml
@@ -186,22 +206,26 @@ spec:
               kind: AWSIAMGroup
               metadata:
                 name: tags-group
-                namespace: default
+                namespace: awsiamgroup
               status:
-                resourceName: default-tags-group
+                resourceName: awsiamgroup-tags-group
       cleanup:
         - delete:
             file: 06-group-tags.yaml
         - script:
             content: |
-              kubectl patch awsiamconfig general-policy -n kro-system --subresource=status --type=merge \
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
 
     - name: ac7-synced-labels
       try:
         - script:
             content: |
-              kubectl patch awsiamconfig general-policy -n kro-system --subresource=status --type=merge \
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
         - apply:
             file: 07-group-synced-labels.yaml
@@ -211,7 +235,7 @@ spec:
               kind: Group
               metadata:
                 name: synced-labels-group
-                namespace: default
+                namespace: awsiamgroup
                 labels:
                   app.kubernetes.io/managed-by: kro
                   app.kubernetes.io/instance: synced-labels-group
@@ -221,7 +245,9 @@ spec:
             file: 07-group-synced-labels.yaml
         - script:
             content: |
-              kubectl patch awsiamconfig general-policy -n kro-system --subresource=status --type=merge \
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch awsiamconfig general-policy -n awsiamgroup --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
 
     - name: ac8-standard-metadata
@@ -234,7 +260,7 @@ spec:
               kind: Group
               metadata:
                 name: standard-metadata-group
-                namespace: default
+                namespace: awsiamgroup
                 labels:
                   app.kubernetes.io/managed-by: kro
                   app.kubernetes.io/instance: standard-metadata-group
@@ -247,12 +273,9 @@ spec:
                     controller: true
                     blockOwnerDeletion: true
               spec:
-                name: default-standard-metadata-group
+                name: awsiamgroup-standard-metadata-group
                 path: "/"
       cleanup:
         - delete:
             file: 08-group-standard-metadata.yaml
 
-  cleanup:
-    - delete:
-        file: 00-awsiamconfig.yaml
