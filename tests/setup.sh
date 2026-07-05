@@ -16,11 +16,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "==> Creating kind cluster..."
-kind create cluster --name kropath-test --config "${SCRIPT_DIR}/fixtures/kind-config.yaml"
+if ! kind get clusters | grep -qx "kropath-test"; then
+  echo "==> Creating kind cluster..."
+  kind create cluster --name kropath-test --config "${SCRIPT_DIR}/fixtures/kind-config.yaml"
+fi
 
 echo "==> Installing kro operator (v0.9.2)..."
-kubectl create namespace kro-system
+kubectl create namespace kro-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f https://github.com/kubernetes-sigs/kro/releases/download/v0.9.2/kro-core-install-manifests.yaml
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
 
@@ -29,5 +31,8 @@ kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/iam/"
 
 echo "==> Installing ACK EKS CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/eks/"
+
+echo "==> Installing ACK S3 CRD definitions..."
+kubectl apply -f "${SCRIPT_DIR}/fixtures/crds/s3/"
 
 echo "==> Test environment ready."
