@@ -1,0 +1,143 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: awsiamgroup.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: kropath.run
+    kind: AWSIAMGroup
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      path: string | default=/
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      policies: "[]GroupPolicy | default=[]"
+      inlinePolicies: "[]InlinePolicy | default=[]"
+    types:
+      GroupPolicy:
+        arn: string | default=""
+        ref: string | default=""
+      InlinePolicy:
+        name: string | required=true
+        documentJSON: string | default=""
+        documentRef: string | default=""
+    status:
+      resourceName: >-
+        ${group.?spec.?name.orValue("")}
+      namingStatus: >-
+        ${group.?spec.?name.orValue("").contains("{") ? "invalid-unresolved-tokens" : (has(group.spec) ? "valid" : "pending")}
+      predictedArn: >-
+        ${has(rsrcCfg.status.effectiveConfig.aws) && has(rsrcCfg.status.effectiveConfig.aws.accountId) && has(group.spec) && has(group.spec.name) && group.spec.name != "" ? "arn:aws:iam::" + rsrcCfg.status.effectiveConfig.aws.accountId + ":group" + group.spec.path + group.spec.name : ""}
+      conditions: >-
+        ${group.status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+  resources:
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: kropath.run/v1alpha1
+        kind: AWSIAMConfig
+        metadata:
+          name: ${schema.?spec.?configRef.orValue("general-policy")}
+          namespace: ${schema.metadata.namespace}
+
+    - id: firstPolicyRef
+      externalRef:
+        apiVersion: kropath.run/v1alpha1
+        kind: AWSIAMPolicy
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              kropath.run/resource-name: '${has(schema.spec.policies) && schema.spec.policies.size() > 0 && schema.spec.policies[0].?ref.orValue("") != "" ? schema.spec.policies[0].ref : "kro-empty-fallback-sentinel"}'
+
+    - id: firstInlineDoc
+      externalRef:
+        apiVersion: kropath.run/v1alpha1
+        kind: AWSPolicyDocument
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              kropath.run/resource-name: '${has(schema.spec.inlinePolicies) && schema.spec.inlinePolicies.size() > 0 && schema.spec.inlinePolicies[0].?documentRef.orValue("") != "" ? schema.spec.inlinePolicies[0].documentRef : "kro-empty-fallback-sentinel"}'
+
+    - id: group
+      template:
+        apiVersion: iam.services.k8s.aws/v1alpha1
+        kind: Group
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(has(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels) ? rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(has(rsrcCfg.status.effectiveConfig.defaults.syncedLabels) ? rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(has(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations) ? rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(has(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations) ? rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSIAMGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: >-
+            ${schema.spec.nameOverride != "" ? schema.spec.nameOverride :
+              (has(rsrcCfg.status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg.status.effectiveConfig.mandatory.namingTemplate != "" ?
+                rsrcCfg.status.effectiveConfig.mandatory.namingTemplate :
+                (has(rsrcCfg.status.effectiveConfig.defaults.namingTemplate) && rsrcCfg.status.effectiveConfig.defaults.namingTemplate != "" ?
+                  rsrcCfg.status.effectiveConfig.defaults.namingTemplate :
+                  schema.metadata.name))
+                .replace("{namespace}", schema.metadata.namespace)
+                .replace("{name}", schema.metadata.name)
+                .replace("{account_id}", has(rsrcCfg.status.effectiveConfig.aws) && has(rsrcCfg.status.effectiveConfig.aws.accountId) ? rsrcCfg.status.effectiveConfig.aws.accountId : "")
+                .replace("{kind}", "awsiamgroup")}
+          path: "${schema.spec.path}"
+          policies: >-
+            ${(has(schema.spec.policies) && schema.spec.policies.size() > 0 && has(schema.spec.policies[0].arn) && schema.spec.policies[0].arn != "" ? [schema.spec.policies[0].arn] : [])
+              + (has(schema.spec.policies) && schema.spec.policies.size() > 0 &&
+                has(schema.spec.policies[0].ref) && schema.spec.policies[0].ref != "" &&
+                firstPolicyRef.size() > 0 && has(firstPolicyRef[0].status) && has(firstPolicyRef[0].status.arn) && firstPolicyRef[0].status.arn != "" ?
+                [firstPolicyRef[0].status.arn] : [])}
+          inlinePolicies: >-
+            ${(has(schema.spec.inlinePolicies) && schema.spec.inlinePolicies.size() > 0 &&
+              has(schema.spec.inlinePolicies[0].name) && schema.spec.inlinePolicies[0].name != "" &&
+              has(schema.spec.inlinePolicies[0].documentJSON) && schema.spec.inlinePolicies[0].documentJSON != "" ?
+              {schema.spec.inlinePolicies[0].name: schema.spec.inlinePolicies[0].documentJSON} : {})
+              .merge(has(schema.spec.inlinePolicies) && schema.spec.inlinePolicies.size() > 0 &&
+                has(schema.spec.inlinePolicies[0].name) && schema.spec.inlinePolicies[0].name != "" &&
+                has(schema.spec.inlinePolicies[0].documentRef) && schema.spec.inlinePolicies[0].documentRef != "" &&
+                firstInlineDoc.size() > 0 && has(firstInlineDoc[0].spec) && has(firstInlineDoc[0].spec.documentJSON) ?
+                {schema.spec.inlinePolicies[0].name: firstInlineDoc[0].spec.documentJSON} : {})}
