@@ -76,3 +76,14 @@ All gotchas in the list above apply when authoring new resources, not just when 
 - **Config reset between steps that mutate shared config** — any step that sets naming template, tags, or syncedLabels must delete and recreate the config at the start of subsequent steps that need a different config state. Do not assume cleanup from an earlier step; always reset explicitly.
 - **Fixed namespace in `spec.namespace`** — declare a fixed namespace in the chainsaw test's `spec.namespace` (e.g. `namespace: awsiamrole`) so resource names are predictable and `{namespace}-{name}` naming templates expand to known values. Never use `default` namespace for tests.
 - **Distinguish `metadata.name` from `spec.name` in asserts** — child K8s resources receive `metadata.name: ${schema.metadata.name}` (the CR's K8s name, unaffected by naming templates) and `spec.name: ${effectiveName}` (the cloud resource name, controlled by naming templates). Asserts on labels, annotations, and ownerReferences use `metadata.name`; asserts on the cloud resource name use `spec.name`.
+
+## Local test gate — mandatory before PR creation
+
+Before creating or updating a PR, the full Chainsaw test suite for the affected service MUST pass locally:
+
+1. Run `cd tests && make test-<service>` (e.g. `make test-kms` for KMS work).
+2. All test steps must pass (zero failures, zero skips due to missing resources).
+3. Post the final make output (last 30 lines) as a comment on the Multica issue with the heading "Local test run — PASS" before pushing.
+4. Do NOT create the PR until step 3 is complete.
+
+If tests are failing, continue the autonomous test-fix loop (see "Fixing chainsaw test failures" above) until they pass. Do not submit a PR with known test failures.
