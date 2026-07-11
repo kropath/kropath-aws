@@ -54,10 +54,16 @@ kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"
 # wait for kro to create and establish the CRD from the RGD schema, then patch them in.
 # kro creates the CRD asynchronously, so poll until it appears before running kubectl wait.
 echo "==> Waiting for kro to create awskmskeys.kropath.run CRD..."
-for i in $(seq 1 60); do
+for i in $(seq 1 30); do
   kubectl get crd awskmskeys.kropath.run &>/dev/null && break
   sleep 2
 done
+if ! kubectl get crd awskmskeys.kropath.run &>/dev/null; then
+  echo "==> CRD not yet created — dumping RGD state for diagnosis:"
+  kubectl describe rgd awskmskey.kropath.run || true
+  echo "==> kro controller logs:"
+  kubectl logs -n kro-system -l app.kubernetes.io/name=kro --tail=50 || true
+fi
 echo "==> Waiting for awskmskeys.kropath.run CRD to be Established..."
 kubectl wait crd awskmskeys.kropath.run --for=condition=Established --timeout=120s
 
