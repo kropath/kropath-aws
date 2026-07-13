@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# setup-local.sh — Creates and bootstraps the 'kro-aws' Kind cluster for
+# setup-local.sh — Creates and bootstraps the 'kropath-aws-test' Kind cluster for
 # local kropath-aws development and Chainsaw E2E testing.
 #
 # Prerequisites: kind, kubectl, helm (>= 3.13)
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-CLUSTER_NAME="kro-aws"
+CLUSTER_NAME=${CLUSTER_NAME:-kropath-aws-test}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KRO_VERSION="${KRO_VERSION:-0.9.2}"
 SKIP_KRO="${SKIP_KRO:-false}"
@@ -77,16 +77,7 @@ else
   echo "Skipping kro installation (--skip-kro)."
 fi
 
-# ── kropath CRDs ───────────────────────────────────────────────────────────────
-if [ -d "${SCRIPT_DIR}/../crds" ]; then
-  echo "Installing kropath CRDs..."
-  kubectl apply -f "${SCRIPT_DIR}/../crds/awsiamconfig.yaml"
-  kubectl apply -f "${SCRIPT_DIR}/../crds/awsiampolicy.yaml"
-  kubectl apply -f "${SCRIPT_DIR}/../crds/awskropathconfig.yaml"
-  kubectl apply -f "${SCRIPT_DIR}/../crds/policy/awspolicydocument.yaml"
-else
-  echo "No kropath CRDs directory found — skipping."
-fi
+kubectl apply -f "${SCRIPT_DIR}/../tests/fixtures/rbac/kro-controller.yaml"
 
 # ── Provider CRDs ─────────────────────────────────────────────────────────────
 if [ "${SKIP_CRDS}" = false ]; then
@@ -94,6 +85,23 @@ if [ "${SKIP_CRDS}" = false ]; then
   "${SCRIPT_DIR}/install-provider-crds.sh"
 else
   echo "Skipping provider CRD installation (--skip-crds)."
+fi
+
+# ── kropath CRDs ───────────────────────────────────────────────────────────────
+if [ -d "${SCRIPT_DIR}/../crds" ]; then
+  echo "Installing kropath CRDs..."
+  kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
+  kubectl apply -f "${SCRIPT_DIR}/../crds/policy/awspolicydocument.yaml"
+else
+  echo "No kropath CRDs directory found — skipping."
+fi
+
+# ── kropath RGDs ───────────────────────────────────────────────────────────────────────
+if [ -d "${SCRIPT_DIR}/../rgds" ]; then
+  echo "Installing kropath.run RGDs..."
+  kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"
+else
+  echo "No RGDs directory found — skipping."
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────

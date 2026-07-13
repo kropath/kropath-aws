@@ -1,0 +1,267 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: awskmskey.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: kropath.run
+    kind: AWSKMSKey
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      description: string | default=""
+      keySpec: string | default=""
+      keyUsage: string | default=""
+      # No default — false is the zero-value sentinel meaning "not enforced / fall through".
+      # Use schema.spec.?enableKeyRotation.orValue(false) at each call site.
+      enableKeyRotation: boolean
+      policy: string | default=""
+      keyPolicyRef: string | default=""
+      createAlias: boolean | default=true
+      aliasName: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      predictedArn: >-
+        ${key.?status.?ackResourceMetadata.?arn.orValue("")}
+      keyID: >-
+        ${key.?status.?keyID.orValue("")}
+      keyArn: >-
+        ${key.?status.?ackResourceMetadata.?arn.orValue("")}
+      aliasArn: >-
+        ${has(alias.spec) && alias.?spec.?name.orValue("") != ""
+          ? "arn:aws:kms:" + rsrcCfg.status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg.status.effectiveConfig.aws.?accountId.orValue("") + ":" + alias.spec.name
+          : ""}
+      conditions: >-
+        ${key.?status.?conditions.orValue([])}
+      validationError: >-
+        ${has(mutualExclusionError.data) && has(mutualExclusionError.data.error) ? mutualExclusionError.data.error : ""}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+      - name: KeyID
+        type: string
+        jsonPath: .status.keyID
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: kropath.run/v1alpha1
+        kind: AWSKMSConfig
+        metadata:
+          name: ${schema.?spec.?configRef.orValue("general-policy")}
+          namespace: ${schema.metadata.namespace}
+
+    # AWSPolicyDocument lookup via sentinel label selector — variable always bound as [] when
+    # keyPolicyRef is empty. Requires AWSPolicyDocument CRD deployed (OQ-1 non-blocking).
+    - id: policyDoc
+      externalRef:
+        apiVersion: kropath.run/v1alpha1
+        kind: AWSPolicyDocument
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              kropath.run/resource-name: '${schema.spec.keyPolicyRef != "" ? schema.spec.keyPolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # Mutual exclusion guard: spec.policy and spec.keyPolicyRef cannot both be set.
+    # When both are set, this ConfigMap is created and its error is surfaced in status.validationError.
+    # The key resource is still created; enforcement is advisory (admission-time CEL not available via kro).
+    - id: mutualExclusionError
+      includeWhen:
+        - '${schema.spec.policy != "" && schema.spec.keyPolicyRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSKey
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "spec.policy and spec.keyPolicyRef are mutually exclusive — set exactly one"
+
+    # ConfigMap to materialise effectiveName and namingStatus for the status block.
+    # status: block cannot reference schema.* directly (kro restriction), so we compute
+    # these values here and read them back in status via naming.data.*.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSKey
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : (rsrcCfg.status.effectiveConfig.mandatory.namingTemplate != ""
+                  ? rsrcCfg.status.effectiveConfig.mandatory.namingTemplate
+                  : (rsrcCfg.status.effectiveConfig.defaults.namingTemplate != ""
+                      ? rsrcCfg.status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+                .replace("{name}", schema.metadata.name)
+                .replace("{namespace}", schema.metadata.namespace)
+                .replace("{account_id}", rsrcCfg.status.effectiveConfig.aws.?accountId.orValue(""))
+                .replace("{region}", rsrcCfg.status.effectiveConfig.aws.?region.orValue(""))
+                .replace("{configRef}", schema.spec.configRef)}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+                ? schema.spec.nameOverride
+                : (rsrcCfg.status.effectiveConfig.mandatory.namingTemplate != ""
+                    ? rsrcCfg.status.effectiveConfig.mandatory.namingTemplate
+                    : (rsrcCfg.status.effectiveConfig.defaults.namingTemplate != ""
+                        ? rsrcCfg.status.effectiveConfig.defaults.namingTemplate
+                        : "{namespace}-{name}"))
+                  .replace("{name}", schema.metadata.name)
+                  .replace("{namespace}", schema.metadata.namespace)
+                  .replace("{account_id}", rsrcCfg.status.effectiveConfig.aws.?accountId.orValue(""))
+                  .replace("{region}", rsrcCfg.status.effectiveConfig.aws.?region.orValue(""))
+                  .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK KMS Key CR — primary cloud resource
+    - id: key
+      template:
+        apiVersion: kms.services.k8s.aws/v1alpha1
+        kind: Key
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSKey
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          description: "${schema.spec.description}"
+          keySpec: >-
+            ${rsrcCfg.status.effectiveConfig.mandatory.keySpec != ""
+              ? rsrcCfg.status.effectiveConfig.mandatory.keySpec
+              : (schema.spec.keySpec != ""
+                  ? schema.spec.keySpec
+                  : (rsrcCfg.status.effectiveConfig.defaults.keySpec != ""
+                      ? rsrcCfg.status.effectiveConfig.defaults.keySpec
+                      : "SYMMETRIC_DEFAULT"))}
+          keyUsage: >-
+            ${rsrcCfg.status.effectiveConfig.mandatory.keyUsage != ""
+              ? rsrcCfg.status.effectiveConfig.mandatory.keyUsage
+              : (schema.spec.keyUsage != ""
+                  ? schema.spec.keyUsage
+                  : (rsrcCfg.status.effectiveConfig.defaults.keyUsage != ""
+                      ? rsrcCfg.status.effectiveConfig.defaults.keyUsage
+                      : "ENCRYPT_DECRYPT"))}
+          enableKeyRotation: >-
+            ${rsrcCfg.status.effectiveConfig.mandatory.enableKeyRotation
+              ? true
+              : (schema.spec.?enableKeyRotation.orValue(false)
+                  ? true
+                  : rsrcCfg.status.effectiveConfig.defaults.enableKeyRotation)}
+          policy: >-
+            ${schema.spec.keyPolicyRef != "" && policyDoc.size() > 0
+              ? policyDoc[0].spec.documentJSON
+              : schema.spec.policy}
+          tags: >-
+            ${rsrcCfg.status.effectiveConfig.defaults.tags
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels)
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations)
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.tags)
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels)
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations)
+              .transformList(k, v, {"tagKey": k, "tagValue": v})}
+
+    # ACK KMS Alias CR — composed only when spec.createAlias is true.
+    # Alias name: "alias/<aliasName>" if aliasName non-empty, else "alias/<effectiveName>".
+    # targetKeyID reads from key.status after key creation (kro handles DAG ordering).
+    - id: alias
+      includeWhen:
+        - '${schema.spec.createAlias}'
+      template:
+        apiVersion: kms.services.k8s.aws/v1alpha1
+        kind: Alias
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          ownerReferences:
+            - apiVersion: kropath.run/v1alpha1
+              kind: AWSKMSKey
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: >-
+            ${schema.spec.aliasName != ""
+              ? "alias/" + schema.spec.aliasName
+              : "alias/" + naming.data.effectiveName}
+          targetKeyID: >-
+            ${key.?status.?keyID.orValue("")}

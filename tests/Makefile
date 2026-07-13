@@ -12,20 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: setup teardown test test-iam test-s3
+CLUSTER_NAME ?= kropath-aws-test
+
+.PHONY: setup teardown test test-iam test-kms test-s3
 
 setup:
-	./setup.sh
+	./setup.sh $(CLUSTER_NAME)
+	mkdir -p test-results
 
 teardown:
-	./teardown.sh
+	./teardown.sh $(CLUSTER_NAME)
 
-test: setup
-	chainsaw test . --parallel 4 --report-format junit --report-path test-results/
-	$(MAKE) teardown
+test:
+	chainsaw test . --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+# 	$(MAKE) teardown
+
+chainsaw-e2e:
+	chainsaw test chainsaw/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-iam:
-	chainsaw test iam/ --parallel 4 --report-format junit --report-path test-results/
+	chainsaw test iam/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-policy:
+	chainsaw test policy/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-kms:
+	chainsaw test kms/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-s3:
-	chainsaw test s3/ --parallel 4 --report-format junit --report-path test-results/
+	chainsaw test s3/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
