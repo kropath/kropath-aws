@@ -1,6 +1,6 @@
-# Logs for awsiamgroup chainsaw tests fix (2026-07-05)
+# Logs for iamgroup chainsaw tests fix (2026-07-05)
 
-`tests/iam/awsiamgroup/chainsaw-test.yaml` was failing because the ACK `Group` child in this environment does not expose `spec.tags`.
+`tests/iam/iamgroup/chainsaw-test.yaml` was failing because the ACK `Group` child in this environment does not expose `spec.tags`.
 
 ---
 
@@ -18,9 +18,9 @@ That means the provider surface here is non-taggable for IAM groups.
 
 ### Fix
 
-- Removed the `tags:` block from `rgds/awsiamgroup.yaml` so the ACK child matches the actual provider schema.
-- Updated AC-6 and AC-7 in `tests/iam/awsiamgroup/chainsaw-test.yaml` to assert that `spec.tags` is absent while keeping the CR-side tag and synced-label coverage in the spec and RGD schema.
-- Kept the schema-level `spec.tags` field in the `AWSIAMGroup` spec as a no-op/waiver so the cycle documents the limitation explicitly.
+- Removed the `tags:` block from `rgds/iamgroup.yaml` so the ACK child matches the actual provider schema.
+- Updated AC-6 and AC-7 in `tests/iam/iamgroup/chainsaw-test.yaml` to assert that `spec.tags` is absent while keeping the CR-side tag and synced-label coverage in the spec and RGD schema.
+- Kept the schema-level `spec.tags` field in the `IAMGroup` spec as a no-op/waiver so the cycle documents the limitation explicitly.
 
 ### Verification
 

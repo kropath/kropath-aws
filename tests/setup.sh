@@ -45,7 +45,7 @@ source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 
 echo "==> Installing kropath CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
-kubectl apply -f "${SCRIPT_DIR}/../crds/policy/awspolicydocument.yaml"
+kubectl apply -f "${SCRIPT_DIR}/../crds/policy/policydocument.yaml"
 
 echo "==> Installing kropath.run RGDS definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"

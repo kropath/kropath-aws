@@ -91,7 +91,7 @@ fi
 if [ -d "${SCRIPT_DIR}/../crds" ]; then
   echo "Installing kropath CRDs..."
   kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
-  kubectl apply -f "${SCRIPT_DIR}/../crds/policy/awspolicydocument.yaml"
+  kubectl apply -f "${SCRIPT_DIR}/../crds/policy/policydocument.yaml"
 else
   echo "No kropath CRDs directory found — skipping."
 fi

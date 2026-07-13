@@ -1,0 +1,179 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: iamidentityprovider.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: IAMIdentityProvider
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      type: string | required=true
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      oidc:
+        url: string | default=""
+        thumbprints: "[]string | default=[]"
+        audiences: "[]string | default=[]"
+      saml:
+        metadataDocument: string | default=""
+    status:
+      resourceName: >-
+        ${has(oidcProvider.metadata) && has(oidcProvider.metadata.name) ? oidcProvider.metadata.name : ""}
+      namingStatus: >-
+        ${has(oidcProvider.metadata) && has(oidcProvider.metadata.name)
+          ? (oidcProvider.metadata.name.contains("{") ? "invalid-unresolved-tokens" : "active")
+          : (has(samlProvider.data) && has(samlProvider.data.status) ? samlProvider.data.status : "pending")}
+      providerArn: >-
+        ${has(oidcProvider.status) ? oidcProvider.status.?ackResourceMetadata.?arn.orValue("") : ""}
+      conditions: >-
+        ${has(oidcProvider.status) ? oidcProvider.status.?conditions.orValue([]) : []}
+      validationError: >-
+        ${has(urlValidationError.data) && has(urlValidationError.data.error) ? urlValidationError.data.error : ""}
+    additionalPrinterColumns:
+      - name: Type
+        type: string
+        jsonPath: .spec.type
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
+  resources:
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMConfig
+        metadata:
+          name: ${schema.?spec.?configRef.orValue("general-policy")}
+          namespace: ${schema.metadata.namespace}
+    - id: oidcProvider
+      includeWhen:
+        - '${has(schema.spec) && schema.spec.type == "oidc"}'
+        - '${schema.spec.oidc.url == "" || schema.spec.oidc.url.startsWith("https://")}'
+      template:
+        apiVersion: iam.services.k8s.aws/v1alpha1
+        kind: OpenIDConnectProvider
+        metadata:
+          name: >-
+            ${schema.spec.nameOverride != "" ? schema.spec.nameOverride :
+              ((has(rsrcCfg.status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg.status.effectiveConfig.mandatory.namingTemplate != "") ||
+               (has(rsrcCfg.status.effectiveConfig.defaults.namingTemplate) && rsrcCfg.status.effectiveConfig.defaults.namingTemplate != "")) ?
+              (has(rsrcCfg.status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg.status.effectiveConfig.mandatory.namingTemplate != "" ?
+                rsrcCfg.status.effectiveConfig.mandatory.namingTemplate :
+                rsrcCfg.status.effectiveConfig.defaults.namingTemplate)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", has(rsrcCfg.status.effectiveConfig.aws) && has(rsrcCfg.status.effectiveConfig.aws.accountId) ? rsrcCfg.status.effectiveConfig.aws.accountId : "")
+              .replace("{kind}", "iamidentityprovider") :
+              schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMIdentityProvider
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          clientIDs: >-
+            ${schema.spec.oidc.audiences}
+          thumbprints: >-
+            ${schema.spec.oidc.thumbprints}
+          url: >-
+            ${schema.spec.oidc.url}
+          tags: >-
+            ${rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels)
+              .merge(rsrcCfg.status.effectiveConfig.defaults.tags)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations)
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels)
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.tags)
+              .transformList(k, v, {"key": k, "value": v})}
+    - id: samlProvider
+      includeWhen:
+        - '${has(schema.spec) && schema.spec.type == "saml"}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-samlprovider-advisory
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(rsrcCfg.status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMIdentityProvider
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          status: "UNSUPPORTED"
+          message: >
+            ACK controller does not support samlProvider yet.
+    - id: urlValidationError
+      includeWhen:
+        - '${has(schema.spec) && schema.spec.type == "oidc"}'
+        - '${schema.spec.oidc.url != "" && !schema.spec.oidc.url.startsWith("https://")}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-url-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMIdentityProvider
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "OIDC URL must use HTTPS"
