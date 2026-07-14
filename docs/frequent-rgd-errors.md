@@ -15,9 +15,9 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **What Works Instead:** Ensure all downstream target operator CRDs (e.g., ACK IAM, ACK S3, ACK EKS) are deployed onto the control plane *before* applying the wrapper RGDs, allowing Kro's discovery engine to discover and cache the necessary custom schemas.
 
 ### Implicit Cross-Graph Dependency Race Conditions
-* **What Fails:** Applying a dependent RGD (e.g., `awsiamrole.kropath.run`) fails at compilation because it references a separate, unapplied custom graph resource (e.g., `AWSIAMPolicy`) in its `externalRef` collection.
+* **What Fails:** Applying a dependent RGD (e.g., `iamrole.aws.kropath.run`) fails at compilation because it references a separate, unapplied custom graph resource (e.g., `AWSIAMPolicy`) in its `externalRef` collection.
 * **Why:** Kro's dependency engine tracks custom wrapper resources identically to native core resources. If the API server has no definition for a custom kind during initialization, the RGD validation hook fails.
-* **What Works Instead:** Establish a strict ordering topology for bootstrapping clusters (e.g., apply base type definitions like `awsiampolicy` and `awsfooconfig` before high-level wrappers like `awsiamrole`). Alternatively, stub dependencies with primitive native resources like `ConfigMaps` during rapid local prototyping phases.
+* **What Works Instead:** Establish a strict ordering topology for bootstrapping clusters (e.g., apply base type definitions like `iampolicy` and `awsfooconfig` before high-level wrappers like `iamrole`). Alternatively, stub dependencies with primitive native resources like `ConfigMaps` during rapid local prototyping phases.
 
 ---
 
@@ -104,12 +104,12 @@ This document tracks technical friction points, syntax limitations, and runtime 
         - id: trustDoc
           externalRef:
             apiVersion: kropath.run/v1alpha1
-            kind: AWSPolicyDocument
+            kind: PolicyDocument
             metadata:
               namespace: ${schema.metadata.namespace}
               selector:
                 matchLabels:
-                  kropath.run/resource-name: ${schema.spec.trustPolicyRef != "" ? schema.spec.trustPolicyRef : "kro-empty-fallback-sentinel"}
+                  aws.kropath.run/resource-name: ${schema.spec.trustPolicyRef != "" ? schema.spec.trustPolicyRef : "kro-empty-fallback-sentinel"}
         ```
 
 ### The Cold-Start "Missing Key" Crash (Chainsaw / Mock Testing)
@@ -133,7 +133,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
     ```yaml
     ownerReferences:
       - apiVersion: kropath.run/v1alpha1
-        kind: AWSIAMRole
+        kind: IAMRole
     ```
 
 ### Schema Evolution Blockades
@@ -144,7 +144,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **Why:** Kro applies OpenAPI schema preservation rules to block changes that could potentially orphan or corrupt live managed instances across the control plane.
 * **What Works Instead:** During active local development, refactoring, or mock execution testing, explicitly purge the generated structural layout schemas completely before pushing update changes to the cluster.
     ```bash
-    kubectl delete rgd awsiamrole.kropath.run
+    kubectl delete rgd iamrole.aws.kropath.run
     kubectl apply -f rgd.yaml
     ```
 
@@ -221,9 +221,9 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **Why:** JSON merge patch (RFC 7396) merges objects recursively. Patching a map field with `{}` means "merge empty into existing" — a complete no-op. Keys set by earlier steps survive unchanged across the entire test run.
 * **What Works Instead:** Before re-patching `effectiveConfig`, first null it out:
     ```bash
-    kubectl patch awsiamconfig general-policy -n default --subresource=status --type=merge \
+    kubectl patch iamconfig general-policy -n default --subresource=status --type=merge \
       -p '{"status":{"effectiveConfig":null}}'
-    kubectl patch awsiamconfig general-policy -n default --subresource=status --type=merge \
+    kubectl patch iamconfig general-policy -n default --subresource=status --type=merge \
       -p '{"status":{"effectiveConfig":{"mandatory":{...},"defaults":{...},"aws":{...}}}}'
     ```
   Setting a field to `null` in JSON merge patch removes it. The second patch adds it fresh with exactly the desired values. Apply this two-command pattern to every step that needs a clean effective config slate.
@@ -243,12 +243,12 @@ This document tracks technical friction points, syntax limitations, and runtime 
       try:
         - script:
             content: |
-              kubectl delete awsiamconfig role-general-policy -n awsiamrole --ignore-not-found=true
+              kubectl delete iamconfig role-general-policy -n iamrole --ignore-not-found=true
         - apply:
-            file: 00-awsiamconfig.yaml
+            file: 00-iamconfig.yaml
         - script:
             content: |
-              kubectl patch awsiamconfig role-general-policy ...
+              kubectl patch iamconfig role-general-policy ...
     ```
   Delete-first guarantees `status.effectiveConfig` starts empty; the subsequent `apply` + patch then defines it in full. Same pattern applies to any test that seeds a shared config CR (S3, KMS, IAM policy, etc.).
 
@@ -308,8 +308,8 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **What Fails:** Hand-authoring a CRD alongside an RGD (e.g. to add `x-kubernetes-validations` for immutability or mutual-exclusivity rules) creates a maintenance burden: kro regenerates the CRD from the RGD on every kro upgrade, silently discarding any manually added CEL validation rules. The hand-authored validation is gone after the next `kubectl apply -f rgds/<kind>.yaml` cycle.
 * **Why:** kro derives its CRDs directly from the RGD `spec.schema`. It has no mechanism to preserve or merge `x-kubernetes-validations` rules that were not declared in the RGD's SimpleSchema.
 * **What Works Instead — the in-graph ConfigMap advisory pattern:**
-  1. **Mutual exclusivity** (e.g. `spec.policy` and `spec.keyPolicyRef` cannot both be set): Add a `mutualExclusionError` ConfigMap resource to the RGD, guarded with `includeWhen: ['${spec.policy != "" && spec.keyPolicyRef != ""}']`. Wire a `status.validationError` field to `mutualExclusionError.data.error`. See `rgds/awsiampolicy.yaml` (`mutualExclusionError`) for a working example.
-  2. **Range / floor / ceiling validation** (e.g. `maxSessionDuration` must be 0 or in `[900, 43200]`): Add a `<fieldName>Error` ConfigMap resource guarded with the out-of-range condition. Wire `status.validationError` to its `data.error`. See `rgds/awsiamrole.yaml` (`maxSessionDurationError`) for a working example.
+  1. **Mutual exclusivity** (e.g. `spec.policy` and `spec.keyPolicyRef` cannot both be set): Add a `mutualExclusionError` ConfigMap resource to the RGD, guarded with `includeWhen: ['${spec.policy != "" && spec.keyPolicyRef != ""}']`. Wire a `status.validationError` field to `mutualExclusionError.data.error`. See `rgds/iampolicy.yaml` (`mutualExclusionError`) for a working example.
+  2. **Range / floor / ceiling validation** (e.g. `maxSessionDuration` must be 0 or in `[900, 43200]`): Add a `<fieldName>Error` ConfigMap resource guarded with the out-of-range condition. Wire `status.validationError` to its `data.error`. See `rgds/iamrole.yaml` (`maxSessionDurationError`) for a working example.
   3. **Immutability after creation** (e.g. `keySpec` and `keyUsage` on a KMS key cannot change after creation): **Do not implement at admission time.** ACK controllers already reject or ignore mutating updates to immutable fields at the AWS API layer. Document in the spec that this constraint is enforced by ACK, not by Kubernetes admission. No in-graph ConfigMap is needed.
 
   In all three cases: write a chainsaw step that applies the invalid input and asserts the advisory ConfigMap is present (or the `status.validationError` field is set). Do NOT use `apply + expect ($error != null)` — that pattern only works when the API server rejects the resource at admission time, which kro does not do for in-graph validation.
@@ -319,7 +319,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
   * Use `kubectl patch` post-apply scripts to add validation rules — fragile across kro upgrades.
   * Create a separate hand-authored CRD alongside the kro RGD — the kro-generated CRD will overwrite or conflict with it.
 
-**Reference:** `docs/troubleshooting-logs/2026-07-02-aws-iam-tests-fix.md` §"awsiamconfig-schema-validation suite — reject-max-session-duration-below-floor" and §"awsiamidentityprovider suite — https-validation" for full implementation walkthroughs.
+**Reference:** `docs/troubleshooting-logs/2026-07-02-aws-iam-tests-fix.md` §"iamconfig-schema-validation suite — reject-max-session-duration-below-floor" and §"iamidentityprovider suite — https-validation" for full implementation walkthroughs.
 
 ---
 
@@ -327,11 +327,11 @@ This document tracks technical friction points, syntax limitations, and runtime 
 
 * **What Fails:** Adding `| pattern=^https://` (or any `| pattern=`) to a field in the RGD `spec.schema` makes the RGD go `Inactive` immediately after apply:
     ```
-    kubectl get rgd awsiamidentityprovider.kropath.run
+    kubectl get rgd iamidentityprovider.aws.kropath.run
     # STATE: Inactive   REASON: unknown marker: |pattern
     ```
 * **Why:** kro v0.9.2 SimpleSchema only recognises `default`, `required`, `min`, and `max` as field markers. Any other marker token is rejected at compilation.
-* **What Works Instead:** Implement validation inside the graph using an `includeWhen`-gated ConfigMap resource. Set the ConfigMap's `data.error` to the human-readable message, guard it with the inverse condition (`!url.startsWith("https://")`), and expose it through a `validationError` status field. See `rgds/awsiamidentityprovider.yaml` (`urlValidationError` resource) for a working example.
+* **What Works Instead:** Implement validation inside the graph using an `includeWhen`-gated ConfigMap resource. Set the ConfigMap's `data.error` to the human-readable message, guard it with the inverse condition (`!url.startsWith("https://")`), and expose it through a `validationError` status field. See `rgds/iamidentityprovider.yaml` (`urlValidationError` resource) for a working example.
 
 ---
 

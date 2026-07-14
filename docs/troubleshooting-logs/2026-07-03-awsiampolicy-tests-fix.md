@@ -1,6 +1,6 @@
-# Logs for awsiampolicy chainsaw tests fix (2026-07-03)
+# Logs for iampolicy chainsaw tests fix (2026-07-03)
 
-All 10 steps of `tests/iam/awsiampolicy/chainsaw-test.yaml` were failing. Fixed iteratively via the debug loop.
+All 10 steps of `tests/iam/iampolicy/chainsaw-test.yaml` were failing. Fixed iteratively via the debug loop.
 
 ---
 
@@ -12,9 +12,9 @@ All 10 steps of `tests/iam/awsiampolicy/chainsaw-test.yaml` were failing. Fixed 
 
 ### Fix
 
-Removed `includeWhen` from `policyDoc`. Replaced with sentinel selector pattern: when `documentRef` is empty, the selector targets `kropath.run/resource-name: kro-empty-fallback-sentinel` (matches nothing → resolves to `[]`). The `policyDocument` expression then falls back to `schema.spec.documentJSON`.
+Removed `includeWhen` from `policyDoc`. Replaced with sentinel selector pattern: when `documentRef` is empty, the selector targets `aws.kropath.run/resource-name: kro-empty-fallback-sentinel` (matches nothing → resolves to `[]`). The `policyDocument` expression then falls back to `schema.spec.documentJSON`.
 
-`02-awspolicydocument.yaml`: added `metadata.labels.kropath.run/resource-name: my-policy-doc` so the selector matches when `documentRef` is set.
+`02-policydocument.yaml`: added `metadata.labels.aws.kropath.run/resource-name: my-policy-doc` so the selector matches when `documentRef` is set.
 
 ---
 
@@ -26,7 +26,7 @@ Test used chainsaw `expect ($error != null)` to assert that setting both `docume
 
 ### Fix
 
-Used the `includeWhen`-gated ConfigMap advisory pattern (same as `awsiamidentityprovider` URL validation and `awsiamrole` maxSessionDuration):
+Used the `includeWhen`-gated ConfigMap advisory pattern (same as `iamidentityprovider` URL validation and `iamrole` maxSessionDuration):
 
 - Added `mutualExclusionError` ConfigMap resource included only when `documentJSON != "" && documentRef != ""`
 - Added `status.validationError` field reading from `mutualExclusionError.data.error`
@@ -42,7 +42,7 @@ Used the `includeWhen`-gated ConfigMap advisory pattern (same as `awsiamidentity
 
 ### Fix
 
-**`rgds/awsiampolicy.yaml`:**
+**`rgds/iampolicy.yaml`:**
 - Added naming template logic to `policy.spec.name`: `nameOverride` wins, then mandatory `namingTemplate`, then defaults `namingTemplate`, then `schema.metadata.name`.
 - `status.resourceName: ${policy.?spec.?name.orValue("")}` — reads effective name from ACK child.
 
@@ -60,7 +60,7 @@ Also, the RGD tags expression used `+` list concatenation which omits `syncedLab
 
 ### Fix
 
-**`rgds/awsiampolicy.yaml`**: Replaced list-concat with map-merge pattern (defaults → spec → mandatory for all of syncedAnnotations, syncedLabels, tags), then `.transformList()` at end.
+**`rgds/iampolicy.yaml`**: Replaced list-concat with map-merge pattern (defaults → spec → mandatory for all of syncedAnnotations, syncedLabels, tags), then `.transformList()` at end.
 
 **`07-assert-tags.yaml`**: Added `{key: cost-centre, value: platform}` before `{key: team, value: payments}` (CEL map → list is alphabetical order).
 
@@ -92,7 +92,7 @@ Additionally, the assert expected `arn-policy` (no prefix) but naming template p
 
 ### Fix
 
-**`rgds/awsiampolicy.yaml`**: `predictedArn` changed to be computed:
+**`rgds/iampolicy.yaml`**: `predictedArn` changed to be computed:
 ```yaml
 predictedArn: >-
   ${has(policy.spec) ? "arn:aws:iam::" + rsrcCfg.status.effectiveConfig.aws.accountId + ":policy" + policy.spec.path + policy.spec.name : ""}

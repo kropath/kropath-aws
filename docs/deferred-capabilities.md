@@ -29,7 +29,7 @@ Error from server (NotFound)
 
 ### AC-6 — IAM User group membership (`spec.groups`)
 
-**Spec requirement:** When `groups: ["ops-admins"]` is set and `AWSIAMGroup/ops-admins` exists
+**Spec requirement:** When `groups: ["ops-admins"]` is set and `IAMGroup/ops-admins` exists
 in the same namespace, the IAM User should be a member of that group in AWS.
 
 **Blocking constraint:** Neither upstream ACK CRD supports this association:

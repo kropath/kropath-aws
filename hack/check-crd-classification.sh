@@ -19,11 +19,11 @@
 #
 # Allowed CRD names end in:
 #   *configs.kropath.run        — governance ResourceConfig CRDs
-#   awspolicydocuments.kropath.run — approved utility CRD
+#   policydocuments.aws.kropath.run — approved utility CRD
 
 set -euo pipefail
 
-ALLOWED_PATTERNS="configs\.kropath\.run$|awspolicydocuments\.kropath\.run$"
+ALLOWED_PATTERNS="configs\.aws\.kropath\.run$|policydocuments\.aws\.kropath\.run$"
 
 # Collect all YAML files under crds/ that declare a CustomResourceDefinition.
 # grep returns exit 1 when no files match; || true keeps set -e from aborting.

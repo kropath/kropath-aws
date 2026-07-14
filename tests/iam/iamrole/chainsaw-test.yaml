@@ -1,0 +1,516 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: iamrole
+spec:
+  namespace: iamrole
+  steps:
+    - name: seed-effective-config
+      try:
+        - apply:
+            file: 00-iamrole-namespace.yaml
+        - apply:
+            file: 00-iamconfig.yaml
+        - script:
+            content: |
+              kubectl patch iamconfig role-general-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"team":"platform"},"addSsmPolicy":false,"addEcsExecutionPolicy":false,"addLambdaBasicPolicy":false},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"addSsmPolicy":true,"addEcsExecutionPolicy":true,"addLambdaBasicPolicy":true},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              echo "=== LIVE STATUS REVEAL ==="
+              kubectl get iamconfig role-general-policy -n iamrole -o yaml
+
+    - name: ec2-role-with-instance-profile
+      try:
+        - apply:
+            file: 01-ec2-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ec2-role
+                namespace: iamrole
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ec2-role
+              spec:
+                name: iamrole-ec2-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies:
+                  - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: InstanceProfile
+              metadata:
+                name: ec2-role
+                namespace: iamrole
+              spec:
+                name: iamrole-ec2-role
+                role: iamrole-ec2-role
+
+    - name: ec2-role-without-ssm-policy
+      try:
+        - apply:
+            file: 12-ec2-no-ssm-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ec2-no-ssm-role
+                namespace: iamrole
+              spec:
+                name: iamrole-ec2-no-ssm-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies: []
+
+    - name: ec2-role-without-instance-profile
+      try:
+        - apply:
+            file: 13-ec2-no-instance-profile-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ec2-no-instance-profile-role
+                namespace: iamrole
+              spec:
+                name: iamrole-ec2-no-instance-profile-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+        - script:
+            content: |
+              kubectl get instanceprofile ec2-no-instance-profile-role -n iamrole >/dev/null 2>&1
+              test $? -ne 0
+
+    - name: ecs-task-role
+      try:
+        - apply:
+            file: 14-ecs-task-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ecs-task-role
+                namespace: iamrole
+              spec:
+                name: iamrole-ecs-task-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies:
+                  - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+    - name: ecs-task-role-without-execution-policy
+      try:
+        - apply:
+            file: 15-ecs-task-no-policy-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ecs-task-no-policy-role
+                namespace: iamrole
+              spec:
+                name: iamrole-ecs-task-no-policy-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies: []
+
+    - name: lambda-role-standard-metadata
+      try:
+        - apply:
+            file: 02-lambda-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: lambda-role
+                namespace: iamrole
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: lambda-role
+                  kropath.run/environment: production
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                  kropath.run/team: platform
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: IAMRole
+                    name: lambda-role
+                    controller: true
+              spec:
+                name: iamrole-lambda-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies:
+                  - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+                tags:
+                  - key: environment
+                    value: production
+                  - key: team
+                    value: platform
+
+    - name: lambda-role-without-basic-policy
+      try:
+        - apply:
+            file: 16-lambda-no-basic-policy-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: lambda-no-basic-policy-role
+                namespace: iamrole
+              spec:
+                name: iamrole-lambda-no-basic-policy-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                policies: []
+
+    - name: eks-role-variants
+      try:
+        - apply:
+            file: 03-eks-irsa-role.yaml
+        - apply:
+            file: 04-eks-pod-identity-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: irsa-role
+                namespace: iamrole
+              spec:
+                name: iamrole-irsa-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::123:oidc-provider/oidc.eks.ap-southeast-2.amazonaws.com/id/EXAMPLE"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"sts.amazonaws.com:sub":"system:serviceaccount:iamrole:app"}}}]}'
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: podid-role
+                namespace: iamrole
+              spec:
+                clusterName: my-cluster
+                namespace: ns
+                serviceAccount: sa
+                roleARN: arn:aws:iam::123456789012:role/iamrole-podid-role
+
+    - name: aws-service-role
+      try:
+        - apply:
+            file: 17-aws-service-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: aws-service-role
+                namespace: iamrole
+              spec:
+                name: iamrole-aws-service-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"backup.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    - name: generic-role-with-explicit-trust-policy
+      try:
+        - apply:
+            file: 18-generic-trust-json-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: generic-trust-json-role
+                namespace: iamrole
+              spec:
+                name: iamrole-generic-trust-json-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sts.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    - name: boundary-and-naming
+      try:
+        - script:
+            content: |
+              kubectl delete iamconfig boundary-general-policy -n iamrole --ignore-not-found=true
+        - apply:
+            file: 00-iamconfig-boundary.yaml
+        - script:
+            content: |
+              kubectl patch iamconfig boundary-general-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"arn:aws:iam::123456789012:policy/OrgBoundary","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"arn:aws:iam::123456789012:policy/DefaultBoundary","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":7200,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              echo "=== LIVE STATUS REVEAL ==="
+              kubectl get iamconfig boundary-general-policy -n iamrole -o yaml
+        - apply:
+            file: 08-boundary-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: boundary-role
+                namespace: iamrole
+              spec:
+                name: iamrole-boundary-role
+                permissionsBoundary: arn:aws:iam::123456789012:policy/OrgBoundary
+                maxSessionDuration: 3600
+
+        # Clear mandatory boundary so 'none' opt-out can override defaults only
+        - script:
+            content: |
+              kubectl patch iamconfig boundary-general-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"arn:aws:iam::123456789012:policy/DefaultBoundary","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":7200,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            file: 09-boundary-optout-role.yaml
+        - script:
+            content: |
+              boundary="$(kubectl get role boundary-optout-role -n iamrole -o jsonpath='{.spec.permissionsBoundary}')"
+              test -z "$boundary"
+
+        - apply:
+            file: 10-nameoverride-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: nameoverride-role
+                namespace: iamrole
+              spec:
+                name: custom-role-name
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMRole
+              metadata:
+                name: nameoverride-role
+                namespace: iamrole
+              status:
+                resourceName: custom-role-name
+                predictedArn: arn:aws:iam::123456789012:role/custom-role-name
+
+        - script:
+            content: |
+              kubectl patch iamconfig boundary-general-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":3600,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              echo "=== LIVE STATUS REVEAL ==="
+              kubectl get iamconfig boundary-general-policy -n iamrole -o yaml
+
+        - apply:
+            file: 11-invalid-naming-role.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMRole
+              metadata:
+                name: invalid-naming-role
+                namespace: iamrole
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    - name: default-max-session-duration-applies
+      try:
+        - script:
+            content: |
+              kubectl patch iamconfig role-general-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":7200,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              echo "=== LIVE STATUS REVEAL ==="
+              kubectl get iamconfig role-general-policy -n iamrole -o yaml
+        - apply:
+            file: 19-default-max-session-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: default-max-session-role
+                namespace: iamrole
+              spec:
+                name: iamrole-default-max-session-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                maxSessionDuration: 7200
+
+    - name: default-naming-template-sets-resource-name
+      try:
+        - apply:
+            file: 20-name-template-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: lambda-exec
+                namespace: iamrole
+              spec:
+                name: iamrole-lambda-exec
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMRole
+              metadata:
+                name: lambda-exec
+                namespace: iamrole
+              status:
+                resourceName: iamrole-lambda-exec
+                predictedArn: arn:aws:iam::123456789012:role/iamrole-lambda-exec
+
+    - name: mandatory-naming-template-wins
+      try:
+        - script:
+            content: |
+              kubectl patch iamconfig role-general-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":7200,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              echo "=== LIVE STATUS REVEAL ==="
+              kubectl get iamconfig role-general-policy -n iamrole -o yaml
+        - apply:
+            file: 21-mandatory-name-template-role.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMRole
+              metadata:
+                name: mandatory-name-template-role
+                namespace: iamrole
+              status:
+                resourceName: iamrole-mandatory-name-template-role-123456789012
+                predictedArn: arn:aws:iam::123456789012:role/iamrole-mandatory-name-template-role-123456789012
+
+    - name: tag-merge-prefers-mandatory-values
+      try:
+        - script:
+            content: |
+              kubectl delete iamconfig role-general-policy -n iamrole --ignore-not-found=true
+        - apply:
+            file: 00-iamconfig.yaml
+        - script:
+            content: |
+              kubectl patch iamconfig role-general-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":0,"namingTemplate":"","tags":{"cost-centre":"platform","environment":"mandatory"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"permissionsBoundaryArn":"","blockIamUserAccessKeys":false,"maxSessionDurationSeconds":7200,"namingTemplate":"{namespace}-{name}","tags":{"environment":"defaults","team":"ops"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              echo "=== LIVE STATUS REVEAL ==="
+              kubectl get iamconfig role-general-policy -n iamrole -o yaml
+        - apply:
+            file: 22-tags-merge-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: tags-merge-role
+                namespace: iamrole
+              spec:
+                name: iamrole-tags-merge-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                tags:
+                  - key: cost-centre
+                    value: platform
+                  - key: environment
+                    value: mandatory
+                  - key: app
+                    value: payments
+                  - key: team
+                    value: ops
+
+    - name: policy-document-refs
+      try:
+        - apply:
+            file: 05-policy-document.yaml
+        - apply:
+            file: 06-policy-document-trust.yaml
+        - apply:
+            file: 07-policy-ref.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: ref-role
+                namespace: iamrole
+              spec:
+                name: iamrole-ref-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sts.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                inlinePolicies:
+                  inline-read: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"*"}]}'
+
+    - name: policy-arn-reference
+      try:
+        - apply:
+            file: 08-my-policy.yaml
+        - script:
+            content: |
+              # Wait for kro to create the underlying ACK Policy object
+              for i in $(seq 1 30); do
+                kubectl get policies.iam.services.k8s.aws my-policy -n iamrole 2>/dev/null && break
+                sleep 1
+              done
+              # Seed a fake ARN on the ACK Policy status — kro reads ackResourceMetadata.arn
+              # and propagates it to AWSIAMPolicy.status.arn
+              kubectl patch policies.iam.services.k8s.aws my-policy -n iamrole \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:iam::123456789012:policy/MyPolicy","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+              # Wait for kro to propagate the ARN to AWSIAMPolicy.status.arn
+              for i in $(seq 1 30); do
+                arn=$(kubectl get iampolicy my-policy -n iamrole -o jsonpath='{.status.arn}' 2>/dev/null)
+                [ -n "$arn" ] && break
+                sleep 1
+              done
+        - apply:
+            file: 09-policy-ref-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: policy-ref-role
+                namespace: iamrole
+              spec:
+                name: iamrole-policy-ref-role
+                policies:
+                  - arn:aws:iam::123456789012:policy/MyPolicy
+
+    - name: inline-policy-json
+      try:
+        - apply:
+            file: 24-inline-policy-json-role.yaml
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: Role
+              metadata:
+                name: inline-json-role
+                namespace: iamrole
+              spec:
+                name: iamrole-inline-json-role
+                assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+                inlinePolicies:
+                  inline-json: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":"*"}]}'
