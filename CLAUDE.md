@@ -41,7 +41,7 @@ Read `docs/frequent-rgd-errors.md` first — it catalogs every CEL/RGD trap alre
 - **`kropath.run/` prefix is Kubernetes-only** — applies to `metadata.labels` and `metadata.annotations`, NEVER to cloud resource tags. Cloud tags use plain keys from `syncedLabels`/`syncedAnnotations`/`tags`.
 - **Cross-tier tags must map-merge, not list-concat** — `mandatory > spec > defaults` requires `.merge()` on maps (last-writer-wins), then `.transformList(k, v, {"key": k, "value": v})` at the end. Concatenating pre-transformed lists with `+` produces duplicate keys and breaks mandatory-wins semantics.
 - **Boolean flags meant to be tri-state (`unset` / `true` / `false`) must NOT declare `| default=false`** — kro copies the default into the generated CRD, kubernetes materializes `false` on every instance, and `has()` always returns true. Declare them as bare `boolean` in the RGD schema.
-- **Test resources referenced via `externalRef` label selectors need the selector label present** — e.g. `AWSPolicyDocument`/`AWSIAMPolicy` referenced by `firstPolicyRef`/`firstInlineDoc`/`trustDoc` must carry `metadata.labels.kropath.run/resource-name: <name>` in the test manifest.
+- **Test resources referenced via `externalRef` label selectors need the selector label present** — e.g. `AWSPolicyDocument`/`AWSIAMPolicy` referenced by `firstPolicyRef`/`firstInlineDoc`/`trustDoc` must carry `metadata.labels.aws.kropath.run/resource-name: <name>` in the test manifest. Config CRs matched via `rsrcCfg` likewise need `metadata.labels.aws.kropath.run/resource-name: <configRef-value>` (see Theme 28 below).
 - **awsiampolicy tests run in `default` namespace** — unlike awsiamrole (namespace = `awsiamrole`), awsiampolicy chainsaw tests run in `default`. Naming template `{namespace}-{name}` therefore produces `default-<name>` (e.g. `default-my-policy`). Update assert files accordingly.
 - **Chainsaw `--type=merge {}` does NOT clear existing map keys** — to reset `mandatory.tags` or `mandatory.syncedLabels` between steps, first null out the whole field: `kubectl patch ... --type=merge -p '{"status":{"effectiveConfig":null}}'`, then immediately re-patch with desired values. Apply this two-command pattern to every step that needs a clean state after a previous step set map keys.
 - **`status:` expressions cannot reference `schema.*`** — `schema` and `instance` are out of scope in the `status:` block. Compute fields like `predictedArn` from child resource fields only (e.g. `policy.spec.path`, `policy.spec.name`, `rsrcCfg.status.effectiveConfig.aws.accountId`).
@@ -51,6 +51,48 @@ Read `docs/frequent-rgd-errors.md` first — it catalogs every CEL/RGD trap alre
 - **"passes in isolation but fails in parallel" is not automatically a race condition** — the isolation run may be asserting against stale cluster state left over from the parallel run. A suspiciously short elapsed time (e.g. 9s vs 25s in a clean run) indicates reconciliation was skipped because child resources already existed. Before dismissing a failure as a race, verify that the test's `purge-stale-leftovers` step cleans up ALL resources the test uses (not just some), and that child resources were actually re-created during the isolation run. The cascade test's purge only deletes `awsiamconfig` but not `awskropathconfig` or the already-reconciled child `Role` — so a stale Role from a prior run can make the assert pass even when the assert is wrong.
 
 Log the fix for each failing step in `docs/troubleshooting-logs/<YYYY-MM-DD>-<slug>.md` (one section per test case) so a re-entrant session can see what's already handled.
+
+## Theme 28: ExternalRef Config Lookup — labelSelector Required (KRO-143, KRO-221)
+
+**Rule:** Never use CEL (`${}`) in `externalRef.metadata.name`. Use `selector.matchLabels` with the provider-prefixed label key instead.
+
+**Why it matters:** kro evaluates CEL only in `template:` blocks and `selector.matchLabels` entries. In `externalRef.metadata.name`, the `${}` expression is treated as a literal string and never resolved — the config lookup silently fails and the instance stalls in reconciliation.
+
+**Correct pattern (AWS):**
+```yaml
+- id: rsrcCfg
+  externalRef:
+    apiVersion: kropath.run/v1alpha1
+    kind: AWSIAMConfig
+    metadata:
+      namespace: ${schema.metadata.namespace}
+      selector:
+        matchLabels:
+          aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+```
+
+The config CR must carry the matching label:
+```yaml
+metadata:
+  name: general-policy
+  labels:
+    aws.kropath.run/resource-name: general-policy
+```
+
+**Label key convention:**
+
+| Provider | Label key |
+|---|---|
+| AWS | `aws.kropath.run/resource-name` |
+| GCP *(future)* | `gcp.kropath.run/resource-name` |
+| Azure *(future)* | `azure.kropath.run/resource-name` |
+
+**What to avoid:**
+- `metadata.name: ${schema.spec.configRef}` — CEL not evaluated in `externalRef.metadata.name`
+- `kropath.run/config-name:` — deprecated bare form, no provider prefix
+- `kropath.run/resource-name:` — deprecated bare form, no provider prefix
+
+**See also:** `docs/frequent-rgd-errors.md` §"CEL Is Not Supported in `externalRef.metadata.name`" and §"The Unbound Variable Freeze".
 
 ## Creating new RGDs, CRDs, and test cases
 
@@ -88,3 +130,49 @@ Before creating or updating a PR, the full Chainsaw test suite for the affected 
 4. Do NOT create the PR until step 3 is complete.
 
 If tests are failing, continue the autonomous test-fix loop (see "Fixing chainsaw test failures" above) until they pass. Do not submit a PR with known test failures.
+
+## Theme 28: `labelSelector` for All `externalRef` Lookups — Never CEL in `metadata.name` (KRO-143, KRO-221)
+
+**Rule:** Every `externalRef` entry in an RGD MUST use `selector.matchLabels` to locate the target resource. CEL expressions (`${}`) in `externalRef.metadata.name` are silently not evaluated by kro — the literal string is sent to the API server as the resource name, causing the lookup to fail or resolve the wrong object.
+
+**Required pattern for the governance config lookup (`rsrcCfg`):**
+
+```yaml
+- id: rsrcCfg
+  externalRef:
+    apiVersion: kropath.run/v1alpha1
+    kind: AWS<Kind>Config
+    metadata:
+      namespace: ${schema.metadata.namespace}
+      selector:
+        matchLabels:
+          aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+```
+
+**Required pattern for policy/document lookups (with sentinel fallback):**
+
+```yaml
+- id: policyDoc
+  externalRef:
+    apiVersion: kropath.run/v1alpha1
+    kind: AWSPolicyDocument
+    metadata:
+      namespace: ${schema.metadata.namespace}
+      selector:
+        matchLabels:
+          aws.kropath.run/resource-name: '${schema.spec.documentRef != "" ? schema.spec.documentRef : "kro-empty-fallback-sentinel"}'
+```
+
+**Label key convention:**
+
+| Provider | Label key |
+|---|---|
+| AWS | `aws.kropath.run/resource-name` |
+| GCP *(future)* | `gcp.kropath.run/resource-name` |
+| Azure *(future)* | `azure.kropath.run/resource-name` |
+
+The bare `kropath.run/resource-name` and `kropath.run/config-name` forms are **deprecated** and must not appear in new RGDs or test fixtures.
+
+**Test fixture requirement:** Every config CR (e.g. `AWSIAMConfig`, `AWSS3Config`) used in tests MUST carry `metadata.labels.aws.kropath.run/resource-name: <its-name>` so the selector can find it. Every external resource (e.g. `AWSPolicyDocument`, `AWSIAMPolicy`) MUST carry the same label with its own name as the value.
+
+**Reference:** `docs/frequent-rgd-errors.md#cel-is-not-supported-in-externalrefmetadataname--use-labelselector`, KRO-143, KRO-221.

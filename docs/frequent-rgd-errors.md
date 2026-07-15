@@ -98,7 +98,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
     assumeRolePolicyDocument: ${schema.spec.trustPolicyRef != "" ? trustDoc[0].spec.documentJSON : schema.spec.trustPolicyJSON}
     ```
 * **Why:** When a graph task fails its `includeWhen` condition, Kro deletes that resource reference from the active memory context for that reconciliation loop iteration. Even though ternary strings support execution-time short-circuiting, Kro’s initialization pass validates all mentioned tokens. Encountering the uninitialized label `trustDoc` triggers an immediate runtime exception (`no such variable: trustDoc`), silently halting the entire instance reconciliation loop.
-* **What Works Instead:** **The Sentinel Fallback Selector:** Eliminate the `includeWhen` directive to ensure the variable is always initialized in memory. Instead, use an inline conditional operator directly inside the task's label selector field to fetch a dummy value if the target property is missing. This guarantees the variable resolves safely to an empty bound collection (`[]`) rather than dropping out of memory completely.
+* **What Works Instead:** **The Sentinel Fallback Selector:** Eliminate the `includeWhen` directive to ensure the variable is always initialized in memory. Instead, use an inline conditional operator directly inside the task’s label selector field to fetch a dummy value if the target property is missing. This guarantees the variable resolves safely to an empty bound collection (`[]`) rather than dropping out of memory completely.
     * *Example:*
         ```yaml
         - id: trustDoc
@@ -109,8 +109,49 @@ This document tracks technical friction points, syntax limitations, and runtime 
               namespace: ${schema.metadata.namespace}
               selector:
                 matchLabels:
-                  kropath.run/resource-name: ${schema.spec.trustPolicyRef != "" ? schema.spec.trustPolicyRef : "kro-empty-fallback-sentinel"}
+                  aws.kropath.run/resource-name: ${schema.spec.trustPolicyRef != "" ? schema.spec.trustPolicyRef : "kro-empty-fallback-sentinel"}
         ```
+
+### CEL Is Not Supported in `externalRef.metadata.name` — Use `labelSelector`
+
+* **What Fails:** Setting `externalRef.metadata.name` to a CEL expression:
+    ```yaml
+    externalRef:
+      apiVersion: kropath.run/v1alpha1
+      kind: AWSIAMConfig
+      metadata:
+        name: ${schema.spec.configRef}     # ← CEL not evaluated here
+        namespace: ${schema.metadata.namespace}
+    ```
+  The instance stalls: the literal string `${schema.spec.configRef}` is sent to the API server as the resource name rather than the resolved value.
+* **Why:** kro only evaluates CEL `${}` expressions in `template:` resource blocks and `selector.matchLabels` entries. The `externalRef.metadata.name` field is treated as a static string; CEL is silently ignored there.
+* **What Works Instead:** Use `selector.matchLabels` with the provider-prefixed `resource-name` label key. The config CR must carry the matching label:
+    ```yaml
+    externalRef:
+      apiVersion: kropath.run/v1alpha1
+      kind: AWSIAMConfig
+      metadata:
+        namespace: ${schema.metadata.namespace}
+        selector:
+          matchLabels:
+            aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+    ```
+  The config CR fixture must carry the matching label:
+    ```yaml
+    metadata:
+      name: general-policy
+      labels:
+        aws.kropath.run/resource-name: general-policy
+    ```
+* **Provider label key convention:**
+
+    | Provider | Label key |
+    |---|---|
+    | AWS | `aws.kropath.run/resource-name` |
+    | GCP *(future)* | `gcp.kropath.run/resource-name` |
+    | Azure *(future)* | `azure.kropath.run/resource-name` |
+
+  Use the provider-prefixed form in all `selector.matchLabels` entries. The bare `kropath.run/resource-name` or `kropath.run/config-name` forms are deprecated and must not appear in new RGDs or test fixtures. **KRO-143, KRO-221.**
 
 ### The Cold-Start "Missing Key" Crash (Chainsaw / Mock Testing)
 * **What Fails:** Running validation workflows on uninitialized instances crashes early with:
@@ -414,3 +455,5 @@ This document tracks technical friction points, syntax limitations, and runtime 
 | **Chainsaw inter-step map clearing** | `--type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{}}}}'` | Null out first: `-p '{"status":{"effectiveConfig":null}}'`, then re-patch with desired values |
 | **`predictedArn` in status block** | `schema.spec.path` / `schema.spec.name` (unavailable in status scope) | Use child resource fields: `policy.spec.path` + `policy.spec.name` |
 | **ARN assertion in tests** | `status.arn` (empty without real AWS) | `status.predictedArn` (computed from accountId + path + name) |
+| **`externalRef` config lookup** | `metadata.name: ${CEL}` (CEL not evaluated) | `selector.matchLabels.aws.kropath.run/resource-name: ${CEL}` + matching label on config CR |
+| **External ref label key (AWS)** | `kropath.run/config-name:` or `kropath.run/resource-name:` (deprecated bare forms) | `aws.kropath.run/resource-name:` (provider-prefixed; GCP: `gcp.kropath.run/resource-name`; Azure: `azure.kropath.run/resource-name`) |
