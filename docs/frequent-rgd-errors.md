@@ -414,3 +414,51 @@ This document tracks technical friction points, syntax limitations, and runtime 
 | **Chainsaw inter-step map clearing** | `--type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{}}}}'` | Null out first: `-p '{"status":{"effectiveConfig":null}}'`, then re-patch with desired values |
 | **`predictedArn` in status block** | `schema.spec.path` / `schema.spec.name` (unavailable in status scope) | Use child resource fields: `policy.spec.path` + `policy.spec.name` |
 | **ARN assertion in tests** | `status.arn` (empty without real AWS) | `status.predictedArn` (computed from accountId + path + name) |
+
+### CEL Is Not Supported in `externalRef.metadata.name` — Use labelSelector
+
+* **What Fails:** Using a CEL expression in `externalRef.metadata.name` to reference a config CR by name:
+    ```yaml
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMConfig
+        metadata:
+          name: ${schema.spec.configRef}   # ← CEL NOT evaluated here
+          namespace: ${schema.metadata.namespace}
+    ```
+* **Why:** kro only evaluates CEL (`${}`) inside `template:` blocks and `selector.matchLabels` values. In `externalRef.metadata.name`, the expression is passed verbatim to the Kubernetes API as a literal string (e.g. `"${schema.spec.configRef}"`), which never matches any real resource. The lookup silently returns nothing and the instance stalls in reconciliation with no error.
+* **What Works Instead:** Use `selector.matchLabels` with the provider-prefixed `aws.kropath.run/resource-name` label key. CEL IS evaluated there.
+    ```yaml
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+    ```
+    The config CR must carry the matching label:
+    ```yaml
+    metadata:
+      name: general-policy
+      labels:
+        aws.kropath.run/resource-name: general-policy
+    ```
+* **Critical side-effect — `rsrcCfg` becomes a list:** When `selector.matchLabels` is used, kro infers the variable type as `[]IAMConfig` (a list), not a scalar. Every field access must change from `rsrcCfg.status.*` to `rsrcCfg[0].status.*`, and every access must be guarded with `rsrcCfg.size() > 0`:
+    ```yaml
+    # WRONG — rsrcCfg is now a list, .status does not exist on lists
+    .merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(...))
+
+    # CORRECT — guard size first, then index
+    .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(...) : {})
+    ```
+* **Label key convention (provider-prefixed):**
+    | Provider | Label key |
+    |---|---|
+    | AWS | `aws.kropath.run/resource-name` |
+    | GCP *(future)* | `gcp.kropath.run/resource-name` |
+    | Azure *(future)* | `azure.kropath.run/resource-name` |
+    Bare forms `kropath.run/resource-name` and `kropath.run/config-name` are **deprecated**.
