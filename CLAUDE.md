@@ -88,3 +88,54 @@ Before creating or updating a PR, the full Chainsaw test suite for the affected 
 4. Do NOT create the PR until step 3 is complete.
 
 If tests are failing, continue the autonomous test-fix loop (see "Fixing chainsaw test failures" above) until they pass. Do not submit a PR with known test failures.
+
+## Theme 28: ExternalRef Config Lookup — labelSelector Required (KRO-143, KRO-222)
+
+**Rule:** Never use CEL (`${}`) in `externalRef.metadata.name`. Use `selector.matchLabels` with the provider-prefixed label key instead.
+
+**Why it matters:** kro evaluates CEL only in `template:` blocks and `selector.matchLabels` entries. In `externalRef.metadata.name`, the `${}` expression is treated as a literal string and never resolved — the config lookup silently fails and the instance stalls in reconciliation. Additionally, when `selector.matchLabels` is used, kro infers the variable as a **list** — all accesses must use `rsrcCfg[0].*` with `rsrcCfg.size() > 0` guards.
+
+**Correct pattern (AWS):**
+```yaml
+- id: rsrcCfg
+  externalRef:
+    apiVersion: aws.kropath.run/v1alpha1
+    kind: IAMConfig
+    metadata:
+      namespace: ${schema.metadata.namespace}
+      selector:
+        matchLabels:
+          aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+```
+
+The config CR must carry the matching label:
+```yaml
+metadata:
+  name: general-policy
+  labels:
+    aws.kropath.run/resource-name: general-policy
+```
+
+**Accessing the list result — always guard:**
+```yaml
+# WRONG — rsrcCfg.status fails when list is empty
+.merge(rsrcCfg.status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(...))
+
+# CORRECT — guard with size() > 0 before indexing
+.merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(...) : {})
+```
+
+**Label key convention:**
+
+| Provider | Label key |
+|---|---|
+| AWS | `aws.kropath.run/resource-name` |
+| GCP *(future)* | `gcp.kropath.run/resource-name` |
+| Azure *(future)* | `azure.kropath.run/resource-name` |
+
+**What to avoid:**
+- `metadata.name: ${schema.spec.configRef}` — CEL not evaluated in `externalRef.metadata.name`
+- `kropath.run/config-name:` — deprecated bare form, no provider prefix
+- `kropath.run/resource-name:` — deprecated bare form, no provider prefix
+
+**See also:** `docs/frequent-rgd-errors.md` §"CEL Is Not Supported in `externalRef.metadata.name`" and §"The Unbound Variable Freeze".
