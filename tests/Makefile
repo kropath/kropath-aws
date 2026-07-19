@@ -14,7 +14,7 @@
 
 CLUSTER_NAME ?= kropath-aws-test
 
-.PHONY: setup teardown test test-iam test-kms
+.PHONY: setup teardown test test-iam test-kms test-sqs
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -41,3 +41,6 @@ test-kms:
 
 test-s3:
 	chainsaw test s3/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-sqs:
+	chainsaw test sqs/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
