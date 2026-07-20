@@ -1,0 +1,325 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: sqsqueue.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: SQSQueue
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Queue type — true enables FIFO mode and appends .fifo suffix to effectiveName
+      fifo: boolean | default=false
+      # FIFO-specific fields (ignored when fifo=false)
+      contentBasedDeduplication: boolean | default=false
+      deduplicationScope: string | default=queue
+      fifoThroughputLimit: string | default=perQueue
+      # Queue behaviour (integer governance; 0 = not set at this tier)
+      visibilityTimeout: integer | default=0
+      messageRetentionPeriod: integer | default=0
+      delaySeconds: integer | default=0
+      receiveMessageWaitTimeSeconds: integer | default=0
+      maximumMessageSize: integer | default=0
+      # Encryption (governed by SQSConfig cascade)
+      encryptionType: string | default=""
+      kmsMasterKeyId: string | default=""
+      kmsDataKeyReusePeriodSeconds: integer | default=300
+      # Queue policy (resource-based via AWSPolicyDocument)
+      queuePolicyRef: string | default=""
+      # Dead-letter queue configuration
+      redrivePolicy:
+        deadLetterTargetRef: string | default=""
+        maxReceiveCount: integer | default=0
+      # Source queue restriction (on a DLQ itself)
+      redriveAllowPolicy:
+        redrivePermission: string | default=allowAll
+        sourceQueueArns: "[]string | default=[]"
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != ""
+          ? "arn:aws:sqs:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":" + naming.data.resourceName
+          : ""}
+      queueUrl: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != ""
+          ? "https://sqs." + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ".amazonaws.com/" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + "/" + naming.data.resourceName
+          : ""}
+      conditions: >-
+        ${queue.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+      - name: QueueUrl
+        type: string
+        jsonPath: .status.queueUrl
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: SQSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # DLQ ARN resolution — reads status.predictedArn from the referenced SQSQueue CR (OD-2).
+    # Sentinel pattern: when deadLetterTargetRef is empty, selector never matches and dlqCr is [].
+    - id: dlqCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: SQSQueue
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.redrivePolicy.deadLetterTargetRef != "" ? schema.spec.redrivePolicy.deadLetterTargetRef : "kro-empty-fallback-sentinel"}'
+
+    # Queue policy resolution via AWSPolicyDocument (optional).
+    # Sentinel pattern: when queuePolicyRef is empty, selector never matches and policyDoc is [].
+    - id: policyDoc
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: PolicyDocument
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.queuePolicyRef != "" ? schema.spec.queuePolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap to materialise effectiveName, resourceName (with .fifo suffix), and namingStatus.
+    # Computed here so status block can reference naming.data.* without requiring schema.* access.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+                .replace("{name}", schema.metadata.name)
+                .replace("{namespace}", schema.metadata.namespace)
+                .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+                .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+                .replace("{configRef}", schema.spec.configRef)}
+          # resourceName includes .fifo suffix for FIFO queues (appended after effectiveName resolution)
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+                .replace("{name}", schema.metadata.name)
+                .replace("{namespace}", schema.metadata.namespace)
+                .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+                .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+                .replace("{configRef}", schema.spec.configRef))
+              + (schema.spec.fifo ? ".fifo" : "")}
+          namingStatus: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+                .replace("{name}", schema.metadata.name)
+                .replace("{namespace}", schema.metadata.namespace)
+                .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+                .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+                .replace("{configRef}", schema.spec.configRef))
+              + (schema.spec.fifo ? ".fifo" : "")).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK SQS Queue CR — primary cloud resource
+    - id: queue
+      template:
+        apiVersion: sqs.services.k8s.aws/v1alpha1
+        kind: Queue
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          queueName: ${naming.data.resourceName}
+          # Encryption — resolved via three-tier cascade (mandatory -> instance -> defaults -> hardcoded fallback)
+          sqsManagedSSEEnabled: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                : (schema.spec.encryptionType != ""
+                    ? schema.spec.encryptionType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.encryptionType != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                        : "sqs-managed"))) == "sqs-managed"
+              ? "true"
+              : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                  : (schema.spec.encryptionType != ""
+                      ? schema.spec.encryptionType
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.encryptionType != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                          : "sqs-managed"))) == "none"
+                ? "false"
+                : ""}
+          kmsMasterKeyID: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                : (schema.spec.encryptionType != ""
+                    ? schema.spec.encryptionType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.encryptionType != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                        : "sqs-managed"))) == "kms"
+              ? (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.kmsMasterKeyId != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsMasterKeyId
+                  : (schema.spec.kmsMasterKeyId != ""
+                      ? schema.spec.kmsMasterKeyId
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.kmsMasterKeyId : "")))
+              : ""}
+          kmsDataKeyReusePeriodSeconds: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                : (schema.spec.encryptionType != ""
+                    ? schema.spec.encryptionType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.encryptionType != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                        : "sqs-managed"))) == "kms"
+              ? string(schema.spec.kmsDataKeyReusePeriodSeconds > 0 ? schema.spec.kmsDataKeyReusePeriodSeconds : 300)
+              : ""}
+          # Queue behaviour — integer governance: mandatory acts as ceiling (non-zero = enforce)
+          visibilityTimeout: >-
+            ${string(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.visibilityTimeout > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.visibilityTimeout
+              : (schema.spec.visibilityTimeout > 0
+                  ? schema.spec.visibilityTimeout
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.visibilityTimeout > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.visibilityTimeout
+                      : 30)))}
+          messageRetentionPeriod: >-
+            ${string(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.messageRetentionPeriod > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.messageRetentionPeriod
+              : (schema.spec.messageRetentionPeriod > 0
+                  ? schema.spec.messageRetentionPeriod
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.messageRetentionPeriod > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.messageRetentionPeriod
+                      : 345600)))}
+          delaySeconds: >-
+            ${string(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.delaySeconds > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.delaySeconds
+              : (schema.spec.delaySeconds > 0
+                  ? schema.spec.delaySeconds
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.delaySeconds > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.delaySeconds
+                      : 0)))}
+          receiveMessageWaitTimeSeconds: >-
+            ${string(schema.spec.receiveMessageWaitTimeSeconds > 0 ? schema.spec.receiveMessageWaitTimeSeconds : 0)}
+          maximumMessageSize: >-
+            ${string(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.maximumMessageSize > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maximumMessageSize
+              : (schema.spec.maximumMessageSize > 0
+                  ? schema.spec.maximumMessageSize
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.maximumMessageSize > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.maximumMessageSize
+                      : 262144)))}
+          # FIFO-specific fields — only meaningful when fifo: true; ACK ignores them for standard queues
+          fifoQueue: "${schema.spec.fifo ? \"true\" : \"false\"}"
+          contentBasedDeduplication: >-
+            ${schema.spec.fifo && schema.spec.contentBasedDeduplication ? "true" : ""}
+          deduplicationScope: >-
+            ${schema.spec.fifo && schema.spec.deduplicationScope != "" ? schema.spec.deduplicationScope : ""}
+          fifoThroughputLimit: >-
+            ${schema.spec.fifo && schema.spec.fifoThroughputLimit != "" ? schema.spec.fifoThroughputLimit : ""}
+          # Queue access policy — read from AWSPolicyDocument CR when queuePolicyRef is set
+          policy: >-
+            ${schema.spec.queuePolicyRef != "" && policyDoc.size() > 0
+              ? policyDoc[0].spec.documentJSON
+              : ""}
+          # Dead-letter queue — JSON-encoded string consumed by ACK (OD-2: use predictedArn from DLQ CR)
+          redrivePolicy: >-
+            ${schema.spec.redrivePolicy.deadLetterTargetRef != "" && dlqCr.size() > 0
+              ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\",\"maxReceiveCount\":" + string(schema.spec.redrivePolicy.maxReceiveCount) + "}"
+              : ""}
+          # Source queue restriction — JSON-encoded string; v1 constraint: callers supply full ARNs (OD-3)
+          redriveAllowPolicy: >-
+            ${schema.spec.redriveAllowPolicy.redrivePermission == "byQueue"
+              ? "{\"redrivePermission\":\"byQueue\",\"sourceQueueArns\":[" + schema.spec.redriveAllowPolicy.sourceQueueArns.map(arn, "\"" + arn + "\"").join(",") + "]}"
+              : schema.spec.redriveAllowPolicy.redrivePermission == "denyAll"
+                ? "{\"redrivePermission\":\"denyAll\"}"
+                : ""}
+          # Cloud resource tags — plain map (ACK SQS Queue tags field is map[string]string)
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})}

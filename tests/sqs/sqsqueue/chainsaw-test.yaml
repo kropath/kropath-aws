@@ -1,0 +1,1520 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-sqs-02 Chainsaw tests — one scenario per acceptance criterion (32 ACs).
+# Namespace: sqsqueue (fixed; {namespace}-{name} template expands predictably).
+# accountId: 123456789012 | region: ap-southeast-2
+# effectiveConfig is injected via kubectl patch --subresource=status to simulate
+# kropath-controller (which is not running in the local test cluster).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: sqsqueue
+spec:
+  namespace: sqsqueue
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy SQSConfig with effectiveConfig patched.
+    # All steps that use the general-policy config rely on this seed.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-sqsqueue-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch sqsconfig general-policy -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: defaults.encryptionType = "sqs-managed" applied when instance is empty.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-encryption-default-sqs-managed
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-default
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: enc-default
+              spec:
+                sqsManagedSSEEnabled: "true"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-default
+              status:
+                resourceName: sqsqueue-enc-default
+                namingStatus: valid
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-default
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: mandatory.encryptionType = "kms" wins over instance sqs-managed.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-encryption-mandatory-kms-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: kms-mandatory
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: kms-mandatory
+              spec:
+                mandatory:
+                  encryptionType: kms
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig kms-mandatory -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"kms","kmsMasterKeyId":"arn:aws:kms:ap-southeast-2:123:key/abc","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-mandatory-kms
+              spec:
+                configRef: kms-mandatory
+                encryptionType: sqs-managed
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: enc-mandatory-kms
+              spec:
+                kmsMasterKeyID: "arn:aws:kms:ap-southeast-2:123:key/abc"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-mandatory-kms
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: kms-mandatory
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: instance encryptionType = "kms" wins over defaults.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-encryption-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-instance-kms
+              spec:
+                encryptionType: kms
+                kmsMasterKeyId: "arn:aws:kms:ap-southeast-2:123456789012:key/test"
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: enc-instance-kms
+              spec:
+                kmsMasterKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/test"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-instance-kms
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: instance encryptionType = "none" wins over defaults sqs-managed.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-encryption-none
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-none
+              spec:
+                encryptionType: none
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: enc-none
+              spec:
+                sqsManagedSSEEnabled: "false"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: enc-none
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: mandatory.visibilityTimeout = 120 clamps instance 600.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-visibility-mandatory-clamp
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: vis-mandatory
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: vis-mandatory
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 120
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig vis-mandatory -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":120,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: vis-clamp
+              spec:
+                configRef: vis-mandatory
+                visibilityTimeout: 600
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: vis-clamp
+              spec:
+                visibilityTimeout: "120"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: vis-clamp
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: vis-mandatory
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: defaults.visibilityTimeout = 30 applied when instance is 0 (not set).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-visibility-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: vis-default
+              spec:
+                visibilityTimeout: 0
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: vis-default
+              spec:
+                visibilityTimeout: "30"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: vis-default
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: mandatory.messageRetentionPeriod = 604800 clamps instance 1209600.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-retention-mandatory-clamp
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: retention-mandatory
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: retention-mandatory
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 604800
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig retention-mandatory -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":604800,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: retention-clamp
+              spec:
+                configRef: retention-mandatory
+                messageRetentionPeriod: 1209600
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: retention-clamp
+              spec:
+                messageRetentionPeriod: "604800"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: retention-clamp
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: retention-mandatory
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: instance delaySeconds = 300 wins over defaults 0.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-delay-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: delay-override
+              spec:
+                delaySeconds: 300
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: delay-override
+              spec:
+                delaySeconds: "300"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: delay-override
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: mandatory.maximumMessageSize = 131072 (128 KB) clamps instance 262144.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-msgsize-mandatory-clamp
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: msgsize-mandatory
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: msgsize-mandatory
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 131072
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig msgsize-mandatory -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":131072,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: msgsize-clamp
+              spec:
+                configRef: msgsize-mandatory
+                maximumMessageSize: 262144
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: msgsize-clamp
+              spec:
+                maximumMessageSize: "131072"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: msgsize-clamp
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: msgsize-mandatory
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: receiveMessageWaitTimeSeconds = 20 (long polling).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-long-polling
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: long-poll
+              spec:
+                receiveMessageWaitTimeSeconds: 20
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: long-poll
+              spec:
+                receiveMessageWaitTimeSeconds: "20"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: long-poll
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: FIFO queue creation with contentBasedDeduplication.
+    # resourceName = sqsqueue-fifo-create.fifo (default template + .fifo suffix)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-fifo-queue-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: fifo-create
+              spec:
+                fifo: true
+                contentBasedDeduplication: true
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: fifo-create
+              spec:
+                fifoQueue: "true"
+                contentBasedDeduplication: "true"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: fifo-create
+              status:
+                resourceName: sqsqueue-fifo-create.fifo
+                namingStatus: valid
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: fifo-create
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: FIFO high-throughput mode.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-fifo-high-throughput
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: fifo-htp
+              spec:
+                fifo: true
+                fifoThroughputLimit: perMessageGroupId
+                deduplicationScope: messageGroup
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: fifo-htp
+              spec:
+                fifoQueue: "true"
+                fifoThroughputLimit: perMessageGroupId
+                deduplicationScope: messageGroup
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: fifo-htp
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: Standard queue (fifo: false default) — no .fifo suffix, fifoQueue=false.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-standard-queue-no-fifo
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: std-queue
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: std-queue
+              spec:
+                fifoQueue: "false"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: std-queue
+              status:
+                resourceName: sqsqueue-std-queue
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: std-queue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: queuePolicyRef resolves AWSPolicyDocument and sets ACK policy field.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-queue-policy-ref
+      try:
+        - apply:
+            file: 02-policy-document.yaml
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: policy-ref-queue
+              spec:
+                queuePolicyRef: my-queue-policy
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: policy-ref-queue
+              spec:
+                policy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"sqs:SendMessage","Resource":"*"}]}'
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: policy-ref-queue
+        - delete:
+            file: 02-policy-document.yaml
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: No queue policy — spec.policy is empty when queuePolicyRef is "".
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-no-queue-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: no-policy-queue
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: no-policy-queue
+              spec:
+                policy: ""
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: no-policy-queue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: DLQ redrive policy — source queue reads predictedArn from DLQ CR.
+    # my-dlq is created first; kro sets its status.predictedArn from the naming
+    # ConfigMap + effectiveConfig.aws.*. Source queue reads it via externalRef.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-dlq-redrive-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: my-dlq
+                labels:
+                  aws.kropath.run/resource-name: my-dlq
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: my-dlq
+              status:
+                predictedArn: arn:aws:sqs:ap-southeast-2:123456789012:sqsqueue-my-dlq
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: src-queue
+              spec:
+                redrivePolicy:
+                  deadLetterTargetRef: my-dlq
+                  maxReceiveCount: 5
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: src-queue
+              spec:
+                redrivePolicy: '{"deadLetterTargetArn":"arn:aws:sqs:ap-southeast-2:123456789012:sqsqueue-my-dlq","maxReceiveCount":5}'
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: src-queue
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: my-dlq
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: redriveAllowPolicy byQueue with sourceQueueArns (full ARNs supplied).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-dlq-allow-policy-byqueue
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: allow-byqueue-dlq
+              spec:
+                redriveAllowPolicy:
+                  redrivePermission: byQueue
+                  sourceQueueArns:
+                    - "arn:aws:sqs:ap-southeast-2:123456789012:payments-prod-source-1"
+                    - "arn:aws:sqs:ap-southeast-2:123456789012:payments-prod-source-2"
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: allow-byqueue-dlq
+              spec:
+                redriveAllowPolicy: '{"redrivePermission":"byQueue","sourceQueueArns":["arn:aws:sqs:ap-southeast-2:123456789012:payments-prod-source-1","arn:aws:sqs:ap-southeast-2:123456789012:payments-prod-source-2"]}'
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: allow-byqueue-dlq
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: redriveAllowPolicy denyAll.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-dlq-allow-policy-denyall
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: allow-denyall-dlq
+              spec:
+                redriveAllowPolicy:
+                  redrivePermission: denyAll
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: allow-denyall-dlq
+              spec:
+                redriveAllowPolicy: '{"redrivePermission":"denyAll"}'
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: allow-denyall-dlq
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-19: DLQ is a FIFO queue; redrivePolicy ARN includes .fifo suffix.
+    # The .fifo suffix is resolved from my-fifo-dlq.status.predictedArn.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac19-dlq-fifo-suffix
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: my-fifo-dlq
+                labels:
+                  aws.kropath.run/resource-name: my-fifo-dlq
+              spec:
+                fifo: true
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: my-fifo-dlq
+              status:
+                predictedArn: arn:aws:sqs:ap-southeast-2:123456789012:sqsqueue-my-fifo-dlq.fifo
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: src-fifo-queue
+              spec:
+                redrivePolicy:
+                  deadLetterTargetRef: my-fifo-dlq
+                  maxReceiveCount: 3
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: src-fifo-queue
+              spec:
+                redrivePolicy: '{"deadLetterTargetArn":"arn:aws:sqs:ap-southeast-2:123456789012:sqsqueue-my-fifo-dlq.fifo","maxReceiveCount":3}'
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: src-fifo-queue
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: my-fifo-dlq
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-20: Standard naming — {namespace}-{name} template applied.
+    # CR name: order-events → resourceName: sqsqueue-order-events
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac20-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: order-events
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: order-events
+              status:
+                resourceName: sqsqueue-order-events
+                namingStatus: valid
+                predictedArn: arn:aws:sqs:ap-southeast-2:123456789012:sqsqueue-order-events
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: order-events
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: FIFO naming — .fifo suffix appended to {namespace}-{name} result.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac21-naming-fifo-suffix
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: order-events-fifo
+              spec:
+                fifo: true
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: order-events-fifo
+              status:
+                resourceName: sqsqueue-order-events-fifo.fifo
+                predictedArn: arn:aws:sqs:ap-southeast-2:123456789012:sqsqueue-order-events-fifo.fifo
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: order-events-fifo
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22: mandatory.namingTemplate wins over defaults template.
+    # mandatory.namingTemplate = "corp-{namespace}-{name}" → corp-sqsqueue-naming-corp
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: naming-mandatory
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: naming-mandatory
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: "corp-{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig naming-mandatory -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-corp
+              spec:
+                configRef: naming-mandatory
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-corp
+              status:
+                resourceName: corp-sqsqueue-naming-corp
+                namingStatus: valid
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-corp
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: naming-mandatory
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-23: nameOverride bypasses naming template entirely.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac23-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-override-src
+              spec:
+                nameOverride: my-custom-queue
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-override-src
+              status:
+                resourceName: my-custom-queue
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: naming-override-src
+              spec:
+                queueName: my-custom-queue
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-override-src
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-24: nameOverride + fifo: true → .fifo suffix appended even with override.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac24-naming-override-fifo
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-override-fifo-src
+              spec:
+                nameOverride: my-custom-fifo
+                fifo: true
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-override-fifo-src
+              status:
+                resourceName: my-custom-fifo.fifo
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: naming-override-fifo-src
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-25 (Negative): namingTemplate with unresolved {tag.env} token.
+    # namingTemplate = "{tag.env}-{name}" but tag env is absent → invalid status.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac25-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: unresolved-template
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: unresolved-template
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{tag.env}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig unresolved-template -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: unresolved-queue
+              spec:
+                configRef: unresolved-template
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: unresolved-queue
+              status:
+                namingStatus: invalid-unresolved-tokens
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: unresolved-queue
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: unresolved-template
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-26: Tags merge — mandatory + defaults + instance all present.
+    # effectiveConfig.mandatory.tags = {cost-centre: platform, queue-type: messaging}
+    # instance spec.tags = {app: orders}
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac26-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: tags-policy
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: tags-policy
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: ""
+                  tags:
+                    cost-centre: platform
+                    queue-type: messaging
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig tags-policy -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{"cost-centre":"platform","queue-type":"messaging"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: tags-queue
+              spec:
+                configRef: tags-policy
+                tags:
+                  app: orders
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: tags-queue
+              spec:
+                tags:
+                  cost-centre: platform
+                  queue-type: messaging
+                  app: orders
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: tags-queue
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: tags-policy
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-27: syncedLabels appear in BOTH metadata.labels (kropath.run/ prefix)
+    # AND ACK Queue spec.tags (plain key) — ADR-015 §6.1 dual assertion.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac27-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: synced-labels-policy
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: synced-labels-policy
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels:
+                    environment: production
+                  syncedAnnotations: {}
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels:
+                    data-class: internal
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig synced-labels-policy -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{"data-class":"internal"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: synced-labels-queue
+              spec:
+                configRef: synced-labels-policy
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: synced-labels-queue
+                labels:
+                  kropath.run/environment: production
+                  kropath.run/data-class: internal
+              spec:
+                tags:
+                  environment: production
+                  data-class: internal
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: synced-labels-queue
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: synced-labels-policy
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-28: syncedAnnotations mirrored to ACK Queue metadata.annotations
+    # with kropath.run/ prefix.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac28-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: synced-anno-policy
+                namespace: sqsqueue
+                labels:
+                  aws.kropath.run/resource-name: synced-anno-policy
+              spec:
+                mandatory:
+                  encryptionType: ""
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 0
+                  messageRetentionPeriod: 0
+                  delaySeconds: 0
+                  maximumMessageSize: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations:
+                    team: events
+                defaults:
+                  encryptionType: "sqs-managed"
+                  kmsMasterKeyId: ""
+                  visibilityTimeout: 30
+                  messageRetentionPeriod: 345600
+                  delaySeconds: 0
+                  maximumMessageSize: 262144
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch sqsconfig synced-anno-policy -n sqsqueue \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionType":"","kmsMasterKeyId":"","visibilityTimeout":0,"messageRetentionPeriod":0,"delaySeconds":0,"maximumMessageSize":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"events"}},"defaults":{"encryptionType":"sqs-managed","kmsMasterKeyId":"","visibilityTimeout":30,"messageRetentionPeriod":345600,"delaySeconds":0,"maximumMessageSize":262144,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: synced-anno-queue
+              spec:
+                configRef: synced-anno-policy
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: synced-anno-queue
+                annotations:
+                  kropath.run/team: events
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: synced-anno-queue
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSConfig
+              metadata:
+                name: synced-anno-policy
+                namespace: sqsqueue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-29: Standard K8s metadata wiring on ACK Queue child.
+    # app.kubernetes.io/managed-by, app.kubernetes.io/instance,
+    # services.k8s.aws/deletion-policy: retain, ownerReferences → SQSQueue CR.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac29-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: std-meta-queue
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: std-meta-queue
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: std-meta-queue
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              (ownerReferences[?kind=='SQSQueue' && name=='std-meta-queue' && controller==`true`]):
+                - kind: SQSQueue
+                  name: std-meta-queue
+                  controller: true
+                  blockOwnerDeletion: true
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: std-meta-queue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-30: deletionPolicy = "delete" → annotation services.k8s.aws/deletion-policy: delete
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac30-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: del-policy-delete
+              spec:
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: del-policy-delete
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: del-policy-delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-31: deletionPolicy = "retain" (default) → annotation retain.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac31-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: del-policy-retain
+              spec:
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: del-policy-retain
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: del-policy-retain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-32: KMS encryption with kmsDataKeyReusePeriodSeconds = 3600.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac32-kms-data-key-reuse
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: kms-reuse-queue
+              spec:
+                encryptionType: kms
+                kmsMasterKeyId: "arn:aws:kms:ap-southeast-2:123456789012:key/reuse-test"
+                kmsDataKeyReusePeriodSeconds: 3600
+        - assert:
+            resource:
+              apiVersion: sqs.services.k8s.aws/v1alpha1
+              kind: Queue
+              metadata:
+                name: kms-reuse-queue
+              spec:
+                kmsMasterKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/reuse-test"
+                kmsDataKeyReusePeriodSeconds: "3600"
+      cleanup:
+        - delete:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SQSQueue
+              metadata:
+                name: kms-reuse-queue
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Final teardown: delete namespace and general-policy config.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: teardown
+      try:
+        - delete:
+            file: 01-general-policy-config.yaml
+        - delete:
+            file: 00-sqsqueue-namespace.yaml
