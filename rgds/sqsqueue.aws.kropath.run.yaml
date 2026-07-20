@@ -96,17 +96,21 @@ spec:
             matchLabels:
               aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
 
-    # DLQ ARN resolution — reads status.predictedArn from the referenced SQSQueue CR (OD-2).
-    # Sentinel pattern: when deadLetterTargetRef is empty, selector never matches and dlqCr is [].
-    - id: dlqCr
+    # DLQ ARN resolution via the DLQ's naming ConfigMap (OD-2).
+    # Cannot use SQSQueue externalRef here — self-referential kind causes kro schema-not-found at init.
+    # Instead, each SQSQueue's naming ConfigMap is labeled with aws.kropath.run/resource-name and
+    # aws.kropath.run/kropath-type: sqs-naming so source queues can discover the DLQ's resourceName.
+    # Sentinel pattern: when deadLetterTargetRef is empty, selector never matches and dlqNaming is [].
+    - id: dlqNaming
       externalRef:
-        apiVersion: aws.kropath.run/v1alpha1
-        kind: SQSQueue
+        apiVersion: v1
+        kind: ConfigMap
         metadata:
           namespace: ${schema.metadata.namespace}
           selector:
             matchLabels:
               aws.kropath.run/resource-name: '${schema.spec.redrivePolicy.deadLetterTargetRef != "" ? schema.spec.redrivePolicy.deadLetterTargetRef : "kro-empty-fallback-sentinel"}'
+              aws.kropath.run/kropath-type: sqs-naming
 
     # Queue policy resolution via AWSPolicyDocument (optional).
     # Sentinel pattern: when queuePolicyRef is empty, selector never matches and policyDoc is [].
@@ -129,6 +133,9 @@ spec:
         metadata:
           name: ${schema.metadata.name}-naming
           namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: sqs-naming
           ownerReferences:
             - apiVersion: aws.kropath.run/v1alpha1
               kind: SQSQueue
@@ -300,10 +307,12 @@ spec:
             ${schema.spec.queuePolicyRef != "" && policyDoc.size() > 0
               ? policyDoc[0].spec.documentJSON
               : ""}
-          # Dead-letter queue — JSON-encoded string consumed by ACK (OD-2: use predictedArn from DLQ CR)
+          # Dead-letter queue — JSON-encoded string consumed by ACK.
+          # ARN is constructed from dlqNaming ConfigMap (resourceName already includes .fifo suffix)
+          # combined with rsrcCfg aws.region and aws.accountId (both queues share the same config).
           redrivePolicy: >-
-            ${schema.spec.redrivePolicy.deadLetterTargetRef != "" && dlqCr.size() > 0
-              ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\",\"maxReceiveCount\":" + string(schema.spec.redrivePolicy.maxReceiveCount) + "}"
+            ${schema.spec.redrivePolicy.deadLetterTargetRef != "" && dlqNaming.size() > 0 && rsrcCfg.size() > 0
+              ? "{\"deadLetterTargetArn\":\"arn:aws:sqs:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":" + dlqNaming[0].data.resourceName + "\",\"maxReceiveCount\":" + string(schema.spec.redrivePolicy.maxReceiveCount) + "}"
               : ""}
           # Source queue restriction — JSON-encoded string; v1 constraint: callers supply full ARNs (OD-3)
           redriveAllowPolicy: >-
