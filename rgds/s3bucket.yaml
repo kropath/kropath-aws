@@ -40,11 +40,11 @@ spec:
       objectOwnership: string | default=BucketOwnerEnforced
     status:
       resourceName: >-
-        ${bucket.spec.name}
+        ${naming.data.effectiveName}
       namingStatus: >-
-        ${bucket.spec.name.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
       predictedArn: >-
-        ${"arn:aws:s3:::" + bucket.spec.name}
+        ${"arn:aws:s3:::" + naming.data.effectiveName}
   resources:
     - id: rsrcCfg
       externalRef:
@@ -55,6 +55,71 @@ spec:
           selector:
             matchLabels:
               aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Tag tokens are resolved in cascade order: defaults → instance spec → mandatory (mandatory wins).
+    # Any {tag.X} token whose key is absent in the merged tags map is kept verbatim so that
+    # namingStatus reports "invalid-unresolved-tokens" and the bucket name is clearly invalid.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # Dynamic {tag.X} resolution:
+          #   1. Split template by "{tag." to get segments
+          #   2. For each segment after the first, extract key = part before "}", resolve from
+          #      merged tags (mandatory wins > instance spec > defaults), then append tail
+          #   3. Re-join segments and apply standard {namespace}/{name}/etc. substitutions
+          # Priority: mandatory.tags > spec.tags > spec.syncedLabels > defaults.tags
+          # Unresolved tokens are kept verbatim as "{tag.KEY}" so namingStatus catches them.
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)
+            ).lowerAscii()}
+
     - id: bucket
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
@@ -80,20 +145,7 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          name: >-
-            ${(schema.spec.nameOverride != ""
-              ? schema.spec.nameOverride
-              : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != ""
-                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
-                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != ""
-                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
-                      : schema.metadata.name))
-                .replace("{namespace}", schema.metadata.namespace)
-                .replace("{name}", schema.metadata.name)
-                .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
-                .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
-                .replace("{configRef}", schema.spec.configRef)
-            ).lowerAscii()}
+          name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
               ${schema.spec.region != "" && schema.spec.region != "us-east-1"
@@ -156,19 +208,7 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.enforceHttpsOnly : false)))
               ? "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
-                .replace("__BNAME__", (schema.spec.nameOverride != ""
-                  ? schema.spec.nameOverride
-                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != ""
-                      ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
-                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != ""
-                          ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
-                          : schema.metadata.name))
-                    .replace("{namespace}", schema.metadata.namespace)
-                    .replace("{name}", schema.metadata.name)
-                    .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
-                    .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
-                    .replace("{configRef}", schema.spec.configRef)
-                ).lowerAscii())
+                .replace("__BNAME__", naming.data.effectiveName)
               : ""}
           tagging: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
