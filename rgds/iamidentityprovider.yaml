@@ -38,11 +38,9 @@ spec:
         metadataDocument: string | default=""
     status:
       resourceName: >-
-        ${has(oidcProvider.metadata) && has(oidcProvider.metadata.name) ? oidcProvider.metadata.name : ""}
+        ${naming.data.effectiveName}
       namingStatus: >-
-        ${has(oidcProvider.metadata) && has(oidcProvider.metadata.name)
-          ? (oidcProvider.metadata.name.contains("{") ? "invalid-unresolved-tokens" : "active")
-          : (has(samlProvider.data) && has(samlProvider.data.status) ? samlProvider.data.status : "pending")}
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : (has(samlProvider.data) && has(samlProvider.data.status) ? samlProvider.data.status : "active")}
       providerArn: >-
         ${has(oidcProvider.status) ? oidcProvider.status.?ackResourceMetadata.?arn.orValue("") : ""}
       conditions: >-
@@ -72,6 +70,59 @@ spec:
           selector:
             matchLabels:
               aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Always created (no includeWhen) so status can reference naming.data.effectiveName unconditionally.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMIdentityProvider
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{kind}", "iamidentityprovider")}
+
     - id: oidcProvider
       includeWhen:
         - '${has(schema.spec) && schema.spec.type == "oidc"}'
@@ -80,19 +131,7 @@ spec:
         apiVersion: iam.services.k8s.aws/v1alpha1
         kind: OpenIDConnectProvider
         metadata:
-          name: >-
-            ${schema.spec.nameOverride != "" ? schema.spec.nameOverride :
-              (rsrcCfg.size() > 0 &&
-                ((has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "") ||
-                 (has(rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate) && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")) ?
-              (has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "" ?
-                rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate :
-                rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate)
-              .replace("{namespace}", schema.metadata.namespace)
-              .replace("{name}", schema.metadata.name)
-              .replace("{account_id}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "")
-              .replace("{kind}", "iamidentityprovider") :
-              schema.metadata.name)}
+          name: ${naming.data.effectiveName}
           namespace: ${schema.metadata.namespace}
           labels: >-
             ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}

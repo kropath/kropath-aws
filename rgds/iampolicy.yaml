@@ -35,11 +35,11 @@ spec:
       syncedAnnotations: map[string]string | default={}
     status:
       resourceName: >-
-        ${policy.?spec.?name.orValue("")}
+        ${naming.data.effectiveName}
       namingStatus: >-
-        ${policy.?spec.?name.orValue("").contains("{") ? "invalid-unresolved-tokens" : (has(policy.spec) ? "valid" : "pending")}
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
       predictedArn: >-
-        ${has(policy.spec) && rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) ? "arn:aws:iam::" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":policy" + policy.spec.path + policy.spec.name : ""}
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) && naming.data.effectiveName != "" ? "arn:aws:iam::" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":policy" + (has(policy.spec) ? policy.spec.path : "/") + naming.data.effectiveName : ""}
       arn: >-
         ${policy.status.?ackResourceMetadata.?arn.orValue("")}
       policyId: >-
@@ -68,6 +68,61 @@ spec:
           selector:
             matchLabels:
               aws.kropath.run/resource-name: '${schema.spec.documentRef != "" ? schema.spec.documentRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Tag tokens are resolved in cascade order: defaults → instance spec → mandatory (mandatory wins).
+    # Any {tag.X} token whose key is absent in the merged tags map is kept verbatim so that
+    # namingStatus reports "invalid-unresolved-tokens" and the policy name is clearly invalid.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")}
+
     - id: mutualExclusionError
       includeWhen:
         - '${schema.spec.documentJSON != "" && schema.spec.documentRef != ""}'
@@ -113,17 +168,7 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          name: >-
-            ${schema.spec.nameOverride != "" ? schema.spec.nameOverride :
-              (rsrcCfg.size() > 0 &&
-                ((has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "") ||
-                 (has(rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate) && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")) ?
-                (has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "" ?
-                  rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate :
-                  rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate)
-                  .replace("{namespace}", schema.metadata.namespace)
-                  .replace("{name}", schema.metadata.name) :
-                schema.metadata.name)}
+          name: ${naming.data.effectiveName}
           path: "${schema.spec.path}"
           description: "${schema.spec.description}"
           policyDocument: >-
