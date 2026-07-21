@@ -43,11 +43,11 @@ spec:
           documentRef: string | default=""
     status:
       resourceName: >-
-        ${user.?spec.?name.orValue("")}
+        ${naming.data.effectiveName}
       namingStatus: >-
-        ${user.?spec.?name.orValue("").contains("{") ? "invalid-unresolved-tokens" : (has(user.spec) ? "valid" : "pending")}
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
       predictedArn: >-
-        ${has(user.spec) && rsrcCfg.size() > 0 && has(rsrcCfg[0].status) && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) ? "arn:aws:iam::" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":user" + user.spec.path + user.spec.name : ""}
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) && naming.data.effectiveName != "" ? "arn:aws:iam::" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":user" + (has(user.spec) ? user.spec.path : "/") + naming.data.effectiveName : ""}
       accessKeyBlocked: >-
         ${accessKeyBlockedAdvisory.?data.?blocked.orValue("") == "true"}
       accessKeyBlockedConditionType: >-
@@ -95,6 +95,60 @@ spec:
           selector:
             matchLabels:
               aws.kropath.run/resource-name: '${has(schema.spec.policies) && schema.spec.policies.size() > 0 && schema.spec.policies[0].?inline.?documentRef.orValue("") != "" ? schema.spec.policies[0].inline.documentRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Tag tokens are resolved in cascade order: defaults → instance spec → mandatory (mandatory wins).
+    # Any {tag.X} token whose key is absent in the merged tags map is kept verbatim so that
+    # namingStatus reports "invalid-unresolved-tokens" and the user name is clearly invalid.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMUser
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")}
 
     - id: accessKeyBlockedAdvisory
       # Advisory ConfigMap surfacing that createAccessKey was requested but blocked by governance.
@@ -148,17 +202,7 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          name: >-
-            ${schema.spec.nameOverride != "" ? schema.spec.nameOverride :
-              ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "") ?
-                rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
-                  .replace("{namespace}", schema.metadata.namespace)
-                  .replace("{name}", schema.metadata.name) :
-               ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate) && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "") ?
-                 rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
-                   .replace("{namespace}", schema.metadata.namespace)
-                   .replace("{name}", schema.metadata.name) :
-                 schema.metadata.name))}
+          name: ${naming.data.effectiveName}
           path: >-
             ${schema.spec.path}
           policies: >-
