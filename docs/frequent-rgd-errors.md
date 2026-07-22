@@ -414,6 +414,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
 | **Chainsaw inter-step map clearing** | `--type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{}}}}'` | Null out first: `-p '{"status":{"effectiveConfig":null}}'`, then re-patch with desired values |
 | **`predictedArn` in status block** | `schema.spec.path` / `schema.spec.name` (unavailable in status scope) | Use child resource fields: `policy.spec.path` + `policy.spec.name` |
 | **ARN assertion in tests** | `status.arn` (empty without real AWS) | `status.predictedArn` (computed from accountId + path + name) |
+| **Chainsaw list/array assertion** | Exact-order list match on CEL-generated tags/tagging | `(length(x)): N` + `(key == 'foo'): true` item-level match per element |
 
 ### CEL Is Not Supported in `externalRef.metadata.name` — Use labelSelector
 
@@ -462,3 +463,37 @@ This document tracks technical friction points, syntax limitations, and runtime 
     | GCP *(future)* | `gcp.kropath.run/resource-name` |
     | Azure *(future)* | `azure.kropath.run/resource-name` |
     Bare forms `kropath.run/resource-name` and `kropath.run/config-name` are **deprecated**.
+
+---
+
+## 6. Chainsaw Test Assertion Stability
+
+### Flaky List/Array Asserts — CEL Map-to-List Transforms Have Unstable Order
+
+* **What Fails:** A chainsaw `assert` on a list field produced by a CEL `.merge().transformList(...)` chain (e.g. ACK `spec.tags` / `spec.tagging` key-value lists) passes most runs but intermittently fails with a diff showing the *same elements in a different order*:
+    ```yaml
+    # Flaky — exact-order list match
+    spec:
+      tags:
+        - key: cost-centre
+          value: platform
+        - key: environment
+          value: mandatory
+    ```
+* **Why:** CEL's `.merge()` operates over maps, and map iteration order in the underlying Go/CEL runtime is not guaranteed stable across evaluations. `.transformList()` then serializes that iteration order into a list. Chainsaw's default assertion semantics for arrays require an **exact positional match**, so any CEL-generated list (tags, `tagging`, synced-label-derived tag lists, etc.) is a latent flake — it may pass locally and fail in CI, or pass in isolation and fail in parallel runs, purely from map-order nondeterminism. Note this only applies to *list-shaped* cloud tag fields (ACK IAM Role/User/Policy `spec.tags`, S3 `spec.tagging`, KMS `spec.tags` as `tagKey`/`tagValue`); ACK SQS `Queue.spec.tags` is a **map**, not a list, and is inherently order-stable — no fix needed there.
+* **What Works Instead:** Use Chainsaw's item-level assertion syntax — `(?...)` boolean lambda checks — to match each expected element independent of position, plus a `(length(x))` check to catch unexpected extra/missing elements:
+    ```yaml
+    spec:
+      # 1. Ensure the array length matches (prevents unexpected extra/missing tags)
+      (length(tags)): 2
+      # 2. Match elements order-insensitively — each entry keyed on its unique field
+      tags:
+        - (key == 'cost-centre'): true
+          value: platform
+        - (key == 'environment'): true
+          value: mandatory
+    ```
+    For KMS Key's `tagKey`/`tagValue` naming: `- (tagKey == 'cost-centre'): true`. For S3 Bucket's `tagging` field: same `key`/`value` shape as IAM.
+* **Rule:** Apply this pattern to **every** chainsaw assert on a list field that is populated by a CEL `.merge()`/`.transformList()` chain — even single-item lists, for consistency and to future-proof against a later test adding a second item. Do not apply it to lists that echo raw user input verbatim (e.g. `spec.mandatory.allowedKeySpecs` on a config CR, `spec.policies` ARNs on an IAMRole) — those preserve apply-time order deterministically and are not CEL-transformed.
+
+---
