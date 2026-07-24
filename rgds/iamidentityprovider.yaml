@@ -25,6 +25,11 @@ spec:
     spec:
       configRef: string | default=general-policy
       type: string | required=true
+      # nameOverride is kept for schema consistency across all kropath RGDs (ADR-015 §"Required
+      # Wiring") but is a no-op here: the ACK OpenIDConnectProvider CRD has no `name`/`spec.name`
+      # field to set (confirmed against kropath-core/docs/crd-cache/aws/iam-controller-v1.4.2.md —
+      # OpenIDConnectProvider spec is clientIDs/tags/thumbprints/url only), and SAMLProvider is not
+      # yet supported by the ACK IAM controller at all. There is no cloud resource name to override.
       nameOverride: string | default=""
       deletionPolicy: string | default=retain
       tags: map[string]string | default={}
@@ -36,11 +41,13 @@ spec:
         audiences: "[]string | default=[]"
       saml:
         metadataDocument: string | default=""
+    # No resourceName / namingStatus / predictedArn fields here: unlike other IAM RGDs,
+    # IAMIdentityProvider has no cloud resource "name" to compute. The ACK OpenIDConnectProvider
+    # CRD (the only supported provider type) takes no name parameter — AWS identifies OIDC
+    # providers by URL, not by name — so namingTemplate/nameOverride/{tag.X} tokens never apply
+    # to this RGD's cloud resource. See docs/frequent-rgd-errors.md
+    # §"IAMIdentityProvider Has No Cloud Resource Name — namingTemplate Does Not Apply".
     status:
-      resourceName: >-
-        ${naming.data.effectiveName}
-      namingStatus: >-
-        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : (has(samlProvider.data) && has(samlProvider.data.status) ? samlProvider.data.status : "active")}
       providerArn: >-
         ${has(oidcProvider.status) ? oidcProvider.status.?ackResourceMetadata.?arn.orValue("") : ""}
       conditions: >-
@@ -51,12 +58,9 @@ spec:
       - name: Type
         type: string
         jsonPath: .spec.type
-      - name: ResourceName
+      - name: ProviderArn
         type: string
-        jsonPath: .status.resourceName
-      - name: NamingStatus
-        type: string
-        jsonPath: .status.namingStatus
+        jsonPath: .status.providerArn
       - name: ValidationError
         type: string
         jsonPath: .status.validationError
@@ -70,59 +74,6 @@ spec:
           selector:
             matchLabels:
               aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
-    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
-    # Always created (no includeWhen) so status can reference naming.data.effectiveName unconditionally.
-    - id: naming
-      template:
-        apiVersion: v1
-        kind: ConfigMap
-        metadata:
-          name: ${schema.metadata.name}-naming
-          namespace: ${schema.metadata.namespace}
-          labels:
-            app.kubernetes.io/managed-by: kro
-            app.kubernetes.io/instance: ${schema.metadata.name}
-          ownerReferences:
-            - apiVersion: aws.kropath.run/v1alpha1
-              kind: IAMIdentityProvider
-              name: ${schema.metadata.name}
-              uid: ${schema.metadata.uid}
-              controller: true
-              blockOwnerDeletion: true
-        data:
-          effectiveName: >-
-            ${(schema.spec.nameOverride != ""
-              ? schema.spec.nameOverride
-              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "")
-                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
-                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")
-                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
-                      : schema.metadata.name))
-              .split("{tag.")
-              .transformList(i, part,
-                i == 0 ? part
-                : ((rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
-                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
-                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
-                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
-                          : (part.split("}")[0] in schema.spec.tags
-                              ? schema.spec.tags[part.split("}")[0]]
-                              : (part.split("}")[0] in schema.spec.syncedLabels
-                                  ? schema.spec.syncedLabels[part.split("}")[0]]
-                                  : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
-                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
-                                      : (rsrcCfg.size() > 0 && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
-                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
-                                          : "{tag." + part.split("}")[0] + "}"))))))
-                  + (size(part.split("}")) > 1
-                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
-                      : "")))
-              .join("")
-              .replace("{namespace}", schema.metadata.namespace)
-              .replace("{name}", schema.metadata.name)
-              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
-              .replace("{kind}", "iamidentityprovider")}
-
     - id: oidcProvider
       includeWhen:
         - '${has(schema.spec) && schema.spec.type == "oidc"}'
@@ -131,7 +82,7 @@ spec:
         apiVersion: iam.services.k8s.aws/v1alpha1
         kind: OpenIDConnectProvider
         metadata:
-          name: ${naming.data.effectiveName}
+          name: ${schema.metadata.name}
           namespace: ${schema.metadata.namespace}
           labels: >-
             ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}

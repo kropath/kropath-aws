@@ -346,6 +346,20 @@ This document tracks technical friction points, syntax limitations, and runtime 
 
 ---
 
+### IAMIdentityProvider Has No Cloud Resource Name — namingTemplate Does Not Apply
+
+* **What Fails:** KRO-236 added generic `{tag.X}` dynamic naming-template support to every IAM RGD, including `IAMIdentityProvider`. In that RGD a `naming` ConfigMap computed `effectiveName` from `nameOverride` / `namingTemplate` / `{tag.X}` tokens, and the child `OpenIDConnectProvider`'s `metadata.name` (the Kubernetes object name) was set to `${naming.data.effectiveName}` instead of `${schema.metadata.name}`. This is wrong at the root: it conflates the *Kubernetes child resource name* with a *cloud resource name*, and this resource family has no cloud resource name at all.
+* **Why:** Check the CRD cache before assuming a naming template applies — `kropath-core/docs/crd-cache/aws/iam-controller-v1.4.2.md` documents the ACK `OpenIDConnectProvider` spec as exactly `clientIDs` / `tags` / `thumbprints` / `url`, with no `name` field. AWS identifies an OIDC identity provider by its URL (and, once created, its ARN — `arn:aws:iam::<account>:oidc-provider/<url-without-scheme>`), never by a name. `SAMLProvider` isn't even implemented by the ACK IAM controller (see previous entry), so it can't take a naming template either. Since there is no cloud-side name, `namingTemplate`, `{tag.X}` tokens, and `nameOverride` have nothing to drive — computing an `effectiveName` for this RGD was solving a problem that doesn't exist for this resource family, and doing so via `naming.data.effectiveName` on the child's `metadata.name` accidentally renamed the *Kubernetes* child object too, which is a separate, unconditional rule violation (see "What Works Instead").
+* **What Works Instead:**
+  1. **Never compute `effectiveName` for this RGD.** Don't add a `naming` ConfigMap resource; don't reference `namingTemplate`/`{tag.X}` tokens anywhere in `iamidentityprovider.yaml`.
+  2. **The Kubernetes child resource name is always `${schema.metadata.name}`**, exactly like every other RGD — the RGD instance name is already unique per namespace, so there is never a reason to derive the child object's `metadata.name` from anything else. This applies even in RGDs (like this one) that have no cloud-side naming concept at all.
+  3. **Keep `spec.nameOverride` in the schema** for cross-RGD consistency (ADR-015 §"Required Wiring" / this repo's CLAUDE.md "Never do: Omit `spec.nameOverride`..."), but document it as an intentional no-op for this resource type — do not wire it to anything.
+  4. **Drop `status.resourceName` / `status.namingStatus`** (and their `additionalPrinterColumns` entries) entirely — there is no naming outcome to report. Keep `status.providerArn` (the real, post-reconciliation ARN) and `status.validationError`; consider a `ProviderArn` printer column in place of the removed naming columns for at-a-glance visibility.
+  5. **Before adding naming-template support to any new RGD**, check the resource family's entry in `kropath-core/docs/crd-cache/aws/<controller>.md` for a `name` field on the target ACK CRD. If the target CRD (`OpenIDConnectProvider` today; watch for similar cases in other providers/resource families) has no name field, namingTemplate does not apply — skip the `naming` ConfigMap pattern entirely rather than retrofitting it.
+* **Regression test:** `tests/iam/iamidentityprovider/chainsaw-test.yaml` step `nameoverride-and-naming-template-are-noop-for-oidc` sets a non-empty mandatory `namingTemplate` (with an unresolved `{tag.X}` token) and a non-empty `spec.nameOverride`, then asserts the child `OpenIDConnectProvider`'s `metadata.name` is unaffected and still equals the instance's own `schema.metadata.name`.
+
+---
+
 ### ACK `ackResourceMetadata` Patch Requires `ownerAccountID` and `region`
 
 * **What Fails:** A chainsaw script patches only `arn` into `status.ackResourceMetadata` to simulate a reconciled ACK resource:
@@ -415,6 +429,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
 | **`predictedArn` in status block** | `schema.spec.path` / `schema.spec.name` (unavailable in status scope) | Use child resource fields: `policy.spec.path` + `policy.spec.name` |
 | **ARN assertion in tests** | `status.arn` (empty without real AWS) | `status.predictedArn` (computed from accountId + path + name) |
 | **Chainsaw list/array assertion** | Exact-order list match on CEL-generated tags/tagging | `(length(x)): N` + `(key == 'foo'): true` item-level match per element |
+| **Naming template on a nameless ACK resource** | Adding `naming` ConfigMap / `effectiveName` / `resourceName` / `namingStatus` unconditionally to every RGD | Check `kropath-core/docs/crd-cache/aws/<controller>.md` for a `name` field first; if absent (e.g. `OpenIDConnectProvider`), skip naming-template entirely |
 
 ### CEL Is Not Supported in `externalRef.metadata.name` — Use labelSelector
 
