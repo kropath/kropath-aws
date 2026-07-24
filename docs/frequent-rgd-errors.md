@@ -481,19 +481,35 @@ This document tracks technical friction points, syntax limitations, and runtime 
           value: mandatory
     ```
 * **Why:** CEL's `.merge()` operates over maps, and map iteration order in the underlying Go/CEL runtime is not guaranteed stable across evaluations. `.transformList()` then serializes that iteration order into a list. Chainsaw's default assertion semantics for arrays require an **exact positional match**, so any CEL-generated list (tags, `tagging`, synced-label-derived tag lists, etc.) is a latent flake — it may pass locally and fail in CI, or pass in isolation and fail in parallel runs, purely from map-order nondeterminism. Note this only applies to *list-shaped* cloud tag fields (ACK IAM Role/User/Policy `spec.tags`, S3 `spec.tagging`, KMS `spec.tags` as `tagKey`/`tagValue`); ACK SQS `Queue.spec.tags` is a **map**, not a list, and is inherently order-stable — no fix needed there.
-* **What Works Instead:** Use Chainsaw's item-level assertion syntax — `(?...)` boolean lambda checks — to match each expected element independent of position, plus a `(length(x))` check to catch unexpected extra/missing elements:
+* **What Does NOT Work — two previously-documented false fixes:**
+    1. Per-item list assertions like `- (key == 'cost-centre'): true` under the list field. **This is still positional.** Chainsaw pairs assert-list-item `[i]` with actual-list-item `[i]` and evaluates the boolean check against that fixed position — it does not search across positions for a match. So when the actual array's map-iteration order differs from the order the assert was written in, item `[0]`'s check (`key == 'cost-centre'`) gets evaluated against whatever tag actually landed at position 0, fails, and the flake reappears exactly as before — confirmed empirically via `spec.tagging[0].(key == 'cost-centre'): Invalid value: false: Expected value: true` in a real CI failure (2026-07-23, KRO-236 follow-up).
+    2. A whole-array CEL `.exists()` boolean check, e.g. `(tags.exists(t, t.key == 'x' && t.value == 'y')): true`. This *would* be order-independent if it worked, but chainsaw's assertion engine is a JMESPath-style tree (kyverno-json), **not** full CEL — `.exists()` is not implemented and fails outright with `Internal error: unknown function: exists` (confirmed in the same 2026-07-23 CI run, one commit after the `.exists()` "fix" was applied).
+
+    Do not use either pattern for any CEL-generated list.
+* **What Works Instead:** Chainsaw's declarative assertion tree has no genuinely order-independent list construct for this case. Drop the tag-list check from the declarative `assert:` block entirely (an empty `spec: {}` for the fields you can't assert declaratively is fine — other fields like `metadata.name`/`labels` can still be asserted normally) and verify it with a `- script:` step using `kubectl ... -o json | jq`, which is plain shell and therefore genuinely order-independent:
     ```yaml
-    spec:
-      # 1. Ensure the array length matches (prevents unexpected extra/missing tags)
-      (length(tags)): 2
-      # 2. Match elements order-insensitively — each entry keyed on its unique field
-      tags:
-        - (key == 'cost-centre'): true
-          value: platform
-        - (key == 'environment'): true
-          value: mandatory
+    - script:
+        content: |
+          TAGS=$(kubectl get role my-role -n myns -o json | jq -c '.spec.tags')
+          COUNT=$(echo "$TAGS" | jq 'length')
+          [ "$COUNT" -eq 2 ] || { echo "FAIL: expected 2 tags, got $COUNT: $TAGS"; exit 1; }
+          echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag cost-centre=platform"; exit 1; }
+          echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "mandatory")' >/dev/null || { echo "FAIL: missing tag environment=mandatory"; exit 1; }
     ```
-    For KMS Key's `tagKey`/`tagValue` naming: `- (tagKey == 'cost-centre'): true`. For S3 Bucket's `tagging` field: same `key`/`value` shape as IAM.
-* **Rule:** Apply this pattern to **every** chainsaw assert on a list field that is populated by a CEL `.merge()`/`.transformList()` chain — even single-item lists, for consistency and to future-proof against a later test adding a second item. Do not apply it to lists that echo raw user input verbatim (e.g. `spec.mandatory.allowedKeySpecs` on a config CR, `spec.policies` ARNs on an IAMRole) — those preserve apply-time order deterministically and are not CEL-transformed.
+    For KMS Key's `tagKey`/`tagValue` naming, use `.tagKey`/`.tagValue` in the jq filter instead. For S3 Bucket's `tagging` field: same `key`/`value` shape as IAM, just query `.spec.tagging`.
+* **Rule:** Apply this jq-script pattern to **every** chainsaw check on a list field that is populated by a CEL `.merge()`/`.transformList()` chain — even single-item lists, for consistency and to future-proof against a later test adding a second item. Do not apply it to lists that echo raw user input verbatim (e.g. `spec.mandatory.allowedKeySpecs` on a config CR, `spec.policies` ARNs on an IAMRole) — those preserve apply-time order deterministically and are not CEL-transformed, so a plain positional `assert:` is fine for them.
+
+### `kubectl get role`/`kubectl get user` Short-Name Collisions with Kubernetes RBAC
+
+* **What Fails:** A test script runs `kubectl get role <name> -n <ns> -o json`, expecting the ACK `iam.services.k8s.aws/v1alpha1` `Role`, but gets `Error from server (NotFound): roles.rbac.authorization.k8s.io "<name>" not found`. Kubernetes' built-in RBAC `Role` kind is registered under the short name `role` too, and kubectl's discovery client resolves the bare short name to the built-in RBAC resource instead of the ACK CRD. A script that only checks for empty/non-empty output (rather than the command's exit code) can silently pass even though it never queried the resource it meant to — a false-negative-tolerant bug, not a crash (found 2026-07-23 in `tests/iam/iamrole/chainsaw-test.yaml`'s `boundary-and-naming` step, which had used this pattern with `test -z "$boundary"` and coincidentally kept "passing" because the command failed and produced empty output either way).
+* **Why:** `kubectl`'s short-name-to-resource mapping is not scoped per test; RBAC's `Role`/`ClusterRole` are core, well-known kinds with priority over CRD-registered kinds of the same short name.
+* **What Works Instead:** Always use the fully-qualified plural resource name for ACK kinds that collide with built-in Kubernetes kinds — `roles.iam.services.k8s.aws` instead of `role`. This matches the pattern already used elsewhere in these test files for other ACK kinds (`policies.iam.services.k8s.aws`, `keys.kms.services.k8s.aws`, `groups.iam.services.k8s.aws`). ACK `User`, `Bucket`, `Key`, `OpenIDConnectProvider` have no built-in-Kubernetes-kind collision and are safe to query with their bare short name.
+* **Rule:** Any new `kubectl get <ack-kind>` in a test script must use the fully-qualified `<plural>.<group>` form, never the bare kind name, for any kind that might shadow a built-in Kubernetes resource (`role`, and watch for `service`, `endpoint`, `event`, `secret`, etc. if ACK ever adds CRDs with those names).
+
+### OPEN ISSUE: `IAMIdentityProvider`/`OpenIDConnectProvider` CLEANUP Always Times Out
+
+* **Status:** Unresolved as of 2026-07-23. See `docs/troubleshooting-logs/2026-07-23-chainsaw-flaky-list-asserts.md` for the full investigation.
+* **Symptom:** Every step in `tests/iam/iamidentityprovider/chainsaw-test.yaml` that creates an `IAMIdentityProvider`/`OpenIDConnectProvider` logs a `CLEANUP ERROR: context deadline exceeded` (~30s per step) before the step's explicit `cleanup:` script (which patches `metadata.finalizers: []` then deletes) runs and succeeds. This inflates the suite's runtime (400s+) and, in a full `make test` run, was enough to mark the whole `iamidentityprovider` suite FAILED even though every individual assertion passed.
+* **What was tried and did NOT fix it:** Moving the finalizer-clearing patch from the `cleanup:` block to the end of `try:` (so it runs before chainsaw's own automatic post-`try` resource deletion). The timeout still recurs on every step at a regular ~30s cadence, suggesting either kro re-adds the finalizer between the patch and chainsaw's automatic delete attempt, or chainsaw's automatic delete is targeting a different/child resource than the one being patched. Needs further investigation before another fix attempt — do not re-apply the "move to end of try" pattern expecting it to work; it demonstrably does not, on its own.
 
 ---
