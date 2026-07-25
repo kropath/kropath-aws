@@ -42,11 +42,11 @@ spec:
         documentRef: string | default=""
     status:
       resourceName: >-
-        ${group.?spec.?name.orValue("")}
+        ${naming.data.effectiveName}
       namingStatus: >-
-        ${group.?spec.?name.orValue("").contains("{") ? "invalid-unresolved-tokens" : (has(group.spec) ? "valid" : "pending")}
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
       predictedArn: >-
-        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) && has(group.spec) && has(group.spec.name) && group.spec.name != "" ? "arn:aws:iam::" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":group" + group.spec.path + group.spec.name : ""}
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) && naming.data.effectiveName != "" ? "arn:aws:iam::" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":group" + (has(group.spec) ? group.spec.path : "/") + naming.data.effectiveName : ""}
       conditions: >-
         ${group.status.?conditions.orValue([])}
     additionalPrinterColumns:
@@ -90,6 +90,58 @@ spec:
             matchLabels:
               aws.kropath.run/resource-name: '${has(schema.spec.inlinePolicies) && schema.spec.inlinePolicies.size() > 0 && schema.spec.inlinePolicies[0].?documentRef.orValue("") != "" ? schema.spec.inlinePolicies[0].documentRef : "kro-empty-fallback-sentinel"}'
 
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{kind}", "iamgroup"))}
+
     - id: group
       template:
         apiVersion: iam.services.k8s.aws/v1alpha1
@@ -115,19 +167,9 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          name: >-
-            ${schema.spec.nameOverride != "" ? schema.spec.nameOverride :
-              (rsrcCfg.size() > 0 &&
-                ((has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "") ||
-                 (has(rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate) && rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate != "")) ?
-                (has(rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate) && rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate != "" ?
-                  rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate :
-                  rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate)
-                .replace("{namespace}", schema.metadata.namespace)
-                .replace("{name}", schema.metadata.name)
-                .replace("{account_id}", has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "")
-                .replace("{kind}", "iamgroup") :
-                schema.metadata.name)}
+          # Known limitation: the ACK iam.services.k8s.aws/Group CRD (installed version)
+          # has no spec.tags field — allCloudMetadata tags are intentionally not applied here.
+          name: ${naming.data.effectiveName}
           path: "${schema.spec.path}"
           policies: >-
             ${(has(schema.spec.policies) && schema.spec.policies.size() > 0 && has(schema.spec.policies[0].arn) && schema.spec.policies[0].arn != "" ? [schema.spec.policies[0].arn] : [])

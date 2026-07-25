@@ -195,6 +195,11 @@ spec:
         - apply:
             file: 07-my-policy.yaml
         - script:
+            # See docs/troubleshooting-logs/2026-07-23-chainsaw-flaky-list-asserts.md —
+            # this step chains two 30-iteration polling loops (worst case ~60s of sleeps),
+            # which can exceed chainsaw's default script timeout under `--parallel` load
+            # across the full suite, producing "signal: killed" flakes.
+            timeout: 3m
             content: |
               # Wait for kro to create the underlying ACK Policy object
               for i in $(seq 1 30); do
@@ -300,12 +305,13 @@ spec:
                 namespace: iamuser
               spec:
                 name: iamuser-tags-user
-                (length(tags)): 2
-                tags:
-                  - (key == 'cost-centre'): true
-                    value: platform
-                  - (key == 'team'): true
-                    value: ops
+        - script:
+            content: |
+              TAGS=$(kubectl get user tags-user -n iamuser -o json | jq -c '.spec.tags')
+              COUNT=$(echo "$TAGS" | jq 'length')
+              [ "$COUNT" -eq 2 ] || { echo "FAIL: expected 2 tags, got $COUNT: $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag cost-centre=platform"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.key == "team" and .value == "ops")' >/dev/null || { echo "FAIL: missing tag team=ops"; exit 1; }
 
     # AC-12: syncedLabels appear as kropath.run/ labels on User AND as plain keys in cloud tags
     - name: ac12-synced-labels
@@ -333,10 +339,12 @@ spec:
                   kropath.run/environment: production
               spec:
                 name: iamuser-synced-labels-user
-                (length(tags)): 1
-                tags:
-                  - (key == 'environment'): true
-                    value: production
+        - script:
+            content: |
+              TAGS=$(kubectl get user synced-labels-user -n iamuser -o json | jq -c '.spec.tags')
+              COUNT=$(echo "$TAGS" | jq 'length')
+              [ "$COUNT" -eq 1 ] || { echo "FAIL: expected 1 tag, got $COUNT: $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "production")' >/dev/null || { echo "FAIL: missing tag environment=production"; exit 1; }
 
     # AC-13: ACK User child has required standard metadata
     - name: ac13-standard-metadata
@@ -356,3 +364,192 @@ spec:
               spec:
                 name: iamuser-basic-user
                 path: /
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # KRO-236: {tag.X} dynamic token resolution in namingTemplate for IAMUser.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    - name: kro236-iamuser-tag-token-resolved-from-spec-tags
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMConfig
+              metadata:
+                name: kro236-user-tag-config
+                namespace: iamuser
+                labels:
+                  aws.kropath.run/resource-name: kro236-user-tag-config
+              spec:
+                mandatory:
+                  namingTemplate: "{namespace}-{name}-{tag.team}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  blockIamUserAccessKeys: false
+                defaults:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  blockIamUserAccessKeys: false
+        - script:
+            content: |
+              kubectl patch iamconfig kro236-user-tag-config -n iamuser \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"{namespace}-{name}-{tag.team}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"blockIamUserAccessKeys":false},"defaults":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"blockIamUserAccessKeys":false},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMUser
+              metadata:
+                name: kro236-tag-user
+                namespace: iamuser
+              spec:
+                configRef: kro236-user-tag-config
+                tags:
+                  team: platform
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: kro236-tag-user
+                namespace: iamuser
+              spec:
+                name: iamuser-kro236-tag-user-platform
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMUser
+              metadata:
+                name: kro236-tag-user
+                namespace: iamuser
+              status:
+                resourceName: iamuser-kro236-tag-user-platform
+                namingStatus: valid
+      cleanup:
+        - script:
+            content: |
+              kubectl delete iamuser kro236-tag-user -n iamuser --ignore-not-found=true
+              kubectl delete iamconfig kro236-user-tag-config -n iamuser --ignore-not-found=true
+
+    - name: kro236-iamuser-tag-token-unresolved-invalid-status
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMConfig
+              metadata:
+                name: kro236-user-missing-tag-config
+                namespace: iamuser
+                labels:
+                  aws.kropath.run/resource-name: kro236-user-missing-tag-config
+              spec:
+                mandatory:
+                  namingTemplate: "{namespace}-{name}-{tag.team}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  blockIamUserAccessKeys: false
+                defaults:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  blockIamUserAccessKeys: false
+        - script:
+            content: |
+              kubectl patch iamconfig kro236-user-missing-tag-config -n iamuser \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"{namespace}-{name}-{tag.team}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"blockIamUserAccessKeys":false},"defaults":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"blockIamUserAccessKeys":false},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMUser
+              metadata:
+                name: kro236-missing-tag-user
+                namespace: iamuser
+              spec:
+                configRef: kro236-user-missing-tag-config
+                tags: {}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMUser
+              metadata:
+                name: kro236-missing-tag-user
+                namespace: iamuser
+              status:
+                namingStatus: invalid-unresolved-tokens
+      cleanup:
+        - script:
+            content: |
+              kubectl delete iamuser kro236-missing-tag-user -n iamuser --ignore-not-found=true
+              kubectl delete iamconfig kro236-user-missing-tag-config -n iamuser --ignore-not-found=true
+
+    - name: kro236-iamuser-mandatory-tag-overrides-spec-tag
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMConfig
+              metadata:
+                name: kro236-user-mandatory-tag-config
+                namespace: iamuser
+                labels:
+                  aws.kropath.run/resource-name: kro236-user-mandatory-tag-config
+              spec:
+                mandatory:
+                  namingTemplate: "{namespace}-{name}-{tag.team}"
+                  tags:
+                    team: mandatory-team
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  blockIamUserAccessKeys: false
+                defaults:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  blockIamUserAccessKeys: false
+        - script:
+            content: |
+              kubectl patch iamconfig kro236-user-mandatory-tag-config -n iamuser \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"{namespace}-{name}-{tag.team}","tags":{"team":"mandatory-team"},"syncedLabels":{},"syncedAnnotations":{},"blockIamUserAccessKeys":false},"defaults":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"blockIamUserAccessKeys":false},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMUser
+              metadata:
+                name: kro236-mandatory-tag-user
+                namespace: iamuser
+              spec:
+                configRef: kro236-user-mandatory-tag-config
+                tags:
+                  team: spec-team
+        - assert:
+            resource:
+              apiVersion: iam.services.k8s.aws/v1alpha1
+              kind: User
+              metadata:
+                name: kro236-mandatory-tag-user
+                namespace: iamuser
+              spec:
+                name: iamuser-kro236-mandatory-tag-user-mandatory-team
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMUser
+              metadata:
+                name: kro236-mandatory-tag-user
+                namespace: iamuser
+              status:
+                resourceName: iamuser-kro236-mandatory-tag-user-mandatory-team
+                namingStatus: valid
+      cleanup:
+        - script:
+            content: |
+              kubectl delete iamuser kro236-mandatory-tag-user -n iamuser --ignore-not-found=true
+              kubectl delete iamconfig kro236-user-mandatory-tag-config -n iamuser --ignore-not-found=true

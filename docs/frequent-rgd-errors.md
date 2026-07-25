@@ -346,6 +346,20 @@ This document tracks technical friction points, syntax limitations, and runtime 
 
 ---
 
+### IAMIdentityProvider Has No Cloud Resource Name — namingTemplate Does Not Apply
+
+* **What Fails:** KRO-236 added generic `{tag.X}` dynamic naming-template support to every IAM RGD, including `IAMIdentityProvider`. In that RGD a `naming` ConfigMap computed `effectiveName` from `nameOverride` / `namingTemplate` / `{tag.X}` tokens, and the child `OpenIDConnectProvider`'s `metadata.name` (the Kubernetes object name) was set to `${naming.data.effectiveName}` instead of `${schema.metadata.name}`. This is wrong at the root: it conflates the *Kubernetes child resource name* with a *cloud resource name*, and this resource family has no cloud resource name at all.
+* **Why:** Check the CRD cache before assuming a naming template applies — `kropath-core/docs/crd-cache/aws/iam-controller-v1.4.2.md` documents the ACK `OpenIDConnectProvider` spec as exactly `clientIDs` / `tags` / `thumbprints` / `url`, with no `name` field. AWS identifies an OIDC identity provider by its URL (and, once created, its ARN — `arn:aws:iam::<account>:oidc-provider/<url-without-scheme>`), never by a name. `SAMLProvider` isn't even implemented by the ACK IAM controller (see previous entry), so it can't take a naming template either. Since there is no cloud-side name, `namingTemplate`, `{tag.X}` tokens, and `nameOverride` have nothing to drive — computing an `effectiveName` for this RGD was solving a problem that doesn't exist for this resource family, and doing so via `naming.data.effectiveName` on the child's `metadata.name` accidentally renamed the *Kubernetes* child object too, which is a separate, unconditional rule violation (see "What Works Instead").
+* **What Works Instead:**
+  1. **Never compute `effectiveName` for this RGD.** Don't add a `naming` ConfigMap resource; don't reference `namingTemplate`/`{tag.X}` tokens anywhere in `iamidentityprovider.yaml`.
+  2. **The Kubernetes child resource name is always `${schema.metadata.name}`**, exactly like every other RGD — the RGD instance name is already unique per namespace, so there is never a reason to derive the child object's `metadata.name` from anything else. This applies even in RGDs (like this one) that have no cloud-side naming concept at all.
+  3. **Keep `spec.nameOverride` in the schema** for cross-RGD consistency (ADR-015 §"Required Wiring" / this repo's CLAUDE.md "Never do: Omit `spec.nameOverride`..."), but document it as an intentional no-op for this resource type — do not wire it to anything.
+  4. **Drop `status.resourceName` / `status.namingStatus`** (and their `additionalPrinterColumns` entries) entirely — there is no naming outcome to report. Keep `status.providerArn` (the real, post-reconciliation ARN) and `status.validationError`; consider a `ProviderArn` printer column in place of the removed naming columns for at-a-glance visibility.
+  5. **Before adding naming-template support to any new RGD**, check the resource family's entry in `kropath-core/docs/crd-cache/aws/<controller>.md` for a `name` field on the target ACK CRD. If the target CRD (`OpenIDConnectProvider` today; watch for similar cases in other providers/resource families) has no name field, namingTemplate does not apply — skip the `naming` ConfigMap pattern entirely rather than retrofitting it.
+* **Regression test:** `tests/iam/iamidentityprovider/chainsaw-test.yaml` step `nameoverride-and-naming-template-are-noop-for-oidc` sets a non-empty mandatory `namingTemplate` (with an unresolved `{tag.X}` token) and a non-empty `spec.nameOverride`, then asserts the child `OpenIDConnectProvider`'s `metadata.name` is unaffected and still equals the instance's own `schema.metadata.name`.
+
+---
+
 ### ACK `ackResourceMetadata` Patch Requires `ownerAccountID` and `region`
 
 * **What Fails:** A chainsaw script patches only `arn` into `status.ackResourceMetadata` to simulate a reconciled ACK resource:
@@ -415,6 +429,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
 | **`predictedArn` in status block** | `schema.spec.path` / `schema.spec.name` (unavailable in status scope) | Use child resource fields: `policy.spec.path` + `policy.spec.name` |
 | **ARN assertion in tests** | `status.arn` (empty without real AWS) | `status.predictedArn` (computed from accountId + path + name) |
 | **Chainsaw list/array assertion** | Exact-order list match on CEL-generated tags/tagging | `(length(x)): N` + `(key == 'foo'): true` item-level match per element |
+| **Naming template on a nameless ACK resource** | Adding `naming` ConfigMap / `effectiveName` / `resourceName` / `namingStatus` unconditionally to every RGD | Check `kropath-core/docs/crd-cache/aws/<controller>.md` for a `name` field first; if absent (e.g. `OpenIDConnectProvider`), skip naming-template entirely |
 
 ### CEL Is Not Supported in `externalRef.metadata.name` — Use labelSelector
 
@@ -481,19 +496,35 @@ This document tracks technical friction points, syntax limitations, and runtime 
           value: mandatory
     ```
 * **Why:** CEL's `.merge()` operates over maps, and map iteration order in the underlying Go/CEL runtime is not guaranteed stable across evaluations. `.transformList()` then serializes that iteration order into a list. Chainsaw's default assertion semantics for arrays require an **exact positional match**, so any CEL-generated list (tags, `tagging`, synced-label-derived tag lists, etc.) is a latent flake — it may pass locally and fail in CI, or pass in isolation and fail in parallel runs, purely from map-order nondeterminism. Note this only applies to *list-shaped* cloud tag fields (ACK IAM Role/User/Policy `spec.tags`, S3 `spec.tagging`, KMS `spec.tags` as `tagKey`/`tagValue`); ACK SQS `Queue.spec.tags` is a **map**, not a list, and is inherently order-stable — no fix needed there.
-* **What Works Instead:** Use Chainsaw's item-level assertion syntax — `(?...)` boolean lambda checks — to match each expected element independent of position, plus a `(length(x))` check to catch unexpected extra/missing elements:
+* **What Does NOT Work — two previously-documented false fixes:**
+    1. Per-item list assertions like `- (key == 'cost-centre'): true` under the list field. **This is still positional.** Chainsaw pairs assert-list-item `[i]` with actual-list-item `[i]` and evaluates the boolean check against that fixed position — it does not search across positions for a match. So when the actual array's map-iteration order differs from the order the assert was written in, item `[0]`'s check (`key == 'cost-centre'`) gets evaluated against whatever tag actually landed at position 0, fails, and the flake reappears exactly as before — confirmed empirically via `spec.tagging[0].(key == 'cost-centre'): Invalid value: false: Expected value: true` in a real CI failure (2026-07-23, KRO-236 follow-up).
+    2. A whole-array CEL `.exists()` boolean check, e.g. `(tags.exists(t, t.key == 'x' && t.value == 'y')): true`. This *would* be order-independent if it worked, but chainsaw's assertion engine is a JMESPath-style tree (kyverno-json), **not** full CEL — `.exists()` is not implemented and fails outright with `Internal error: unknown function: exists` (confirmed in the same 2026-07-23 CI run, one commit after the `.exists()` "fix" was applied).
+
+    Do not use either pattern for any CEL-generated list.
+* **What Works Instead:** Chainsaw's declarative assertion tree has no genuinely order-independent list construct for this case. Drop the tag-list check from the declarative `assert:` block entirely (an empty `spec: {}` for the fields you can't assert declaratively is fine — other fields like `metadata.name`/`labels` can still be asserted normally) and verify it with a `- script:` step using `kubectl ... -o json | jq`, which is plain shell and therefore genuinely order-independent:
     ```yaml
-    spec:
-      # 1. Ensure the array length matches (prevents unexpected extra/missing tags)
-      (length(tags)): 2
-      # 2. Match elements order-insensitively — each entry keyed on its unique field
-      tags:
-        - (key == 'cost-centre'): true
-          value: platform
-        - (key == 'environment'): true
-          value: mandatory
+    - script:
+        content: |
+          TAGS=$(kubectl get role my-role -n myns -o json | jq -c '.spec.tags')
+          COUNT=$(echo "$TAGS" | jq 'length')
+          [ "$COUNT" -eq 2 ] || { echo "FAIL: expected 2 tags, got $COUNT: $TAGS"; exit 1; }
+          echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag cost-centre=platform"; exit 1; }
+          echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "mandatory")' >/dev/null || { echo "FAIL: missing tag environment=mandatory"; exit 1; }
     ```
-    For KMS Key's `tagKey`/`tagValue` naming: `- (tagKey == 'cost-centre'): true`. For S3 Bucket's `tagging` field: same `key`/`value` shape as IAM.
-* **Rule:** Apply this pattern to **every** chainsaw assert on a list field that is populated by a CEL `.merge()`/`.transformList()` chain — even single-item lists, for consistency and to future-proof against a later test adding a second item. Do not apply it to lists that echo raw user input verbatim (e.g. `spec.mandatory.allowedKeySpecs` on a config CR, `spec.policies` ARNs on an IAMRole) — those preserve apply-time order deterministically and are not CEL-transformed.
+    For KMS Key's `tagKey`/`tagValue` naming, use `.tagKey`/`.tagValue` in the jq filter instead. For S3 Bucket's `tagging` field: same `key`/`value` shape as IAM, just query `.spec.tagging`.
+* **Rule:** Apply this jq-script pattern to **every** chainsaw check on a list field that is populated by a CEL `.merge()`/`.transformList()` chain — even single-item lists, for consistency and to future-proof against a later test adding a second item. Do not apply it to lists that echo raw user input verbatim (e.g. `spec.mandatory.allowedKeySpecs` on a config CR, `spec.policies` ARNs on an IAMRole) — those preserve apply-time order deterministically and are not CEL-transformed, so a plain positional `assert:` is fine for them.
+
+### `kubectl get role`/`kubectl get user` Short-Name Collisions with Kubernetes RBAC
+
+* **What Fails:** A test script runs `kubectl get role <name> -n <ns> -o json`, expecting the ACK `iam.services.k8s.aws/v1alpha1` `Role`, but gets `Error from server (NotFound): roles.rbac.authorization.k8s.io "<name>" not found`. Kubernetes' built-in RBAC `Role` kind is registered under the short name `role` too, and kubectl's discovery client resolves the bare short name to the built-in RBAC resource instead of the ACK CRD. A script that only checks for empty/non-empty output (rather than the command's exit code) can silently pass even though it never queried the resource it meant to — a false-negative-tolerant bug, not a crash (found 2026-07-23 in `tests/iam/iamrole/chainsaw-test.yaml`'s `boundary-and-naming` step, which had used this pattern with `test -z "$boundary"` and coincidentally kept "passing" because the command failed and produced empty output either way).
+* **Why:** `kubectl`'s short-name-to-resource mapping is not scoped per test; RBAC's `Role`/`ClusterRole` are core, well-known kinds with priority over CRD-registered kinds of the same short name.
+* **What Works Instead:** Always use the fully-qualified plural resource name for ACK kinds that collide with built-in Kubernetes kinds — `roles.iam.services.k8s.aws` instead of `role`. This matches the pattern already used elsewhere in these test files for other ACK kinds (`policies.iam.services.k8s.aws`, `keys.kms.services.k8s.aws`, `groups.iam.services.k8s.aws`). ACK `User`, `Bucket`, `Key`, `OpenIDConnectProvider` have no built-in-Kubernetes-kind collision and are safe to query with their bare short name.
+* **Rule:** Any new `kubectl get <ack-kind>` in a test script must use the fully-qualified `<plural>.<group>` form, never the bare kind name, for any kind that might shadow a built-in Kubernetes resource (`role`, and watch for `service`, `endpoint`, `event`, `secret`, etc. if ACK ever adds CRDs with those names).
+
+### OPEN ISSUE: `IAMIdentityProvider`/`OpenIDConnectProvider` CLEANUP Always Times Out
+
+* **Status:** Unresolved as of 2026-07-23. See `docs/troubleshooting-logs/2026-07-23-chainsaw-flaky-list-asserts.md` for the full investigation.
+* **Symptom:** Every step in `tests/iam/iamidentityprovider/chainsaw-test.yaml` that creates an `IAMIdentityProvider`/`OpenIDConnectProvider` logs a `CLEANUP ERROR: context deadline exceeded` (~30s per step) before the step's explicit `cleanup:` script (which patches `metadata.finalizers: []` then deletes) runs and succeeds. This inflates the suite's runtime (400s+) and, in a full `make test` run, was enough to mark the whole `iamidentityprovider` suite FAILED even though every individual assertion passed.
+* **What was tried and did NOT fix it:** Moving the finalizer-clearing patch from the `cleanup:` block to the end of `try:` (so it runs before chainsaw's own automatic post-`try` resource deletion). The timeout still recurs on every step at a regular ~30s cadence, suggesting either kro re-adds the finalizer between the patch and chainsaw's automatic delete attempt, or chainsaw's automatic delete is targeting a different/child resource than the one being patched. Needs further investigation before another fix attempt — do not re-apply the "move to end of try" pattern expecting it to work; it demonstrably does not, on its own.
 
 ---
