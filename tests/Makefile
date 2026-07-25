@@ -23,24 +23,26 @@ setup:
 teardown:
 	./teardown.sh $(CLUSTER_NAME)
 
+CHAINSAW_CONFIG := ../.chainsaw.yaml
+
 test:
-	chainsaw test . --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+	chainsaw test . --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 # 	$(MAKE) teardown
 
 chainsaw-e2e:
-	chainsaw test chainsaw/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+	chainsaw test chainsaw/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-iam:
-	chainsaw test iam/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+	chainsaw test iam/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-policy:
-	chainsaw test policy/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+	chainsaw test policy/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-kms:
-	chainsaw test kms/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+	chainsaw test kms/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-s3:
-	chainsaw test s3/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+	chainsaw test s3/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-sqs:
-	chainsaw test sqs/ --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+	chainsaw test sqs/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
