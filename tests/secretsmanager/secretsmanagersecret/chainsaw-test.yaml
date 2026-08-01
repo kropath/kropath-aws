@@ -1,0 +1,975 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-secretsmanager-02 Chainsaw tests — one scenario per acceptance criterion.
+# Namespace: secretsmanagersecret (fixed; {namespace}-{name} template expands predictably).
+# accountId: 123456789012 | region: us-east-1
+# effectiveConfig is injected via kubectl patch --subresource=status to simulate
+# kropath-controller (which is not running in the local test cluster).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: secretsmanagersecret
+spec:
+  namespace: secretsmanagersecret
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy SecretsManagerConfig with effectiveConfig
+    # patched in so the RGD can resolve governance values without a live controller.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-secretsmanagersecret-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig general-policy -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: Basic creation — default naming template, description propagation,
+    #       no secretRef, no KMS overrides → kmsKeyID="" (AWS uses aws/secretsmanager).
+    # AC-5: No kmsKeyRef/kmsKeyArn → spec.kmsKeyID empty.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-basic-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: db-creds
+              spec:
+                description: "DB credentials"
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: db-creds
+              spec:
+                name: secretsmanagersecret-db-creds
+                description: DB credentials
+                kmsKeyID: ""
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: db-creds
+              status:
+                resourceName: secretsmanagersecret-db-creds
+                namingStatus: valid
+                predictedArn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:secretsmanagersecret-db-creds"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: spec.secretRef wired to ACK spec.secretString.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-with-secretref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: api-key
+              spec:
+                secretRef:
+                  name: my-k8s-secret
+                  key: password
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: api-key
+              spec:
+                secretString:
+                  name: my-k8s-secret
+                  key: password
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: spec.kmsKeyArn propagated directly to ACK spec.kmsKeyID.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-custom-kms-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-kmsarn
+              spec:
+                kmsKeyArn: "arn:aws:kms:ap-southeast-2:123456789012:key/mrk-custom"
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-kmsarn
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/mrk-custom"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: spec.kmsKeyRef resolved to KMSKey.status.predictedArn.
+    # Setup: create a KMSConfig + KMSKey in this namespace; patch the ACK Key
+    # status.ackResourceMetadata.arn so kro computes KMSKey.status.predictedArn;
+    # then assert the ACK Secret uses that ARN.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-kms-keyref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSConfig
+              metadata:
+                name: kmsref-policy
+                labels:
+                  aws.kropath.run/resource-name: kmsref-policy
+              spec:
+                mandatory:
+                  enableKeyRotation: false
+                  keySpec: ""
+                  keyUsage: ""
+                  allowedKeySpecs: []
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  enableKeyRotation: false
+                  keySpec: SYMMETRIC_DEFAULT
+                  keyUsage: ENCRYPT_DECRYPT
+                  allowedKeySpecs: []
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kmsconfig kmsref-policy -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"SYMMETRIC_DEFAULT","keyUsage":"ENCRYPT_DECRYPT","allowedKeySpecs":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: my-kms-key
+                labels:
+                  aws.kropath.run/resource-name: my-kms-key
+              spec:
+                configRef: kmsref-policy
+                createAlias: false
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Key
+              metadata:
+                name: my-kms-key
+        - script:
+            content: |
+              kubectl patch keys.kms.services.k8s.aws my-kms-key -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:kms:ap-southeast-2:123456789012:key/mrk-ref","ownerAccountID":"123456789012","region":"ap-southeast-2"}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: my-kms-key
+              status:
+                predictedArn: "arn:aws:kms:ap-southeast-2:123456789012:key/mrk-ref"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-kmsref
+              spec:
+                kmsKeyRef: my-kms-key
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-kmsref
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/mrk-ref"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: effCfg.mandatory.kmsKeyID overrides instance spec.kmsKeyArn.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-mandatory-kms-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: mandatory-kms-policy
+                labels:
+                  aws.kropath.run/resource-name: mandatory-kms-policy
+              spec:
+                mandatory:
+                  kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/mrk-mandatory"
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig mandatory-kms-policy -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"arn:aws:kms:ap-southeast-2:123456789012:key/mrk-mandatory","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-mandatory-kms
+              spec:
+                configRef: mandatory-kms-policy
+                kmsKeyArn: "arn:aws:kms:ap-southeast-2:123456789012:key/mrk-instance"
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-mandatory-kms
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/mrk-mandatory"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: effCfg.defaults.kmsKeyID applies when instance sets no KMS.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-defaults-kms
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: defaults-kms-policy
+                labels:
+                  aws.kropath.run/resource-name: defaults-kms-policy
+              spec:
+                mandatory:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: "alias/org-default-key"
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig defaults-kms-policy -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"alias/org-default-key","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-defaults-kms
+              spec:
+                configRef: defaults-kms-policy
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-defaults-kms
+              spec:
+                kmsKeyID: "alias/org-default-key"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: spec.replicaRegions propagated to ACK spec.replicaRegions.
+    # Uses jq for order-independent assertion on the list content.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-replication
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-replica
+              spec:
+                replicaRegions:
+                  - region: "us-west-2"
+                    kmsKeyID: "arn:aws:kms:us-west-2:123456789012:key/mrk-dr"
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-replica
+              spec: {}
+        - script:
+            content: |
+              REGIONS=$(kubectl get secrets.secretsmanager.services.k8s.aws secret-replica \
+                -n secretsmanagersecret -o json | jq -c '.spec.replicaRegions')
+              COUNT=$(echo "$REGIONS" | jq 'length')
+              [ "$COUNT" -eq 1 ] || { echo "FAIL: expected 1 replicaRegion, got $COUNT: $REGIONS"; exit 1; }
+              echo "$REGIONS" | jq -e 'any(.[]; .region == "us-west-2" and .kmsKeyID == "arn:aws:kms:us-west-2:123456789012:key/mrk-dr")' >/dev/null \
+                || { echo "FAIL: missing replicaRegion us-west-2 with expected kmsKeyID"; exit 1; }
+              echo "PASS: replicaRegions correctly set"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: effCfg.mandatory.replicaRegions overrides instance (priority replacement).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-mandatory-replication-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: dr-mandate
+                labels:
+                  aws.kropath.run/resource-name: dr-mandate
+              spec:
+                mandatory:
+                  kmsKeyID: ""
+                  replicaRegions:
+                    - region: "us-west-2"
+                      kmsKeyID: ""
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig dr-mandate -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[{"region":"us-west-2","kmsKeyID":""}],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-dr-override
+              spec:
+                configRef: dr-mandate
+                replicaRegions:
+                  - region: "eu-west-1"
+                    kmsKeyID: ""
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-dr-override
+              spec: {}
+        - script:
+            content: |
+              REGIONS=$(kubectl get secrets.secretsmanager.services.k8s.aws secret-dr-override \
+                -n secretsmanagersecret -o json | jq -c '.spec.replicaRegions')
+              COUNT=$(echo "$REGIONS" | jq 'length')
+              [ "$COUNT" -eq 1 ] || { echo "FAIL: expected 1 mandatory replicaRegion, got $COUNT: $REGIONS"; exit 1; }
+              echo "$REGIONS" | jq -e 'any(.[]; .region == "us-west-2")' >/dev/null \
+                || { echo "FAIL: mandatory region us-west-2 not used; got: $REGIONS"; exit 1; }
+              echo "$REGIONS" | jq -e 'any(.[]; .region == "eu-west-1")' >/dev/null \
+                && { echo "FAIL: instance region eu-west-1 should be overridden by mandatory"; exit 1; }
+              echo "PASS: mandatory replicaRegions override instance"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: effCfg.defaults.replicaRegions applies when instance sets none.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-defaults-replication
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: defaults-dr
+                labels:
+                  aws.kropath.run/resource-name: defaults-dr
+              spec:
+                mandatory:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: ""
+                  replicaRegions:
+                    - region: "us-west-2"
+                      kmsKeyID: ""
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig defaults-dr -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[{"region":"us-west-2","kmsKeyID":""}],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-defaults-dr
+              spec:
+                configRef: defaults-dr
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-defaults-dr
+              spec: {}
+        - script:
+            content: |
+              REGIONS=$(kubectl get secrets.secretsmanager.services.k8s.aws secret-defaults-dr \
+                -n secretsmanagersecret -o json | jq -c '.spec.replicaRegions')
+              COUNT=$(echo "$REGIONS" | jq 'length')
+              [ "$COUNT" -eq 1 ] || { echo "FAIL: expected 1 defaults replicaRegion, got $COUNT: $REGIONS"; exit 1; }
+              echo "$REGIONS" | jq -e 'any(.[]; .region == "us-west-2")' >/dev/null \
+                || { echo "FAIL: defaults region us-west-2 not applied; got: $REGIONS"; exit 1; }
+              echo "PASS: defaults replicaRegions applied when instance sets none"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: effCfg.mandatory.namingTemplate overrides defaults.namingTemplate;
+    #        {configRef} token resolved from spec.configRef.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-mandatory-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: pci
+                labels:
+                  aws.kropath.run/resource-name: pci
+              spec:
+                mandatory:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{configRef}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig pci -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{configRef}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: pci-apikey
+              spec:
+                configRef: pci
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: pci-apikey
+              status:
+                resourceName: secretsmanagersecret-pci-pci-apikey
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: pci-apikey
+              spec:
+                name: secretsmanagersecret-pci-pci-apikey
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: spec.nameOverride bypasses the naming template entirely.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: override-test
+              spec:
+                nameOverride: legacy-secret-name
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: override-test
+              status:
+                resourceName: legacy-secret-name
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: override-test
+              spec:
+                name: legacy-secret-name
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: Three-tier tag merge — mandatory wins on collision.
+    # Merge order: defaults.merge(spec).merge(mandatory) → mandatory wins
+    # ACK Secrets Manager tags format: [{key, value}] (not {tagKey, tagValue}).
+    # Use jq for order-independent assertion.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: tags-policy
+                labels:
+                  aws.kropath.run/resource-name: tags-policy
+              spec:
+                mandatory:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: ""
+                  tags:
+                    cost-centre: security
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    team: platform
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig tags-policy -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{"cost-centre":"security"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{name}","tags":{"team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-tags
+              spec:
+                configRef: tags-policy
+                tags:
+                  cost-centre: billing
+                  app: my-app
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-tags
+              spec: {}
+        - script:
+            content: |
+              TAGS=$(kubectl get secrets.secretsmanager.services.k8s.aws secret-tags \
+                -n secretsmanagersecret -o json | jq -c '.spec.tags')
+              COUNT=$(echo "$TAGS" | jq 'length')
+              [ "$COUNT" -eq 3 ] || { echo "FAIL: expected 3 tags, got $COUNT: $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.[]; .key == "cost-centre" and .value == "security")' >/dev/null \
+                || { echo "FAIL: missing tag cost-centre=security (mandatory)"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.[]; .key == "app" and .value == "my-app")' >/dev/null \
+                || { echo "FAIL: missing tag app=my-app (instance)"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.[]; .key == "team" and .value == "platform")' >/dev/null \
+                || { echo "FAIL: missing tag team=platform (defaults)"; exit 1; }
+              ACTUAL=$(kubectl get secrets.secretsmanager.services.k8s.aws secret-tags \
+                -n secretsmanagersecret -o json | jq -r '.spec.tags[] | select(.key == "cost-centre") | .value')
+              [ "$ACTUAL" = "security" ] || { echo "FAIL: mandatory tag lost; cost-centre=$ACTUAL want security"; exit 1; }
+              echo "PASS: three-tier tag merge correct, mandatory wins"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: spec.syncedLabels — dual-write to K8s metadata.labels (prefixed
+    #        aws.kropath.run/) AND cloud tags (unprefixed key).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-synced
+              spec:
+                syncedLabels:
+                  data-class: restricted
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-synced
+                labels:
+                  aws.kropath.run/data-class: restricted
+              spec: {}
+        - script:
+            content: |
+              TAGS=$(kubectl get secrets.secretsmanager.services.k8s.aws secret-synced \
+                -n secretsmanagersecret -o json | jq -c '.spec.tags')
+              echo "$TAGS" | jq -e 'any(.[]; .key == "data-class" and .value == "restricted")' >/dev/null \
+                || { echo "FAIL: syncedLabel not written to cloud tags: $TAGS"; exit 1; }
+              echo "PASS: syncedLabel dual-write to K8s labels and cloud tags"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: spec.deletionPolicy=delete → annotation services.k8s.aws/deletion-policy: delete.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-delete-policy
+              spec:
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-delete-policy
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+              spec: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: spec.deletionPolicy=retain (default) → annotation: retain.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-retain-policy
+              spec:
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-retain-policy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: spec.forceOverwriteReplicaSecret=true propagated to ACK spec.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-force-overwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-force-overwrite
+              spec:
+                forceOverwriteReplicaSecret: true
+                replicaRegions:
+                  - region: "us-west-2"
+                    kmsKeyID: ""
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-force-overwrite
+              spec:
+                forceOverwriteReplicaSecret: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: effCfg.mandatory.forceOverwriteReplicaSecret=true overrides instance false.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-mandatory-force-overwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: mandatory-overwrite
+                labels:
+                  aws.kropath.run/resource-name: mandatory-overwrite
+              spec:
+                mandatory:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: true
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig mandatory-overwrite -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":true,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-mandatory-overwrite
+              spec:
+                configRef: mandatory-overwrite
+                forceOverwriteReplicaSecret: false
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-mandatory-overwrite
+              spec:
+                forceOverwriteReplicaSecret: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-19: Naming template with {tag.X} where tag key is absent → namingStatus
+    #        "invalid-unresolved-tokens"; ACK Secret CR must NOT be created.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac19-naming-unresolved-tokens
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerConfig
+              metadata:
+                name: badtpl-naming
+                labels:
+                  aws.kropath.run/resource-name: badtpl-naming
+              spec:
+                mandatory:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kmsKeyID: ""
+                  replicaRegions: []
+                  forceOverwriteReplicaSecret: false
+                  namingTemplate: "{namespace}-{tag.missing-key}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch secretsmanagerconfig badtpl-naming -n secretsmanagersecret \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyID":"","replicaRegions":[],"forceOverwriteReplicaSecret":false,"namingTemplate":"{namespace}-{tag.missing-key}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-badtpl
+              spec:
+                configRef: badtpl-naming
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-badtpl
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              if kubectl get secrets.secretsmanager.services.k8s.aws secret-badtpl \
+                -n secretsmanagersecret 2>/dev/null; then
+                echo "FAIL: ACK Secret CR should not be created when namingStatus is invalid"
+                exit 1
+              fi
+              echo "PASS: ACK Secret CR not created for invalid naming template"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-20: Both spec.kmsKeyRef and spec.kmsKeyArn set → advisory mutualExclusionError
+    #        ConfigMap created and status.validationError populated.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac20-kms-mutual-exclusivity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-both-kms
+              spec:
+                kmsKeyRef: my-kms-key
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/mrk-direct"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-both-kms
+              status:
+                validationError: "kmsKeyRef and kmsKeyArn are mutually exclusive — set one or neither"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: secret-both-kms-validation-error
+              data:
+                error: "kmsKeyRef and kmsKeyArn are mutually exclusive — set one or neither"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: Standard kropath wiring — every ACK Secret has managed-by and
+    #        instance labels, and retain deletion policy annotation.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac21-standard-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SecretsManagerSecret
+              metadata:
+                name: secret-standard
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: secretsmanager.services.k8s.aws/v1alpha1
+              kind: Secret
+              metadata:
+                name: secret-standard
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: secret-standard
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # cleanup-finalizers: pre-empts kro's finalizer race condition.
+    #
+    # Root cause: kro re-adds kro.run/finalizer to any kro-managed CR that lacks a
+    # deletion timestamp. Simply patching the finalizer off is not enough — kro may
+    # re-add it within milliseconds. Once a deletion timestamp is present kro enters
+    # its deletion-reconciler path and will NOT re-add the finalizer.
+    #
+    # Strategy: (1) send background deletes on all kro CRs so Kubernetes sets
+    # deletion timestamps, (2) wait 2 s for timestamps to propagate, (3) patch
+    # finalizers off — with deletion timestamps in place kro cannot re-add them,
+    # so it immediately proceeds to garbage-collect child resources (ACK Secrets /
+    # ConfigMaps — none have finalizers in the local test cluster), (4) wait for
+    # all CRs to disappear. Chainsaw's per-step auto-cleanup then finds each
+    # resource already gone → "not found" → instant success for all 21 steps.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: cleanup-finalizers
+      try:
+        - script:
+            content: |
+              # Step 1: Send background deletes to set deletion timestamps on all kro CRs.
+              # --wait=false returns immediately; deletion timestamp is set atomically.
+              kubectl delete secretsmanagersecrets.aws.kropath.run -n secretsmanagersecret \
+                --all --wait=false 2>/dev/null || true
+              kubectl delete kmskeys.aws.kropath.run -n secretsmanagersecret \
+                --all --wait=false 2>/dev/null || true
+
+              # Step 2: Wait for deletion timestamps to propagate to all resources.
+              sleep 2
+
+              # Step 3: Remove kro.run/finalizer from all SecretsManagerSecrets.
+              # Deletion timestamps are now set, so kro will NOT re-add the finalizer —
+              # it will instead proceed directly to garbage-collecting child resources.
+              for NAME in $(kubectl get secretsmanagersecrets.aws.kropath.run \
+                -n secretsmanagersecret -o name 2>/dev/null); do
+                kubectl patch "$NAME" -n secretsmanagersecret \
+                  --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+              done
+              # Remove kro.run/finalizer from KMSKey instances (created in ac4).
+              for NAME in $(kubectl get kmskeys.aws.kropath.run \
+                -n secretsmanagersecret -o name 2>/dev/null); do
+                kubectl patch "$NAME" -n secretsmanagersecret \
+                  --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+              done
+
+              # Step 4: Wait for all kro CRs to be fully gone (≤ 30 s).
+              kubectl wait secretsmanagersecrets.aws.kropath.run \
+                -n secretsmanagersecret --for=delete --all --timeout=30s 2>/dev/null || true
+              kubectl wait kmskeys.aws.kropath.run \
+                -n secretsmanagersecret --for=delete --all --timeout=10s 2>/dev/null || true
+
+              echo "PASS: all kro CRs deleted; Chainsaw per-step cleanups will find resources already gone"
