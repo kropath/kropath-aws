@@ -14,7 +14,7 @@
 
 CLUSTER_NAME ?= kropath-aws-test
 
-.PHONY: setup teardown test test-iam test-kms test-sqs test-secretsmanager
+.PHONY: setup teardown test test-iam test-kms test-sqs test-secretsmanager test-sns
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -49,3 +49,6 @@ test-sqs:
 
 test-secretsmanager:
 	chainsaw test secretsmanager/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-sns:
+	chainsaw test sns/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
