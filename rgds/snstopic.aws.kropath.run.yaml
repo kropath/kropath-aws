@@ -1,0 +1,443 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: snstopic.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: SNSTopic
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Topic type — true enables FIFO mode and appends .fifo suffix to effectiveName
+      fifo: boolean | default=false
+      # FIFO-specific fields (ignored when fifo=false)
+      contentBasedDeduplication: boolean | default=false
+      fifoThroughputScope: string | default=Topic
+      # Display name shown for SMS and push notification deliveries
+      displayName: string | default=""
+      # Encryption (governed by SNSConfig cascade)
+      kmsMasterKeyId: string | default=""
+      # Topic access policy (resource-based via PolicyDocument)
+      topicPolicyRef: string | default=""
+      # Data protection (governed by SNSConfig cascade)
+      dataProtectionPolicy: string | default=""
+      # Message signing (governed by SNSConfig cascade)
+      signatureVersion: string | default=""
+      # X-Ray tracing (governed by SNSConfig cascade)
+      tracingConfig: string | default=""
+      # Delivery feedback logging per protocol (governed by SNSConfig cascade)
+      deliveryFeedback:
+        application:
+          successFeedbackRoleArn: string | default=""
+          failureFeedbackRoleArn: string | default=""
+          successFeedbackSampleRate: string | default=""
+        http:
+          successFeedbackRoleArn: string | default=""
+          failureFeedbackRoleArn: string | default=""
+          successFeedbackSampleRate: string | default=""
+        lambda:
+          successFeedbackRoleArn: string | default=""
+          failureFeedbackRoleArn: string | default=""
+          successFeedbackSampleRate: string | default=""
+        sqs:
+          successFeedbackRoleArn: string | default=""
+          failureFeedbackRoleArn: string | default=""
+          successFeedbackSampleRate: string | default=""
+        firehose:
+          successFeedbackRoleArn: string | default=""
+          failureFeedbackRoleArn: string | default=""
+          successFeedbackSampleRate: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{")
+          ? "arn:aws:sns:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":" + naming.data.resourceName
+          : ""}
+      topicArn: >-
+        ${ackTopic.?status.?topicARN.orValue("")}
+      conditions: >-
+        ${ackTopic.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: SNSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Topic policy resolution via PolicyDocument (optional).
+    # Sentinel pattern: when topicPolicyRef is empty, selector never matches and topicPolicyCr is [].
+    - id: topicPolicyCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: PolicyDocument
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.topicPolicyRef != "" ? schema.spec.topicPolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap to materialise effectiveName, resourceName (with .fifo suffix), and namingStatus.
+    # Computed here so the status block can reference naming.data.* without requiring schema.* access
+    # (schema is out of scope in the status block — see frequent-rgd-errors.md section 3).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSTopic
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # effectiveName: base name with full {tag.X} dynamic substitution support.
+          # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+          # Any {tag.X} token whose key is absent in all tiers is kept verbatim so namingStatus
+          # (computed below from resourceName) reports "invalid-unresolved-tokens".
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          # resourceName includes .fifo suffix for FIFO topics (appended after effectiveName resolution)
+          resourceName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))
+              + (schema.spec.fifo ? ".fifo" : ""))}
+          namingStatus: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))
+              + (schema.spec.fifo ? ".fifo" : "")).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK SNS Topic CR — primary cloud resource.
+    # Only created when resourceName has no unresolved {tag.X} tokens.
+    - id: ackTopic
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Topic
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSTopic
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          displayName: "${schema.spec.displayName}"
+          # KMS encryption — three-tier cascade (mandatory wins, then instance, then defaults)
+          kmsMasterKeyID: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsMasterKeyId.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsMasterKeyId
+              : (schema.spec.kmsMasterKeyId != ""
+                  ? schema.spec.kmsMasterKeyId
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsMasterKeyId.orValue("") : ""))}
+          # Message signature version — three-tier cascade with built-in default "1" (SHA-1)
+          signatureVersion: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?signatureVersion.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.signatureVersion
+              : (schema.spec.signatureVersion != ""
+                  ? schema.spec.signatureVersion
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?signatureVersion.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.signatureVersion
+                      : "1"))}
+          # X-Ray tracing — three-tier cascade with built-in default "PassThrough"
+          tracingConfig: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?tracingConfig.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.tracingConfig
+              : (schema.spec.tracingConfig != ""
+                  ? schema.spec.tracingConfig
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?tracingConfig.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.tracingConfig
+                      : "PassThrough"))}
+          # Data protection policy — three-tier cascade (empty = no policy)
+          dataProtectionPolicy: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?dataProtectionPolicy.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.dataProtectionPolicy
+              : (schema.spec.dataProtectionPolicy != ""
+                  ? schema.spec.dataProtectionPolicy
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?dataProtectionPolicy.orValue("") : ""))}
+          # Topic access policy — read from PolicyDocument CR when topicPolicyRef is set
+          policy: >-
+            ${schema.spec.topicPolicyRef != "" && topicPolicyCr.size() > 0
+              ? topicPolicyCr[0].spec.documentJSON
+              : ""}
+          # FIFO topic fields — ACK uses string "true" (empty string means omit)
+          fifoTopic: '${schema.spec.fifo ? "true" : ""}'
+          contentBasedDeduplication: >-
+            ${schema.spec.fifo && schema.spec.contentBasedDeduplication ? "true" : ""}
+          fifoThroughputScope: >-
+            ${schema.spec.fifo ? schema.spec.fifoThroughputScope : ""}
+          # Delivery feedback — 15 flat fields (5 protocols x 3 fields each)
+          # Each field resolved independently via mandatory -> instance -> defaults cascade
+          applicationSuccessFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?application.?successFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.application.successFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.application.successFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.application.successFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?application.?successFeedbackRoleArn.orValue("") : ""))}
+          applicationFailureFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?application.?failureFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.application.failureFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.application.failureFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.application.failureFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?application.?failureFeedbackRoleArn.orValue("") : ""))}
+          applicationSuccessFeedbackSampleRate: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?application.?successFeedbackSampleRate.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.application.successFeedbackSampleRate
+              : (schema.spec.deliveryFeedback.application.successFeedbackSampleRate != ""
+                  ? schema.spec.deliveryFeedback.application.successFeedbackSampleRate
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?application.?successFeedbackSampleRate.orValue("") : ""))}
+          httpSuccessFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?http.?successFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.http.successFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.http.successFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.http.successFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?http.?successFeedbackRoleArn.orValue("") : ""))}
+          httpFailureFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?http.?failureFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.http.failureFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.http.failureFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.http.failureFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?http.?failureFeedbackRoleArn.orValue("") : ""))}
+          httpSuccessFeedbackSampleRate: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?http.?successFeedbackSampleRate.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.http.successFeedbackSampleRate
+              : (schema.spec.deliveryFeedback.http.successFeedbackSampleRate != ""
+                  ? schema.spec.deliveryFeedback.http.successFeedbackSampleRate
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?http.?successFeedbackSampleRate.orValue("") : ""))}
+          lambdaSuccessFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?lambda.?successFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.lambda.successFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.lambda.successFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.lambda.successFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?lambda.?successFeedbackRoleArn.orValue("") : ""))}
+          lambdaFailureFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?lambda.?failureFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.lambda.failureFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.lambda.failureFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.lambda.failureFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?lambda.?failureFeedbackRoleArn.orValue("") : ""))}
+          lambdaSuccessFeedbackSampleRate: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?lambda.?successFeedbackSampleRate.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.lambda.successFeedbackSampleRate
+              : (schema.spec.deliveryFeedback.lambda.successFeedbackSampleRate != ""
+                  ? schema.spec.deliveryFeedback.lambda.successFeedbackSampleRate
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?lambda.?successFeedbackSampleRate.orValue("") : ""))}
+          sqsSuccessFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?sqs.?successFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.sqs.successFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.sqs.successFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.sqs.successFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?sqs.?successFeedbackRoleArn.orValue("") : ""))}
+          sqsFailureFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?sqs.?failureFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.sqs.failureFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.sqs.failureFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.sqs.failureFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?sqs.?failureFeedbackRoleArn.orValue("") : ""))}
+          sqsSuccessFeedbackSampleRate: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?sqs.?successFeedbackSampleRate.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.sqs.successFeedbackSampleRate
+              : (schema.spec.deliveryFeedback.sqs.successFeedbackSampleRate != ""
+                  ? schema.spec.deliveryFeedback.sqs.successFeedbackSampleRate
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?sqs.?successFeedbackSampleRate.orValue("") : ""))}
+          firehoseSuccessFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?firehose.?successFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.firehose.successFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.firehose.successFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.firehose.successFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?firehose.?successFeedbackRoleArn.orValue("") : ""))}
+          firehoseFailureFeedbackRoleARN: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?firehose.?failureFeedbackRoleArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.firehose.failureFeedbackRoleArn
+              : (schema.spec.deliveryFeedback.firehose.failureFeedbackRoleArn != ""
+                  ? schema.spec.deliveryFeedback.firehose.failureFeedbackRoleArn
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?firehose.?failureFeedbackRoleArn.orValue("") : ""))}
+          firehoseSuccessFeedbackSampleRate: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deliveryFeedback.?firehose.?successFeedbackSampleRate.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deliveryFeedback.firehose.successFeedbackSampleRate
+              : (schema.spec.deliveryFeedback.firehose.successFeedbackSampleRate != ""
+                  ? schema.spec.deliveryFeedback.firehose.successFeedbackSampleRate
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?deliveryFeedback.?firehose.?successFeedbackSampleRate.orValue("") : ""))}
+          # Cloud resource tags — ACK SNS Topic spec.tags is array<{key, value}> (not map).
+          # Merge order: defaults -> instance spec -> mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 section 6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
