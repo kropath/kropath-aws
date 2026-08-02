@@ -521,6 +521,48 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **What Works Instead:** Always use the fully-qualified plural resource name for ACK kinds that collide with built-in Kubernetes kinds — `roles.iam.services.k8s.aws` instead of `role`. This matches the pattern already used elsewhere in these test files for other ACK kinds (`policies.iam.services.k8s.aws`, `keys.kms.services.k8s.aws`, `groups.iam.services.k8s.aws`). ACK `User`, `Bucket`, `Key`, `OpenIDConnectProvider` have no built-in-Kubernetes-kind collision and are safe to query with their bare short name.
 * **Rule:** Any new `kubectl get <ack-kind>` in a test script must use the fully-qualified `<plural>.<group>` form, never the bare kind name, for any kind that might shadow a built-in Kubernetes resource (`role`, and watch for `service`, `endpoint`, `event`, `secret`, etc. if ACK ever adds CRDs with those names).
 
+### Chainsaw Cleanup Timeout — kro Cascade Deletion Queue Backup
+
+* **What Fails:** The last step (or last two steps) of a long Chainsaw test suite fails with:
+    ```
+    ERROR: context deadline exceeded
+      - ac34-... / cleanup (2m0s)
+      - ac33-... / cleanup (2m0s)
+    ```
+    This occurs even after `cleanup: 2m` is set in `.chainsaw.yaml` and `cleanup:` scripts use `--wait=false`.
+* **Why:** Chainsaw automatically deletes every resource that was `apply`-ed in a step's `try:` block during the cleanup phase. For the last step(s), Chainsaw's auto-delete triggers kro's cascade deletion of all accumulated CRs. With no cloud controllers running (e.g., ACK controllers absent — only CRD definitions installed), kro cannot get cloud-side confirmation of deletion and queues all resources for retry. With 30+ CRs queued, kro processes earlier items before reaching the last step's resources, so Chainsaw's auto-delete wait for those last resources exceeds 2 minutes.
+
+    The `cleanup:` script's `--wait=false` helps the explicit script portion, but **Chainsaw's own auto-delete of `try:`-applied resources still waits up to `cleanup-timeout`** for each resource to disappear. The auto-delete runs alongside the `cleanup:` script — it is not replaced by it.
+
+* **What Works Instead:** Add a `finally:` block to the **last step** in the suite. Chainsaw's `finally:` runs during the **test execution phase** (right after the step's `try:`), before the cleanup phase begins. Pre-strip all finalizers and issue bulk `--wait=false` deletes there:
+
+    ```yaml
+    finally:
+      - script:
+          content: |
+            for name in $(kubectl get topic -n snstopic -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              kubectl patch topic "$name" -n snstopic --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+            done
+            kubectl delete topic --all -n snstopic --ignore-not-found=true --wait=false 2>/dev/null || true
+            for name in $(kubectl get snstopic -n snstopic -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              kubectl patch snstopic "$name" -n snstopic --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+            done
+            kubectl delete snstopic --all -n snstopic --ignore-not-found=true --wait=false 2>/dev/null || true
+    ```
+
+    With finalizers stripped before the cleanup phase, Chainsaw's auto-delete finds resources already in `Terminating` state with no finalizers and completes sub-second. Also:
+    - Add `cleanup: 2m` (and `delete: 2m`) to `.chainsaw.yaml` as a safety margin for suites with fewer resources.
+    - Add `--wait=false` to all explicit `kubectl delete` calls in `cleanup:` scripts, regardless, to prevent the script itself from blocking.
+
+* **Chainsaw lifecycle order (for reference):**
+    1. Each step's `try:` block runs in order.
+    2. If `finally:` is present on a step, it runs immediately after that step's `try:` (during execution phase).
+    3. The cleanup phase starts after all steps' `finally:` blocks.
+    4. Cleanup runs in reverse-step order: ac34's `cleanup:` runs first, then ac33's, down to ac01's.
+    5. For each step, Chainsaw auto-deletes `try:`-applied resources (waiting up to `cleanup-timeout`), then runs the explicit `cleanup:` script.
+
+* **Rule:** Any Chainsaw suite with 20+ accumulated resources and no live cloud controllers (mock/local clusters) must have a `finally:` block on its last step to pre-strip finalizers and bulk-delete all resource kinds before the cleanup phase. See `docs/troubleshooting-logs/2026-08-02-snstopic-ci-hang.md` for the full SNSTopic investigation.
+
 ### OPEN ISSUE: `IAMIdentityProvider`/`OpenIDConnectProvider` CLEANUP Always Times Out
 
 * **Status:** Unresolved as of 2026-07-23. See `docs/troubleshooting-logs/2026-07-23-chainsaw-flaky-list-asserts.md` for the full investigation.
