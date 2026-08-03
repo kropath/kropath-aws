@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb rds sns sqs secretsmanager eks ecr cloudwatch}"
+ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb rds sns sqs secretsmanager eks ecr cloudwatch eventbridge}"
 ACK_CHART_VERSION="${ACK_CHART_VERSION:-}"
 SKIP_ACK="${SKIP_ACK:-false}"
 SKIP_KCC="${SKIP_KCC:-true}"
