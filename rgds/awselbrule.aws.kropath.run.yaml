@@ -1,0 +1,158 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: awselbrule.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: AWSELBRule
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      # nameOverride is present for cross-RGD schema consistency but is a no-op:
+      # ACK Rule has no name field — the rule is identified by its ARN.
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # ARN of the listener this rule belongs to.
+      listenerArn: string | default=""
+      # priority — unique within a listener; lower numbers evaluated first.
+      priority: integer | default=0
+      # conditions — match conditions; at most one each of host-header, http-request-method,
+      # path-pattern, source-ip; any number of http-header and query-string.
+      # Use the simple field+values form; ACK supports this for all standard condition types.
+      conditions: "[]RuleCondition | default=[]"
+      # actions — routing actions when all conditions match. Same action shapes as
+      # AWSELBListener.defaultActions: forward, redirect, fixed-response.
+      actions: "[]RuleAction | default=[]"
+    types:
+      RuleCondition:
+        # field: host-header | http-header | http-request-method | path-pattern | query-string | source-ip
+        field: string | default=""
+        # values: simple value list (legacy form, supported by ACK for all standard types).
+        values: "[]string | default=[]"
+      RuleAction:
+        type: string | default=forward
+        order: integer | default=0
+        # For forward actions: ARN of the target group.
+        targetGroupArn: string | default=""
+        # For redirect actions.
+        redirectConfig:
+          protocol: string | default=""
+          host: string | default=""
+          path: string | default=""
+          port: string | default=""
+          query: string | default=""
+          statusCode: string | default=""
+        # For fixed-response actions.
+        fixedResponseConfig:
+          statusCode: string | default=""
+          contentType: string | default=""
+          messageBody: string | default=""
+    status:
+      conditions: >-
+        ${rule.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: Priority
+        type: integer
+        jsonPath: .spec.priority
+      - name: ListenerARN
+        type: string
+        jsonPath: .spec.listenerArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ELBConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACK ELBv2 Rule CR — primary cloud resource.
+    # No status.predictedArn: Rule ARNs embed LB + listener + rule hashes, not predictable.
+    # Use status.ackResourceMetadata.arn at runtime.
+    # nameOverride is a no-op: ACK Rule has no name field.
+    - id: rule
+      template:
+        apiVersion: elbv2.services.k8s.aws/v1alpha1
+        kind: Rule
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AWSELBRule
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          listenerARN: ${schema.spec.listenerArn}
+          priority: ${schema.spec.priority}
+          # conditions — passed through directly; field names match ACK's RuleCondition schema.
+          conditions: ${schema.spec.conditions}
+          # actions — type-conditional mapping avoids sending empty sub-config objects
+          # to ACK/AWS for action types that don't use them.
+          actions: >-
+            ${schema.spec.actions.map(a,
+              a.type == "forward"
+                ? {"type": "forward", "targetGroupARN": a.targetGroupArn, "order": a.order}
+              : a.type == "redirect"
+                ? {"type": "redirect", "order": a.order, "redirectConfig": {
+                    "protocol": a.redirectConfig.protocol,
+                    "host": a.redirectConfig.host,
+                    "path": a.redirectConfig.path,
+                    "port": a.redirectConfig.port,
+                    "query": a.redirectConfig.query,
+                    "statusCode": a.redirectConfig.statusCode
+                  }}
+              : a.type == "fixed-response"
+                ? {"type": "fixed-response", "order": a.order, "fixedResponseConfig": {
+                    "statusCode": a.fixedResponseConfig.statusCode,
+                    "contentType": a.fixedResponseConfig.contentType,
+                    "messageBody": a.fixedResponseConfig.messageBody
+                  }}
+              : {"type": a.type, "order": a.order, "targetGroupARN": a.targetGroupArn})}
+          # Cloud resource tags — ACK ELBv2 uses []Tag (key/value pairs), not map[string]string.
+          # Merge order: defaults (lowest) → spec → mandatory (highest).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .transformList(k, v, {"key": k, "value": v})}
