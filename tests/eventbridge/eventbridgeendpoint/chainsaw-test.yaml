@@ -1,0 +1,580 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eventbridge-05 Chainsaw tests -- 16 acceptance criteria for EventBridgeEndpoint.
+# Namespace: eventbridgeendpoint. Default naming: {namespace}-{name} => eventbridgeendpoint-<cr-name>.
+# No predictedArn (Endpoint ARN only available post-creation from ACK status.ackResourceMetadata.arn).
+# No cloud tags (ACK Endpoint does not support tags).
+# replicationConfig.state=ENABLED requires roleArn → replicationRoleError advisory if missing.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: eventbridgeendpoint
+spec:
+  namespace: eventbridgeendpoint
+  steps:
+    # ── Seed: namespace + governance config ──────────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              for kind in endpoint eventbridgeendpoint; do
+                for name in $(kubectl get "$kind" -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                  kubectl patch "$kind" "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+                done
+                kubectl delete "$kind" --all -n eventbridgeendpoint --ignore-not-found --wait=false
+              done
+              kubectl delete eventbridgeconfig --all -n eventbridgeendpoint --ignore-not-found --wait=false
+              kubectl delete namespace eventbridgeendpoint --ignore-not-found
+              sleep 3
+
+    - name: seed-namespace-and-config
+      try:
+        - apply:
+            file: 00-eventbridgeendpoint-namespace.yaml
+        - apply:
+            file: 01-general-policy-eventbridgeconfig.yaml
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ── AC-1: creation with full spec (eventBuses, routingConfig, replicationConfig) ─
+    # ── AC-3: default naming {namespace}-{name} ────────────────────────────
+    # ── AC-6: replicationConfig.state defaults to DISABLED ─────────────────
+    # ── AC-11: eventBuses array passthrough ────────────────────────────────
+    # ── AC-12: routingConfig.failoverConfig.primary.healthCheckArn → ACK healthCheck.arn ─
+    # ── AC-13: routingConfig.failoverConfig.secondary.route passthrough ────
+    - name: ac1-ac3-ac6-ac11-ac12-ac13-creation-full-spec
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: full-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/primary-bus"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/secondary-bus"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/abc123"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: DISABLED
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: full-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                name: eventbridgeendpoint-full-endpoint
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/primary-bus"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/secondary-bus"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheck:
+                        arn: "arn:aws:route53::123456789012:healthcheck/abc123"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: DISABLED
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: full-endpoint
+                namespace: eventbridgeendpoint
+              status:
+                resourceName: eventbridgeendpoint-full-endpoint
+                namingStatus: valid
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+
+    # ── AC-4: nameOverride takes precedence ────────────────────────────────
+    - name: ac4-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: override-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                nameOverride: "my-custom-endpoint"
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: override-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                name: my-custom-endpoint
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+
+    # ── AC-5: mandatory namingTemplate wins ───────────────────────────────
+    - name: ac5-naming-mandatory-template
+      try:
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: naming-mandatory
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: naming-mandatory
+                namespace: eventbridgeendpoint
+              spec:
+                name: corp-eventbridgeendpoint-naming-mandatory
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
+
+    # ── AC-2: unresolved tokens → namingStatus invalid, no ACK Endpoint ───
+    - name: ac2-naming-unresolved-tokens
+      try:
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{tag.unknown}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: naming-unresolved
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: naming-unresolved
+                namespace: eventbridgeendpoint
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              if kubectl get endpoint naming-unresolved -n eventbridgeendpoint 2>/dev/null | grep -q "naming-unresolved"; then
+                echo "FAIL: ACK Endpoint should not exist with invalid naming"; exit 1
+              fi
+              echo "PASS"
+      cleanup:
+        - script:
+            content: |
+              kubectl delete eventbridgeendpoint naming-unresolved -n eventbridgeendpoint --ignore-not-found=true
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeendpoint --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
+
+    # ── AC-7: replicationConfig.state=ENABLED without roleArn → error ──────
+    - name: ac7-replication-enabled-no-role-error
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: replication-no-role
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: ENABLED
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: replication-no-role
+                namespace: eventbridgeendpoint
+              status:
+                (validationError != ""): true
+        - script:
+            content: |
+              if kubectl get endpoint replication-no-role -n eventbridgeendpoint 2>/dev/null | grep -q "replication-no-role"; then
+                echo "FAIL: ACK Endpoint should not exist when replication enabled without roleArn"; exit 1
+              fi
+              echo "PASS"
+      cleanup:
+        - script:
+            content: |
+              kubectl delete eventbridgeendpoint replication-no-role -n eventbridgeendpoint --ignore-not-found=true
+
+    # ── AC-8: replicationConfig.state=ENABLED with roleArn → ACK roleARN set ─
+    - name: ac8-replication-enabled-with-role
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: replication-with-role
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: ENABLED
+                roleArn: "arn:aws:iam::123456789012:role/EndpointRole"
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: replication-with-role
+                namespace: eventbridgeendpoint
+              spec:
+                replicationConfig:
+                  state: ENABLED
+                roleARN: "arn:aws:iam::123456789012:role/EndpointRole"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+
+    # ── AC-9: description passthrough ─────────────────────────────────────
+    - name: ac9-description-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: desc-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                description: "Global endpoint for multi-region event routing"
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: desc-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                description: "Global endpoint for multi-region event routing"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+
+    # ── AC-10: no predictedArn field on EventBridgeEndpoint ──────────────
+    - name: ac10-no-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: no-arn-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - script:
+            content: |
+              PREDICTED=$(kubectl get eventbridgeendpoint no-arn-endpoint -n eventbridgeendpoint -o jsonpath='{.status.predictedArn}' 2>/dev/null || echo "null")
+              if [ "$PREDICTED" != "" ] && [ "$PREDICTED" != "null" ]; then
+                echo "FAIL: EventBridgeEndpoint should not have predictedArn, got: $PREDICTED"; exit 1
+              fi
+              echo "PASS: No predictedArn on EventBridgeEndpoint (by design)"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+
+    # ── AC-14: syncedLabels dual-write to K8s labels (no cloud tags — Endpoint has none) ─
+    - name: ac14-synced-labels-kubernetes-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: synced-labels-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                syncedLabels:
+                  team: platform
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: synced-labels-endpoint
+                namespace: eventbridgeendpoint
+                labels:
+                  aws.kropath.run/team: platform
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+
+    # ── AC-15: standard K8s metadata wiring + deletionPolicy ──────────────
+    - name: ac15-standard-metadata-and-deletion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: meta-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: general-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: meta-endpoint
+                namespace: eventbridgeendpoint
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: meta-endpoint
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+        - script:
+            content: |
+              OWNER_KIND=$(kubectl get endpoint meta-endpoint -n eventbridgeendpoint -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              if [ "$OWNER_KIND" != "EventBridgeEndpoint" ]; then echo "FAIL: ownerRef kind=$OWNER_KIND"; exit 1; fi
+              echo "PASS"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+
+    # ── AC-16: configRef selects correct EventBridgeConfig ────────────────
+    - name: ac16-config-profile-selection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: team-endpoint-policy
+                namespace: eventbridgeendpoint
+                labels:
+                  aws.kropath.run/resource-name: team-endpoint-policy
+              spec:
+                mandatory:
+                  archiveRetentionDays: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  archiveRetentionDays: 0
+                  namingTemplate: "team-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig team-endpoint-policy -n eventbridgeendpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"team-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: team-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                configRef: team-endpoint-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: team-endpoint
+                namespace: eventbridgeendpoint
+              spec:
+                name: team-team-endpoint
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get endpoint -n eventbridgeendpoint -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch endpoint "$name" -n eventbridgeendpoint --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete endpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeendpoint --all -n eventbridgeendpoint --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeconfig team-endpoint-policy -n eventbridgeendpoint --ignore-not-found=true
