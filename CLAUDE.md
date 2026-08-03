@@ -9,6 +9,15 @@ Every session, before editing any RGD, CRD, or test file:
 
 Skipping this will cause you to re-discover known traps and revert known-good patterns.
 
+> **Canonical chainsaw test structure (2026-08-03):** new and rewritten suites use a
+> **unique resource name per step** and **`spec.skipDelete: true`**, and delete nothing
+> between steps — see `docs/frequent-rgd-errors.md` §"CANONICAL: Unique-Name-Per-Step +
+> `skipDelete`". This supersedes the older delete-then-recreate / `--wait=false` /
+> finalizer-strip / per-step-cleanup / poll-script workarounds (which fought the fact that
+> the test cluster has kro but **no ACK controllers**, so ACK finalizers are never removed).
+> Suites are being migrated one commit at a time; a suite still using the old pattern is
+> mid-migration, not the intended template.
+
 ## This Repo
 
 **kropath-aws** — ACK-based CRDs and kro RGDs for AWS resources.
