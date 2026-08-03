@@ -1,0 +1,208 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: eventbridgearchive.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: EventBridgeArchive
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      # Event bus source — exactly one must be set (enforced via ConfigMap advisory).
+      eventBusRef: string | default=""
+      eventBusArn: string | default=""
+      # eventPattern filters which events are archived; empty = match all events.
+      eventPattern: string | default=""
+      description: string | default=""
+      # retentionDays: 0 = indefinite. mandatory.archiveRetentionDays is a minimum floor.
+      retentionDays: integer | default=0
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status) && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.aws) && !naming.data.effectiveName.contains("{") && naming.data.effectiveName != ""
+          ? "arn:aws:events:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":archive/" + naming.data.effectiveName
+          : ""}
+      archiveArn: >-
+        ${ackArchive.?status.?ackResourceMetadata.?arn.orValue("")}
+      conditions: >-
+        ${ackArchive.?status.?conditions.orValue([])}
+      validationError: >-
+        ${has(eventBusExclusionError.data) && has(eventBusExclusionError.data.error) ? eventBusExclusionError.data.error : ""}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+  resources:
+    # Single governance config lookup (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EventBridgeConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Optional cross-reference to an EventBridgeEventBus CR.
+    # Archive uses EventBus.status.predictedArn (the ARN), not resourceName.
+    # Sentinel fallback to avoid Unbound Variable Freeze (frequent-rgd-errors.md §UBF).
+    - id: eventBusResource
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EventBridgeEventBus
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.eventBusRef != "" ? schema.spec.eventBusRef : "kro-empty-fallback-sentinel"}'
+
+    # Materialise effectiveName in a ConfigMap for status-block access.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeArchive
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.syncedLabels
+                              ? schema.spec.syncedLabels[part.split("}")[0]]
+                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                  ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                      : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)}
+
+    # Advisory ConfigMap — created only when both eventBusRef and eventBusArn are set simultaneously.
+    - id: eventBusExclusionError
+      includeWhen:
+        - '${schema.spec.eventBusRef != "" && schema.spec.eventBusArn != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-eventbus-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeArchive
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "eventBusRef and eventBusArn are mutually exclusive — set exactly one"
+
+    # ACK EventBridge Archive CR — gated on valid naming and no mutual exclusion errors.
+    # ACK Archive has no spec.tags field — cloud metadata written only to K8s labels/annotations.
+    - id: ackArchive
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{") && !(has(eventBusExclusionError.data) && has(eventBusExclusionError.data.error))}'
+      template:
+        apiVersion: eventbridge.services.k8s.aws/v1alpha1
+        kind: Archive
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeArchive
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          archiveName: ${naming.data.effectiveName}
+          # eventSourceARN: resolved from eventBusRef (→ EventBus.status.predictedArn) or eventBusArn direct.
+          eventSourceARN: >-
+            ${schema.spec.eventBusRef != "" && eventBusResource.size() > 0
+              ? eventBusResource[0].?status.?predictedArn.orValue("")
+              : schema.spec.eventBusArn}
+          eventPattern: ${schema.spec.eventPattern}
+          description: ${schema.spec.description}
+          # retentionDays governance floor: mandatory.archiveRetentionDays is a minimum.
+          # If mandatory > 0 and instance < mandatory and instance != 0 → clamp to mandatory.
+          # 0 = indefinite: if instance is 0, keep 0 regardless of mandatory floor.
+          retentionDays: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?archiveRetentionDays.orValue(0) > 0
+              && schema.spec.retentionDays != 0
+              && schema.spec.retentionDays < rsrcCfg[0].status.effectiveConfig.mandatory.archiveRetentionDays)
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.archiveRetentionDays
+              : schema.spec.retentionDays}
