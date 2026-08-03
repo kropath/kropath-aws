@@ -212,6 +212,19 @@ This document tracks technical friction points, syntax limitations, and runtime 
     (!has(schema.spec.addSsmPolicy) && rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.addSsmPolicy) && rsrcCfg[0].status.effectiveConfig.defaults.addSsmPolicy)
     ```
 
+### Boolean Cascade Cannot Disable a Default-True Flag (kro v0.9.2 Zero-Value Stripping + OR-Logic)
+
+* **What Fails:** A spec acceptance criterion asks that an instance's explicit `false` override a governance `defaults.<flag>: true` (e.g. `defaults.deletionProtectionEnabled: true`, instance `spec.deletionProtectionEnabled: false` → ACK Table `false`). The RGD cannot honour it — the flag stays `true`.
+* **Why:** kro v0.9.2 strips zero-value booleans from the stored instance spec, so an explicit `false` is byte-for-byte indistinguishable from "field unset". The only cascade that survives this is OR-logic:
+    ```cel
+    ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.<flag>)
+      || schema.spec.?<flag>.orValue(false)
+      || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.<flag>)}
+    ```
+  OR can only **add or strengthen** a flag. When `defaults.<flag>` is already `true`, the whole expression is `true` regardless of the instance value — there is no way for the instance to force `false`.
+* **What Works Instead:** Accept the limitation. A tri-state boolean is not representable end-to-end in kro v0.9.2. Test only the achievable direction — instance turns a flag **ON** when defaults leaves it off — and document the deviation in both the test fixture and the spec note. If genuine explicit-disable is required, the field must be modelled as a string enum (`""` / `"true"` / `"false"`) rather than a bare boolean, so the "unset" state is a non-zero value that kro preserves.
+* **Reference:** `tests/dynamodb/dynamodbtable/chainsaw-test.yaml` step `ac11-instance-deletion-protection-enable-over-default-off`.
+
 ### Chainsaw Inter-Step State Pollution via `--type=merge {}` (No-Op)
 
 * **What Fails:** A later chainsaw step patches `mandatory.tags: {}` via `--type=merge` to clear tags set by a previous step. The tags still appear in the cloud resource's `spec.tags`:
