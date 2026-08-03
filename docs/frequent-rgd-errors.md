@@ -230,6 +230,68 @@ This document tracks technical friction points, syntax limitations, and runtime 
 
 ---
 
+### Chainsaw `cleanup:` Blocks Run at End-of-File — Reused Resource Names Need Explicit Pre-Cleanup
+
+* **What Fails:** A step (e.g. `ac22-composite-key-schema`) applies a new manifest for a resource name reused across many steps (e.g. `test-table`), and the child resource's `spec` ends up **completely empty** (`spec: {}`), not merely wrong:
+    ```
+    * spec.(length(keySchema)): Invalid value: 1: Expected value: 2
+    --- expected
+    +++ actual
+      spec: {}
+    ```
+* **Why:** Chainsaw's `cleanup:` blocks are deferred to the **end of the entire test file** (run in reverse step order), not immediately after each step. The previous step's object (with a different shape — e.g. a single-attribute `keySchema`) is still present when the next step's `kubectl apply` runs. `apply` performs a merge/strategic patch against the existing object, not a full replace; when the new manifest's shape doesn't line up with the stale object's shape, kro's CEL evaluation can bail out entirely, leaving the child resource's `spec` empty rather than partially wrong. This is the same deferred-cleanup timing already documented for **config CRs** in "Chainsaw Seed Steps Must Delete-Then-Create Config CRs" below — this entry covers the same root cause for **any** resource CR (not just config) whose name is reused across steps.
+* **What Works Instead:** Add an explicit pre-cleanup `script:` step at the start of every step's `try:` block that reuses a resource name from a prior step, deleting (with finalizers stripped first) both the child ACK CR and the parent kro-managed CR before applying the new manifest:
+    ```yaml
+    try:
+      - script:
+          content: |
+            for name in $(kubectl get table -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              kubectl patch table "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+            done
+            kubectl delete table --all -n dynamodbtable --ignore-not-found=true
+            for name in $(kubectl get dynamodbtable -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              kubectl patch dynamodbtable "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+            done
+            kubectl delete dynamodbtable --all -n dynamodbtable --ignore-not-found=true
+      - apply:
+          file: 01-general-policy.yaml
+    ```
+* **Rule:** Once one step in a long chainsaw suite hits this (proven by fixing it and having the *very next* step fail identically), assume **every** subsequent step that reuses the same resource name needs the same pre-cleanup block — fix all of them proactively rather than one at a time as each fails.
+* **Reference:** `docs/troubleshooting-logs/2026-08-03-dynamodbtable-ac22-ac39-stale-state-and-kro-ratelimiter.md`.
+
+---
+
+### YAML 1.1 Boolean Coercion of Single-Letter/Word Field Values (the "Norway Problem")
+
+* **What Fails:** A test fixture sets a single-letter or single-word field value that happens to be a YAML 1.1 boolean literal, e.g. DynamoDB's `attributeType: N` (the "Number" type code):
+    ```
+    * spec.attributeDefinitions[0].attributeType: Invalid value: "boolean": must be of type string: "boolean"
+    ```
+* **Why:** YAML 1.1 parsers (used by `kubectl`/client-go) treat bare, unquoted `y`/`Y`/`yes`/`n`/`N`/`no`/`on`/`off`/`true`/`false` (and case variants) as booleans. `N` is silently coerced to boolean `false` before the value ever reaches the Kubernetes API server, which then rejects it against the CRD's `type: string` schema.
+* **What Works Instead:** Always quote such values: `attributeType: "N"`.
+* **Rule:** Any field whose valid values include a bare single letter or word that collides with a YAML 1.1 boolean literal (`attributeType: S`/`N`/`B`, or similar single-token enums elsewhere) must be quoted in every test fixture and RGD example — do not rely on the value "looking obviously like a string" to a human reader.
+
+---
+
+### kro Dynamic-Controller Rate Limiter Compounds Backoff Under Rapid Test Churn
+
+* **What Fails:** Chainsaw asserts intermittently see `actual resource not found` on objects that should already exist, and `kubectl delete` / cleanup phases take minutes instead of seconds — worsening the more test runs are executed against the same long-lived cluster.
+* **Why:** kro's dynamic-controller workqueue applies a **per-object-key** (`namespace/name`) exponential-backoff rate limiter, defaulting to `min-delay=200ms` / `max-delay=1000s` — correct for production AWS reconciliation (where backing off for minutes avoids hammering a degraded cloud API), but actively harmful for chainsaw suites that create/delete/patch the *same-named* resource dozens of times per run. Any transient "dependency not ready yet" condition trips the backoff for that object key, and consecutive trips compound (`200ms × 2ⁿ`, capped at 1000s) since every step in the suite reuses the same resource name. `KRO_DYNAMIC_CONTROLLER_CONCURRENT_RECONCILES` also defaults to `1` (fully serialized), compounding the effect further.
+* **What Works Instead:** Tune the rate limiter down for local/CI test environments only (never for a production kro deployment) — apply via `kubectl set env` right after the kro rollout wait in the test-cluster bootstrap script, so it's picked up by every run:
+    ```bash
+    kubectl set env deployment/kro -n kro-system \
+      KRO_DYNAMIC_CONTROLLER_RATE_LIMITER_MIN_DELAY=50ms \
+      KRO_DYNAMIC_CONTROLLER_RATE_LIMITER_MAX_DELAY=5s \
+      KRO_DYNAMIC_CONTROLLER_RATE_LIMITER_RATE_LIMIT=50 \
+      KRO_DYNAMIC_CONTROLLER_RATE_LIMITER_BURST_LIMIT=200 \
+      KRO_DYNAMIC_CONTROLLER_CONCURRENT_RECONCILES=5
+    kubectl rollout status deployment/kro -n kro-system --timeout=120s
+    ```
+* **How to confirm this is the cause before applying:** grep the kro controller pod logs for repeated reconcile attempts against the same object key and compare the gaps between attempts against `200ms × 2ⁿ` (1s, 2s, 3s→4s, 6s→8s, 13s→16s, 26s→32s, 51s→64s...); a near-exact match confirms the rate limiter, not a genuine stuck dependency.
+* **Reference:** `tests/setup.sh` (the fix is baked in here) and `docs/troubleshooting-logs/2026-08-03-dynamodbtable-ac22-ac39-stale-state-and-kro-ratelimiter.md`.
+
+---
+
 ### Chainsaw Seed Steps Must Delete-Then-Create Config CRs, Not Just Patch
 
 * **What Fails:** A later step's status patch (e.g. `mandatory.tags = {cost-centre, environment:mandatory}`) appears to leak into an EARLIER step's assertion when the test is re-run against a cluster where a prior run (or manual investigation) already populated `status.effectiveConfig`:
@@ -430,6 +492,10 @@ This document tracks technical friction points, syntax limitations, and runtime 
 | **ARN assertion in tests** | `status.arn` (empty without real AWS) | `status.predictedArn` (computed from accountId + path + name) |
 | **Chainsaw list/array assertion** | Exact-order list match on CEL-generated tags/tagging | `(length(x)): N` + `(key == 'foo'): true` item-level match per element |
 | **Naming template on a nameless ACK resource** | Adding `naming` ConfigMap / `effectiveName` / `resourceName` / `namingStatus` unconditionally to every RGD | Check `kropath-core/docs/crd-cache/aws/<controller>.md` for a `name` field first; if absent (e.g. `OpenIDConnectProvider`), skip naming-template entirely |
+| **Reused resource name across chainsaw steps** | Relying on end-of-file `cleanup:` to remove the prior step's object before the next `apply` | Explicit pre-cleanup `script:` at the start of `try:` — delete + strip finalizers before applying |
+| **Single-letter/word field value (e.g. `attributeType: N`)** | Bare unquoted scalar in YAML test fixture | Quote it (`"N"`) — YAML 1.1 parses bare `N`/`Y`/`on`/`off`/etc. as booleans |
+| **kro test-cluster reconcile churn** | Leaving kro's production rate-limiter defaults (`max-delay=1000s`) in CI/local test clusters | Tune down via `kubectl set env deployment/kro` in the test bootstrap script (`tests/setup.sh`) |
+| **Assert on a multi-hop-dependency resource** | Plain `assert:` expecting chainsaw to retry a missing (not just wrong-valued) resource | Poll-based `script:` step — chainsaw does not retry "resource not found", only value mismatches |
 
 ### CEL Is Not Supported in `externalRef.metadata.name` — Use labelSelector
 
@@ -562,6 +628,36 @@ This document tracks technical friction points, syntax limitations, and runtime 
     5. For each step, Chainsaw auto-deletes `try:`-applied resources (waiting up to `cleanup-timeout`), then runs the explicit `cleanup:` script.
 
 * **Rule:** Any Chainsaw suite with 20+ accumulated resources and no live cloud controllers (mock/local clusters) must have a `finally:` block on its last step to pre-strip finalizers and bulk-delete all resource kinds before the cleanup phase. See `docs/troubleshooting-logs/2026-08-02-snstopic-ci-hang.md` for the full SNSTopic investigation.
+
+### Chainsaw `assert:` Retries a Value Mismatch, But Not a Completely Missing Resource
+
+* **What Fails:** A chainsaw `assert:` step against a resource created via a multi-hop dependency chain (e.g. an `externalRef` lookup that must resolve before an `includeWhen`-gated child resource is even created) intermittently fails with `actual resource not found`, even though `.chainsaw.yaml` sets `assert: 5m`:
+    ```
+    ac28-resource-policy-ref | ASSERT | ERROR | ... actual resource not found
+    ```
+* **Why:** Chainsaw retries an assert whose target object **exists but has the wrong value** against the full configured `assert:` timeout. It does **not** retry when the target object **does not exist at all** — confirmed by comparing RUN/ERROR timestamps in the chainsaw log: a value-mismatch failure shows RUN and ERROR many seconds apart (evidence of retries), while a missing-resource failure shows RUN and ERROR in the same second (zero retries, fails on the very first check). Steps whose child resource depends on an *additional* externalRef hop resolving first (e.g. a `resourcePolicyRef` → `PolicyDocument` lookup gating the child's `includeWhen`) are structurally more likely to be checked before the object exists at all, versus a step where the object already exists and only a field value is wrong.
+* **What Works Instead:** Replace the plain `assert:` with a bounded poll `script:` step that waits for the resource to exist (and have the expected field populated) before treating the step as passed:
+    ```yaml
+    - script:
+        timeout: 30s
+        content: |
+          for i in $(seq 1 15); do
+            RESOURCE_POLICY=$(kubectl get table test-table -n dynamodbtable -o jsonpath='{.spec.resourcePolicy}' 2>/dev/null)
+            if [ -n "$RESOURCE_POLICY" ]; then
+              echo "PASS: resourcePolicy is set (length ${#RESOURCE_POLICY})"
+              exit 0
+            fi
+            echo "Attempt $i: Table not found or resourcePolicy not yet set, waiting..."
+            sleep 2
+          done
+          echo "FAIL: resourcePolicy still not set after 30 seconds"
+          kubectl get table test-table -n dynamodbtable -o yaml
+          exit 1
+    ```
+* **Rule:** Use a poll-based `script:` step instead of a declarative `assert:` for any resource whose *existence* (not just field value) depends on a multi-hop `externalRef`/`includeWhen` chain resolving first.
+* **Reference:** `docs/troubleshooting-logs/2026-08-03-dynamodbtable-ac22-ac39-stale-state-and-kro-ratelimiter.md`.
+
+---
 
 ### OPEN ISSUE: `IAMIdentityProvider`/`OpenIDConnectProvider` CLEANUP Always Times Out
 
