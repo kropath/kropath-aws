@@ -1,0 +1,1977 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named DynamoDBConfig + DynamoDBTable and
+# deletes nothing between steps, so no ACK finalizer ever blocks a delete and kro's
+# per-object-key backoff never compounds. Test-level skipDelete: true stops chainsaw's
+# end-of-test cascade delete; the ephemeral kind cluster is discarded after the suite.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: dynamodbtable
+spec:
+  # Canonical pattern (see docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-
+  # Per-Step + skipDelete"): every step uses a unique config+table name and deletes
+  # nothing between steps; skipDelete stops chainsaw's end-of-test cascade delete (the
+  # cluster runs kro but no ACK controllers, so ACK finalizers are never removed and any
+  # delete would hang). The ephemeral kind cluster is discarded after the suite.
+  skipDelete: true
+  namespace: dynamodbtable
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: When no billingMode is set anywhere, ACK Table defaults to PAY_PER_REQUEST.
+    - name: ac1-default-billing-mode-ondemand
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac1-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac1-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac1-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac1-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac1-table
+                namespace: dynamodbtable
+              spec:
+                billingMode: PAY_PER_REQUEST
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac1-table
+                namespace: dynamodbtable
+              status:
+                resourceName: dynamodbtable-ac1-table
+                namingStatus: valid
+    # AC-2: When mandatory.billingMode=PROVISIONED, ACK Table uses PROVISIONED.
+    - name: ac2-mandatory-billing-mode-provisioned
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac2-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac2-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"PROVISIONED","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac2-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac2-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+                provisionedThroughput:
+                  readCapacityUnits: 5
+                  writeCapacityUnits: 5
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac2-table
+                namespace: dynamodbtable
+              spec:
+                billingMode: PROVISIONED
+                provisionedThroughput:
+                  readCapacityUnits: 5
+                  writeCapacityUnits: 5
+    # AC-3: When spec.billingMode=PROVISIONED (no mandatory), uses PROVISIONED.
+    - name: ac3-instance-billing-mode-provisioned
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac3-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac3-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac3-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac3-cfg
+                billingMode: PROVISIONED
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+                provisionedThroughput:
+                  readCapacityUnits: 10
+                  writeCapacityUnits: 10
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac3-table
+                namespace: dynamodbtable
+              spec:
+                billingMode: PROVISIONED
+    # AC-4: Resolved billingMode=PAY_PER_REQUEST; instance onDemandThroughput caps
+    # propagate to the ACK Table's spec.onDemandThroughput.
+    - name: ac4-ondemand-throughput-caps
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac4-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac4-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac4-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac4-cfg
+                onDemandThroughput:
+                  maxReadRequestUnits: 1000
+                  maxWriteRequestUnits: 500
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac4-table
+                namespace: dynamodbtable
+              spec:
+                billingMode: PAY_PER_REQUEST
+                onDemandThroughput:
+                  maxReadRequestUnits: 1000
+                  maxWriteRequestUnits: 500
+    # AC-5: Default encryption disabled — sseSpecification.enabled=false.
+    - name: ac5-encryption-default-disabled
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac5-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac5-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac5-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac5-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac5-table
+                namespace: dynamodbtable
+              spec:
+                sseSpecification:
+                  enabled: false
+    # AC-6: mandatory.encryptionEnabled=true with KMS key → sseType=KMS.
+    - name: ac6-mandatory-encryption-kms-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac6-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac6-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":true,"kmsMasterKeyId":"arn:aws:kms:ap-southeast-2:123456789012:key/mandatory-key","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac6-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac6-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac6-table
+                namespace: dynamodbtable
+              spec:
+                sseSpecification:
+                  enabled: true
+                  sseType: KMS
+                  kmsMasterKeyID: arn:aws:kms:ap-southeast-2:123456789012:key/mandatory-key
+    # AC-7: Instance spec.encryption.enabled=true with KMS key.
+    - name: ac7-instance-encryption-kms
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac7-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac7-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac7-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac7-cfg
+                encryption:
+                  enabled: true
+                  kmsMasterKeyId: arn:aws:kms:ap-southeast-2:123456789012:key/instance-key
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac7-table
+                namespace: dynamodbtable
+              spec:
+                sseSpecification:
+                  enabled: true
+                  sseType: KMS
+                  kmsMasterKeyID: arn:aws:kms:ap-southeast-2:123456789012:key/instance-key
+    # AC-8: mandatory.encryptionEnabled=true without explicit KMS key uses default KMS.
+    - name: ac8-mandatory-encryption-no-key
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac8-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac8-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":true,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac8-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac8-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac8-table
+                namespace: dynamodbtable
+              spec:
+                sseSpecification:
+                  enabled: true
+                  sseType: KMS
+    # AC-9: mandatory.deletionProtectionEnabled=true enforced regardless of instance.
+    - name: ac9-mandatory-deletion-protection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac9-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac9-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":true,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac9-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac9-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac9-table
+                namespace: dynamodbtable
+              spec:
+                deletionProtectionEnabled: true
+    # AC-10: defaults.deletionProtectionEnabled=true when no mandatory/instance set.
+    - name: ac10-default-deletion-protection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac10-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac10-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":true,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac10-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac10-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac10-table
+                namespace: dynamodbtable
+              spec:
+                deletionProtectionEnabled: true
+    # AC-11: Instance deletionProtectionEnabled=true overrides defaults=false.
+    #
+    # NOTE ON SPEC DEVIATION: Spec AC11 describes the inverse direction
+    # (defaults=true, instance=false explicit-disable → false). That scenario is
+    # NOT achievable under kro v0.9.2: it strips zero-value booleans from the
+    # instance spec, so an explicit `false` is indistinguishable from "unset".
+    # The boolean cascade therefore uses OR-logic (mandatory || instance ||
+    # defaults), which can only ADD/STRENGTHEN a flag, never disable a default
+    # that is already true. This step verifies the achievable direction: an
+    # instance can turn a boolean ON when defaults leave it off.
+    # See docs/frequent-rgd-errors.md §"Boolean Cascade Cannot Disable a
+    # Default-True Flag (kro v0.9.2 Zero-Value Stripping + OR-Logic)".
+    - name: ac11-instance-deletion-protection-enable-over-default-off
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac11-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac11-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac11-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac11-cfg
+                deletionProtectionEnabled: true
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac11-table
+                namespace: dynamodbtable
+              spec:
+                deletionProtectionEnabled: true
+    # AC-12: mandatory.pointInTimeRecoveryEnabled=true → continuousBackups.pointInTimeRecoveryEnabled=true.
+    - name: ac12-mandatory-pitr
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac12-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac12-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":true,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac12-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac12-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac12-table
+                namespace: dynamodbtable
+              spec:
+                continuousBackups:
+                  pointInTimeRecoveryEnabled: true
+    # AC-13: Instance spec.pointInTimeRecoveryEnabled=true.
+    - name: ac13-instance-pitr-enable
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac13-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac13-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac13-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac13-cfg
+                pointInTimeRecoveryEnabled: true
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac13-table
+                namespace: dynamodbtable
+              spec:
+                continuousBackups:
+                  pointInTimeRecoveryEnabled: true
+    # AC-14: mandatory.tableClass overrides instance and defaults.
+    - name: ac14-mandatory-table-class
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac14-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac14-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"STANDARD_INFREQUENT_ACCESS","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"STANDARD","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac14-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac14-cfg
+                tableClass: STANDARD
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac14-table
+                namespace: dynamodbtable
+              spec:
+                tableClass: STANDARD_INFREQUENT_ACCESS
+    # AC-15: defaults.tableClass=STANDARD when no mandatory/instance set.
+    - name: ac15-default-table-class
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac15-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac15-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"STANDARD","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac15-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac15-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac15-table
+                namespace: dynamodbtable
+              spec:
+                tableClass: STANDARD
+    # AC-16: mandatory.contributorInsights=ENABLE propagated to ACK Table.
+    - name: ac16-mandatory-contributor-insights
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac16-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac16-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"ENABLE","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac16-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac16-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac16-table
+                namespace: dynamodbtable
+              spec:
+                contributorInsights: ENABLE
+    # AC-17: Instance spec.contributorInsights=ENABLE when no mandatory set.
+    - name: ac17-instance-contributor-insights-enable
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac17-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac17-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac17-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac17-cfg
+                contributorInsights: ENABLE
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac17-table
+                namespace: dynamodbtable
+              spec:
+                contributorInsights: ENABLE
+    # AC-18: streamEnabled=true with NEW_AND_OLD_IMAGES propagated.
+    - name: ac18-streams-enabled
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac18-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac18-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac18-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac18-cfg
+                streamSpecification:
+                  streamEnabled: true
+                  streamViewType: NEW_AND_OLD_IMAGES
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac18-table
+                namespace: dynamodbtable
+              spec:
+                streamSpecification:
+                  streamEnabled: true
+                  streamViewType: NEW_AND_OLD_IMAGES
+    # AC-19: streamEnabled defaults to false.
+    - name: ac19-streams-disabled-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac19-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac19-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac19-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac19-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - script:
+            timeout: 5m
+            content: |
+              # Poll until Table exists and streamEnabled is false or absent (kro may omit zero-value false)
+              for i in $(seq 1 60); do
+                TABLE_JSON=$(kubectl get table ac19-table -n dynamodbtable -o json 2>/dev/null) || { sleep 5; continue; }
+                STREAM_ENABLED=$(echo "$TABLE_JSON" | jq -r '.spec.streamSpecification.streamEnabled // "absent"')
+                if [ "$STREAM_ENABLED" = "true" ]; then
+                  echo "Attempt $i: streamEnabled=true (stale table still present), waiting..."
+                  sleep 5
+                else
+                  echo "PASS: streamEnabled='$STREAM_ENABLED' (false or absent — streams correctly disabled)"
+                  exit 0
+                fi
+              done
+              echo "FAIL: streamEnabled is still true after 5 minutes"
+              kubectl get table ac19-table -n dynamodbtable -o json | jq '.spec.streamSpecification'
+              exit 1
+    # AC-20: TTL enabled with attributeName propagated.
+    - name: ac20-ttl-enabled
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac20-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac20-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac20-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac20-cfg
+                timeToLive:
+                  attributeName: expiresAt
+                  enabled: true
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac20-table
+                namespace: dynamodbtable
+              spec:
+                timeToLive:
+                  attributeName: expiresAt
+                  enabled: true
+    # AC-21: TTL disabled by default.
+    - name: ac21-ttl-disabled-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac21-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac21-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac21-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac21-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - script:
+            timeout: 5m
+            content: |
+              # kro v0.9.2 strips zero-value booleans from templates; ttl.enabled may be
+              # absent rather than false. Poll until Table exists and enabled is absent/false.
+              for i in $(seq 1 60); do
+                TABLE_JSON=$(kubectl get table ac21-table -n dynamodbtable -o json 2>/dev/null) || { sleep 5; continue; }
+                TTL_ENABLED=$(echo "$TABLE_JSON" | jq -r '.spec.timeToLive.enabled // "absent"')
+                if [ "$TTL_ENABLED" = "true" ]; then
+                  echo "Attempt $i: ttl.enabled=true (stale table still present), waiting..."
+                  sleep 5
+                else
+                  echo "PASS: ttl.enabled='$TTL_ENABLED' (false or absent — TTL correctly disabled)"
+                  exit 0
+                fi
+              done
+              echo "FAIL: ttl.enabled is still true after 5 minutes"
+              kubectl get table ac21-table -n dynamodbtable -o json | jq '.spec.timeToLive'
+              exit 1
+    # AC-22: Composite HASH+RANGE key schema propagated to ACK Table.
+    - name: ac22-composite-key-schema
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac22-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac22-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac22-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac22-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac22-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                  - attributeName: sk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+                  - attributeName: sk
+                    keyType: RANGE
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac22-table
+                namespace: dynamodbtable
+              spec:
+                (length(keySchema)): 2
+    # AC-23: keySchema is immutable (pass-through verified).
+    - name: ac23-key-schema-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac23-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac23-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac23-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac23-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac23-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac23-table
+                namespace: dynamodbtable
+              spec:
+                (length(keySchema)): 1
+    # AC-24: LSI with KEYS_ONLY projection created and propagated.
+    - name: ac24-lsi-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac24-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac24-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac24-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac24-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac24-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                  - attributeName: sk
+                    attributeType: S
+                  - attributeName: lsiKey
+                    attributeType: "N"
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+                  - attributeName: sk
+                    keyType: RANGE
+                localSecondaryIndexes:
+                  - indexName: lsi-by-lsikey
+                    keySchema:
+                      - attributeName: pk
+                        keyType: HASH
+                      - attributeName: lsiKey
+                        keyType: RANGE
+                    projection:
+                      projectionType: KEYS_ONLY
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac24-table
+                namespace: dynamodbtable
+              spec:
+                (length(localSecondaryIndexes)): 1
+    # AC-25: LSI is immutable (pass-through verified).
+    - name: ac25-lsi-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac25-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac25-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac25-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac25-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac25-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                  - attributeName: sk
+                    attributeType: S
+                  - attributeName: lsiKey
+                    attributeType: "N"
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+                  - attributeName: sk
+                    keyType: RANGE
+                localSecondaryIndexes:
+                  - indexName: lsi-by-lsikey
+                    keySchema:
+                      - attributeName: pk
+                        keyType: HASH
+                      - attributeName: lsiKey
+                        keyType: RANGE
+                    projection:
+                      projectionType: ALL
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac25-table
+                namespace: dynamodbtable
+              spec:
+                (length(localSecondaryIndexes)): 1
+    # AC-26: GSI with ALL projection created and propagated.
+    - name: ac26-gsi-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac26-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac26-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac26-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac26-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac26-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                  - attributeName: gsiKey
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+                globalSecondaryIndexes:
+                  - indexName: gsi-by-gsikey
+                    keySchema:
+                      - attributeName: gsiKey
+                        keyType: HASH
+                    projection:
+                      projectionType: ALL
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac26-table
+                namespace: dynamodbtable
+              spec:
+                (length(globalSecondaryIndexes)): 1
+    # AC-27: GSI with PROVISIONED throughput propagated.
+    - name: ac27-gsi-provisioned-throughput
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac27-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac27-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac27-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"PROVISIONED","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac27-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac27-cfg
+                provisionedThroughput:
+                  readCapacityUnits: 5
+                  writeCapacityUnits: 5
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                  - attributeName: gsiKey
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+                globalSecondaryIndexes:
+                  - indexName: gsi-provisioned
+                    keySchema:
+                      - attributeName: gsiKey
+                        keyType: HASH
+                    projection:
+                      projectionType: KEYS_ONLY
+                    provisionedThroughput:
+                      readCapacityUnits: 3
+                      writeCapacityUnits: 3
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac27-table
+                namespace: dynamodbtable
+              spec:
+                billingMode: PROVISIONED
+                (length(globalSecondaryIndexes)): 1
+    # AC-28: resourcePolicyRef set → PolicyDocument content written to ACK Table resourcePolicy.
+    - name: ac28-resource-policy-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac28-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac28-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - apply:
+            file: 28-policy-document.yaml
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac28-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac28-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac28-cfg
+                resourcePolicyRef: table-resource-policy
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - script:
+            timeout: 30s
+            content: |
+              # resourcePolicyRef adds an extra externalRef hop (PolicyDocument lookup)
+              # before kro's includeWhen gate on the child Table can resolve, so the
+              # object may not exist yet on the very first check — unlike a value
+              # mismatch, chainsaw's assert does not retry a missing resource, so poll
+              # for existence first.
+              for i in $(seq 1 15); do
+                RESOURCE_POLICY=$(kubectl get table ac28-table -n dynamodbtable -o jsonpath='{.spec.resourcePolicy}' 2>/dev/null)
+                if [ -n "$RESOURCE_POLICY" ]; then
+                  echo "PASS: resourcePolicy is set (length ${#RESOURCE_POLICY})"
+                  exit 0
+                fi
+                echo "Attempt $i: Table not found or resourcePolicy not yet set, waiting..."
+                sleep 2
+              done
+              echo "FAIL: resourcePolicy still not set after 30 seconds"
+              kubectl get table ac28-table -n dynamodbtable -o yaml
+              exit 1
+    # AC-29: resourcePolicyRef="" → resourcePolicy is empty string in ACK Table.
+    - name: ac29-no-resource-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac29-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac29-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac29-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac29-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac29-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac29-table
+                namespace: dynamodbtable
+              spec:
+                resourcePolicy: ""
+    # AC-30: Default naming template {namespace}-{name} → resourceName=dynamodbtable-ac29-table.
+    - name: ac30-naming-standard-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac30-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac30-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac30-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac30-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac30-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac30-table
+                namespace: dynamodbtable
+              status:
+                resourceName: dynamodbtable-ac30-table
+                namingStatus: valid
+                predictedArn: arn:aws:dynamodb:ap-southeast-2:123456789012:table/dynamodbtable-ac30-table
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac30-table
+                namespace: dynamodbtable
+              spec:
+                tableName: dynamodbtable-ac30-table
+    # AC-31: mandatory.namingTemplate overrides defaults namingTemplate.
+    - name: ac31-naming-mandatory-template-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac31-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac31-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac31-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"prod-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac31-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac31-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac31-table
+                namespace: dynamodbtable
+              status:
+                resourceName: prod-ac31-table
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac31-table
+                namespace: dynamodbtable
+              spec:
+                tableName: prod-ac31-table
+    # AC-32: spec.nameOverride takes precedence over naming template.
+    - name: ac32-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac32-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac32-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac32-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"prod-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac32-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac32-cfg
+                nameOverride: my-custom-table-name
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac32-table
+                namespace: dynamodbtable
+              status:
+                resourceName: my-custom-table-name
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac32-table
+                namespace: dynamodbtable
+              spec:
+                tableName: my-custom-table-name
+    # AC-33: Unresolved {tag.X} token → namingStatus=invalid-unresolved-tokens, ACK Table not created.
+    - name: ac33-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac33-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac33-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac33-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{tag.env}-table","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac33-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac33-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac33-table
+                namespace: dynamodbtable
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              count=$(kubectl get table ac33-table -n dynamodbtable --ignore-not-found -o name 2>/dev/null | wc -l | tr -d ' ')
+              [ "$count" -eq 0 ]
+    # AC-34: Tags merge order: mandatory wins over spec wins over defaults.
+    - name: ac34-tags-merge-cascade
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac34-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac34-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac34-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{"env":"prod","cost-centre":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{"team":"platform","env":"dev"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac34-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac34-cfg
+                tags:
+                  service: orders
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - script:
+            timeout: 30s
+            content: |
+              # Table creation lags one reconcile behind DynamoDBTable apply, so the
+              # very first check can race a genuinely-missing object — unlike a value
+              # mismatch, chainsaw does not retry that, so poll for existence first
+              # (same pattern as ac28-resource-policy-ref).
+              for i in $(seq 1 15); do
+                TAGS=$(kubectl get table ac34-table -n dynamodbtable -o json 2>/dev/null | jq -c '.spec.tags')
+                if [ -n "$TAGS" ] && [ "$TAGS" != "null" ]; then
+                  if echo "$TAGS" | jq -e '
+                    (map(select(.key == "env")) | length == 1 and .[0].value == "prod") and
+                    (map(select(.key == "cost-centre")) | length == 1 and .[0].value == "infra") and
+                    (map(select(.key == "team")) | length == 1 and .[0].value == "platform") and
+                    (map(select(.key == "service")) | length == 1 and .[0].value == "orders")
+                  ' >/dev/null; then
+                    echo "PASS: all 4 cascade tags present"
+                    exit 0
+                  fi
+                fi
+                echo "Attempt $i: Table not found or tags not yet merged, waiting..."
+                sleep 2
+              done
+              echo "FAIL: cascade tags not merged after 30 seconds"
+              kubectl get table ac34-table -n dynamodbtable -o yaml
+              exit 1
+    # AC-35: syncedLabels written to both K8s metadata.labels (kropath.run/ prefix) and ACK Table tags (plain key).
+    - name: ac35-synced-labels-dual-write
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac35-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac35-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac35-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{"data-class":"confidential"},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac35-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac35-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac35-table
+                namespace: dynamodbtable
+                labels:
+                  kropath.run/data-class: confidential
+        - script:
+            content: |
+              kubectl get table ac35-table -n dynamodbtable -o json | jq -e '
+                .spec.tags | map(select(.key == "data-class")) | length == 1 and .[0].value == "confidential"
+              '
+    # AC-36: syncedAnnotations written to ACK Table K8s annotations with kropath.run/ prefix.
+    - name: ac36-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac36-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac36-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac36-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"runbook":"https://wiki.example.com/runbook"}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac36-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac36-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac36-table
+                namespace: dynamodbtable
+                annotations:
+                  kropath.run/runbook: https://wiki.example.com/runbook
+    # AC-37: Standard metadata wiring — managed-by, instance, ownerRefs, deletion-policy annotation.
+    - name: ac37-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac37-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac37-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac37-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac37-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac37-cfg
+                deletionPolicy: retain
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac37-table
+                namespace: dynamodbtable
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac37-table
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                (length(ownerReferences)): 1
+    # AC-38: deletionPolicy=delete → annotation services.k8s.aws/deletion-policy=delete.
+    - name: ac38-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac38-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac38-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac38-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac38-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac38-cfg
+                deletionPolicy: delete
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac38-table
+                namespace: dynamodbtable
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+    # AC-39: deletionPolicy=retain (default) → annotation services.k8s.aws/deletion-policy=retain.
+    - name: ac39-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBConfig
+              metadata:
+                name: ac39-cfg
+                namespace: dynamodbtable
+                labels:
+                  aws.kropath.run/resource-name: ac39-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch dynamodbconfig ac39-cfg -n dynamodbtable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionEnabled":false,"kmsMasterKeyId":"","deletionProtectionEnabled":false,"pointInTimeRecoveryEnabled":false,"billingMode":"","tableClass":"","contributorInsights":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              metadata:
+                name: ac39-table
+                namespace: dynamodbtable
+              spec:
+                configRef: ac39-cfg
+                attributeDefinitions:
+                  - attributeName: pk
+                    attributeType: S
+                keySchema:
+                  - attributeName: pk
+                    keyType: HASH
+        - assert:
+            resource:
+              apiVersion: dynamodb.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac39-table
+                namespace: dynamodbtable
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
