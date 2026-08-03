@@ -288,6 +288,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
     kubectl rollout status deployment/kro -n kro-system --timeout=120s
     ```
 * **How to confirm this is the cause before applying:** grep the kro controller pod logs for repeated reconcile attempts against the same object key and compare the gaps between attempts against `200ms × 2ⁿ` (1s, 2s, 3s→4s, 6s→8s, 13s→16s, 26s→32s, 51s→64s...); a near-exact match confirms the rate limiter, not a genuine stuck dependency.
+* **CI caveat — don't over-raise `CONCURRENT_RECONCILES`:** `tests/Makefile` already runs 4 chainsaw suites in parallel (`--parallel 4`) against this one kro pod, and a CI runner has far fewer cores than a local dev machine. Raising `KRO_DYNAMIC_CONTROLLER_CONCURRENT_RECONCILES` too high (5 was tried) adds CPU contention that *increases* reconcile latency in aggregate on CI, even though it measured as a clear win locally — it tipped an unrelated suite (`snstopic`) over its 2-minute cleanup-phase timeout. Keep this value modest (2 worked) and validate against an actual CI run, not just a local one, before raising it further.
 * **Reference:** `tests/setup.sh` (the fix is baked in here) and `docs/troubleshooting-logs/2026-08-03-dynamodbtable-ac22-ac39-stale-state-and-kro-ratelimiter.md`.
 
 ---

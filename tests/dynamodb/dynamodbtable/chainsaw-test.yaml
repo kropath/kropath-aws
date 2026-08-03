@@ -1967,14 +1967,31 @@ spec:
                   - attributeName: pk
                     keyType: HASH
         - script:
+            timeout: 30s
             content: |
-              kubectl get table test-table -n dynamodbtable -o json | jq -e '
-                .spec.tags |
-                (map(select(.key == "env")) | length == 1 and .[0].value == "prod") and
-                (map(select(.key == "cost-centre")) | length == 1 and .[0].value == "infra") and
-                (map(select(.key == "team")) | length == 1 and .[0].value == "platform") and
-                (map(select(.key == "service")) | length == 1 and .[0].value == "orders")
-              '
+              # Table creation lags one reconcile behind DynamoDBTable apply, so the
+              # very first check can race a genuinely-missing object — unlike a value
+              # mismatch, chainsaw does not retry that, so poll for existence first
+              # (same pattern as ac28-resource-policy-ref).
+              for i in $(seq 1 15); do
+                TAGS=$(kubectl get table test-table -n dynamodbtable -o json 2>/dev/null | jq -c '.spec.tags')
+                if [ -n "$TAGS" ] && [ "$TAGS" != "null" ]; then
+                  if echo "$TAGS" | jq -e '
+                    (map(select(.key == "env")) | length == 1 and .[0].value == "prod") and
+                    (map(select(.key == "cost-centre")) | length == 1 and .[0].value == "infra") and
+                    (map(select(.key == "team")) | length == 1 and .[0].value == "platform") and
+                    (map(select(.key == "service")) | length == 1 and .[0].value == "orders")
+                  ' >/dev/null; then
+                    echo "PASS: all 4 cascade tags present"
+                    exit 0
+                  fi
+                fi
+                echo "Attempt $i: Table not found or tags not yet merged, waiting..."
+                sleep 2
+              done
+              echo "FAIL: cascade tags not merged after 30 seconds"
+              kubectl get table test-table -n dynamodbtable -o yaml
+              exit 1
       cleanup:
         - script:
             content: |
@@ -2282,15 +2299,31 @@ spec:
                 namespace: dynamodbtable
                 annotations:
                   services.k8s.aws/deletion-policy: retain
+      # finally runs during test execution (after this last step's try), before the
+      # cleanup phase starts. Pre-stripping all finalizers here means Chainsaw's
+      # per-step auto-delete finds resources already gone and completes instantly,
+      # avoiding the kro cascade-deletion queue backup that causes cleanup timeouts.
+      finally:
+        - script:
+            content: |
+              for name in $(kubectl get table -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch table "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete table --all -n dynamodbtable --ignore-not-found=true --wait=false 2>/dev/null || true
+              for name in $(kubectl get dynamodbtable -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch dynamodbtable "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete dynamodbtable --all -n dynamodbtable --ignore-not-found=true --wait=false 2>/dev/null || true
       cleanup:
         - script:
             content: |
               for name in $(kubectl get table -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
                 kubectl patch table "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
               done
-              kubectl delete table --all -n dynamodbtable --ignore-not-found=true
+              kubectl delete table --all -n dynamodbtable --ignore-not-found=true --wait=false
               for name in $(kubectl get dynamodbtable -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
                 kubectl patch dynamodbtable "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
               done
-              kubectl delete dynamodbtable --all -n dynamodbtable --ignore-not-found=true
+              kubectl delete dynamodbtable --all -n dynamodbtable --ignore-not-found=true --wait=false
+              kubectl delete dynamodbconfig general-policy -n dynamodbtable --ignore-not-found=true --wait=false
               kubectl delete dynamodbconfig general-policy -n dynamodbtable --ignore-not-found=true --wait=false
