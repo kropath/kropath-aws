@@ -78,6 +78,18 @@ spec:
                 validationError: "OIDC URL must use HTTPS"
     - name: mandatory-tags
       try:
+        # Delete+recreate the shared config first: a plain --type=merge patch does NOT remove
+        # stale map keys, so under skipDelete the `environment`/`team` tags left by a later
+        # step's config (tag-merge-prefers-mandatory-values) on a prior run would survive and
+        # make tagged-oidc reconcile to 3 tags instead of the asserted single cost-centre tag.
+        # This mirrors the reset pattern used by the synced-labels/standard-metadata/tag-merge
+        # steps below. See docs/frequent-rgd-errors.md and CLAUDE.md ("merge patch does NOT
+        # remove keys").
+        - script:
+            content: |
+              kubectl delete iamconfig general-policy -n iamidentityprovider --ignore-not-found=true
+        - apply:
+            file: 00-iamconfig.yaml
         - script:
             content: |
               kubectl patch iamconfig general-policy -n iamidentityprovider \
@@ -106,10 +118,17 @@ spec:
         - script:
             # Order-independent tag check via jq — chainsaw's assertion engine does not
             # support CEL's .exists(), and a per-item list assert is positional and flakes
-            # on CEL map-iteration order (see docs/frequent-rgd-errors.md §6).
+            # on CEL map-iteration order (see docs/frequent-rgd-errors.md §6). Poll until
+            # kro's reconcile has projected both syncedLabels into cloud tags; a one-shot
+            # read races the multi-pass reconcile. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get openidconnectprovider synced-labels-oidc -n iamidentityprovider -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get openidconnectprovider synced-labels-oidc -n iamidentityprovider -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 2 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 2 ] || { echo "FAIL: expected 2 tags, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "production")' >/dev/null || { echo "FAIL: missing tag environment=production"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "team" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag team=platform"; exit 1; }
@@ -146,9 +165,16 @@ spec:
         - assert:
             file: 11-assert-oidc-tag-merge.yaml
         - script:
+            # Poll until kro's merge has produced all four tags — a one-shot read races the
+            # multi-pass reconcile. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get openidconnectprovider tag-merge-oidc -n iamidentityprovider -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get openidconnectprovider tag-merge-oidc -n iamidentityprovider -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 4 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 4 ] || { echo "FAIL: expected 4 tags, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag cost-centre=platform"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "mandatory")' >/dev/null || { echo "FAIL: missing tag environment=mandatory"; exit 1; }

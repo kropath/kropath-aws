@@ -154,10 +154,17 @@ spec:
         - script:
             # Order-independent tag check via jq — chainsaw's assertion engine does not
             # support CEL's .exists(); a per-item list assert would be positional and flake
-            # on CEL map-iteration order (see docs/frequent-rgd-errors.md §6).
+            # on CEL map-iteration order (see docs/frequent-rgd-errors.md §6). Poll until
+            # kro's multi-pass reconcile has merged both syncedLabel-derived tags; a one-shot
+            # read races the reconcile. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get roles.iam.services.k8s.aws lambda-role -n iamrole -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get roles.iam.services.k8s.aws lambda-role -n iamrole -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 2 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 2 ] || { echo "FAIL: expected 2 tags, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "production")' >/dev/null || { echo "FAIL: missing tag environment=production"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "team" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag team=platform"; exit 1; }
@@ -276,8 +283,20 @@ spec:
         - apply:
             file: 09-boundary-optout-role.yaml
         - script:
+            # Poll until kro has created the ACK Role child with no boundary — a one-shot
+            # read races kro's create/reconcile (and under skipDelete may read a not-yet-
+            # reconciled leftover). The opt-out RGD path always yields an empty boundary once
+            # the child exists. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              boundary="$(kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole -o jsonpath='{.spec.permissionsBoundary}')"
+              for i in $(seq 1 60); do
+                if kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole >/dev/null 2>&1; then
+                  boundary="$(kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole -o jsonpath='{.spec.permissionsBoundary}' 2>/dev/null || true)"
+                  [ -z "$boundary" ] && break
+                fi
+                sleep 1
+              done
+              boundary="$(kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole -o jsonpath='{.spec.permissionsBoundary}' 2>/dev/null || true)"
               test -z "$boundary"
 
         - apply:
@@ -427,9 +446,16 @@ spec:
                 name: iamrole-tags-merge-role
                 assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
         - script:
+            # Poll until kro's merge has produced all four tags — a one-shot read races the
+            # multi-pass reconcile. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get roles.iam.services.k8s.aws tags-merge-role -n iamrole -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get roles.iam.services.k8s.aws tags-merge-role -n iamrole -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 4 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 4 ] || { echo "FAIL: expected 4 tags, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag cost-centre=platform"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "mandatory")' >/dev/null || { echo "FAIL: missing tag environment=mandatory"; exit 1; }
