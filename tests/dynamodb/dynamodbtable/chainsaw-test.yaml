@@ -1043,6 +1043,18 @@ spec:
     # AC-21: TTL disabled by default.
     - name: ac21-ttl-disabled-default
       try:
+        - script:
+            content: |
+              # Chainsaw cleanup is deferred to end-of-test. Explicitly delete AC20's
+              # Table and DynamoDBTable so kro creates a fresh CR without ttl.enabled.
+              for name in $(kubectl get table -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch table "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete table --all -n dynamodbtable --ignore-not-found=true
+              for name in $(kubectl get dynamodbtable -n dynamodbtable -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch dynamodbtable "$name" -n dynamodbtable --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete dynamodbtable --all -n dynamodbtable --ignore-not-found=true
         - apply:
             file: 01-general-policy.yaml
         - script:
@@ -1065,16 +1077,25 @@ spec:
                 keySchema:
                   - attributeName: pk
                     keyType: HASH
-        - assert:
-            resource:
-              apiVersion: dynamodb.services.k8s.aws/v1alpha1
-              kind: Table
-              metadata:
-                name: test-table
-                namespace: dynamodbtable
-              spec:
-                timeToLive:
-                  enabled: false
+        - script:
+            timeout: 5m
+            content: |
+              # kro v0.9.2 strips zero-value booleans from templates; ttl.enabled may be
+              # absent rather than false. Poll until Table exists and enabled is absent/false.
+              for i in $(seq 1 60); do
+                TABLE_JSON=$(kubectl get table test-table -n dynamodbtable -o json 2>/dev/null) || { sleep 5; continue; }
+                TTL_ENABLED=$(echo "$TABLE_JSON" | jq -r '.spec.timeToLive.enabled // "absent"')
+                if [ "$TTL_ENABLED" = "true" ]; then
+                  echo "Attempt $i: ttl.enabled=true (stale table still present), waiting..."
+                  sleep 5
+                else
+                  echo "PASS: ttl.enabled='$TTL_ENABLED' (false or absent — TTL correctly disabled)"
+                  exit 0
+                fi
+              done
+              echo "FAIL: ttl.enabled is still true after 5 minutes"
+              kubectl get table test-table -n dynamodbtable -o json | jq '.spec.timeToLive'
+              exit 1
       cleanup:
         - script:
             content: |
