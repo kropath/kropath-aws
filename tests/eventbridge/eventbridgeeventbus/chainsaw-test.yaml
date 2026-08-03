@@ -1,0 +1,553 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eventbridge-02 Chainsaw tests -- 15 acceptance criteria for EventBridgeEventBus.
+# Namespace: eventbridgeeventbus. Default naming: {namespace}-{name} => eventbridgeeventbus-<cr-name>.
+# effectiveConfig patched via kubectl --subresource=status to mock kropath-controller.
+# Cleanup scripts remove ACK EventBus finalizers before deletion (ACK adds finalizers that
+# require live AWS to clear automatically).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: eventbridgeeventbus
+spec:
+  namespace: eventbridgeeventbus
+  steps:
+    # ── Seed: namespace + governance config ──────────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              for name in $(kubectl get eventbridgeeventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbridgeeventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found --wait=false
+              kubectl delete eventbridgeconfig --all -n eventbridgeeventbus --ignore-not-found --wait=false
+              kubectl delete namespace eventbridgeeventbus --ignore-not-found
+              sleep 3
+
+    - name: seed-namespace-and-config
+      try:
+        - apply:
+            file: 00-eventbridgeeventbus-namespace.yaml
+        - apply:
+            file: 01-general-policy-eventbridgeconfig.yaml
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ── AC-1: basic creation succeeds ──────────────────────────────────────
+    # ── AC-2: default naming template {namespace}-{name} applied ───────────
+    - name: ac1-ac2-creation-and-default-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: create-default
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: create-default
+                namespace: eventbridgeeventbus
+              spec:
+                name: eventbridgeeventbus-create-default
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: create-default
+                namespace: eventbridgeeventbus
+              status:
+                resourceName: eventbridgeeventbus-create-default
+                namingStatus: valid
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+
+    # ── AC-3: nameOverride takes precedence over naming template ────────────
+    - name: ac3-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: override-test
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+                nameOverride: "my-custom-bus"
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: override-test
+                namespace: eventbridgeeventbus
+              spec:
+                name: my-custom-bus
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: override-test
+                namespace: eventbridgeeventbus
+              status:
+                resourceName: my-custom-bus
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+
+    # ── AC-4: mandatory namingTemplate wins over defaults namingTemplate ────
+    - name: ac4-naming-mandatory-template
+      try:
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: naming-mandatory
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: naming-mandatory
+                namespace: eventbridgeeventbus
+              spec:
+                name: corp-eventbridgeeventbus-naming-mandatory
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: naming-mandatory
+                namespace: eventbridgeeventbus
+              status:
+                resourceName: corp-eventbridgeeventbus-naming-mandatory
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
+
+    # ── AC-5: unresolved {tag.X} token → namingStatus=invalid, no ACK EventBus ─
+    - name: ac5-naming-unresolved-tokens
+      try:
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{tag.unknown}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: naming-unresolved
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: naming-unresolved
+                namespace: eventbridgeeventbus
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              # ACK EventBus must NOT be created when naming is invalid
+              if kubectl get eventbus naming-unresolved -n eventbridgeeventbus 2>/dev/null | grep -q "naming-unresolved"; then
+                echo "FAIL: EventBus should not exist with invalid naming"
+                exit 1
+              fi
+              echo "PASS: EventBus not created as expected"
+      cleanup:
+        - script:
+            content: |
+              kubectl delete eventbridgeeventbus naming-unresolved -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
+
+    # ── AC-6: effectiveName == "default" → validationError, no ACK EventBus ─
+    - name: ac6-naming-reserved-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: reserved-default
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+                nameOverride: "default"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: reserved-default
+                namespace: eventbridgeeventbus
+              status:
+                resourceName: default
+                (validationError != ""): true
+        - script:
+            content: |
+              # ACK EventBus must NOT be created for reserved name "default"
+              if kubectl get eventbus reserved-default -n eventbridgeeventbus 2>/dev/null | grep -q "reserved-default"; then
+                echo "FAIL: EventBus should not exist — 'default' is reserved"
+                exit 1
+              fi
+              echo "PASS: EventBus not created as expected"
+      cleanup:
+        - script:
+            content: |
+              kubectl delete eventbridgeeventbus reserved-default -n eventbridgeeventbus --ignore-not-found=true --wait=false
+
+    # ── AC-7: predictedArn computed correctly ─────────────────────────────
+    - name: ac7-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: predicted-arn-test
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: predicted-arn-test
+                namespace: eventbridgeeventbus
+              status:
+                predictedArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/eventbridgeeventbus-predicted-arn-test"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+
+    # ── AC-8: defaults tags appear in ACK spec.tags ───────────────────────
+    # ── AC-9: spec tags override defaults tags on collision ───────────────
+    # ── AC-10: mandatory tags win over spec on collision ──────────────────
+    # ── AC-11: cloud tags are [{key, value}] format (jq assertion) ────────
+    - name: ac8-ac11-tags-cascade
+      try:
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":null}}'
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{"env":"prod","cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{"env":"dev","team":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: tags-cascade
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+                tags:
+                  env: staging
+                  service: payments
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: tags-cascade
+                namespace: eventbridgeeventbus
+        - script:
+            content: |
+              # Tags must be [{key, value}] format — use jq for order-independent verification.
+              # mandatory wins: env=prod (not staging from spec, not dev from defaults).
+              TAGS=$(kubectl get eventbus tags-cascade -n eventbridgeeventbus -o json | jq -r '.spec.tags')
+              echo "Tags: $TAGS"
+
+              ENV=$(echo "$TAGS" | jq -r '.[] | select(.key == "env") | .value')
+              if [ "$ENV" != "prod" ]; then echo "FAIL: env=$ENV, expected prod (mandatory wins)"; exit 1; fi
+
+              TEAM=$(echo "$TAGS" | jq -r '.[] | select(.key == "team") | .value')
+              if [ "$TEAM" != "infra" ]; then echo "FAIL: team=$TEAM, expected infra (from defaults)"; exit 1; fi
+
+              COST=$(echo "$TAGS" | jq -r '.[] | select(.key == "cost-centre") | .value')
+              if [ "$COST" != "platform" ]; then echo "FAIL: cost-centre=$COST, expected platform (from mandatory)"; exit 1; fi
+
+              SVC=$(echo "$TAGS" | jq -r '.[] | select(.key == "service") | .value')
+              if [ "$SVC" != "payments" ]; then echo "FAIL: service=$SVC, expected payments (from instance spec)"; exit 1; fi
+
+              # Verify format: every entry has both key and value fields
+              BAD_COUNT=$(echo "$TAGS" | jq '[.[] | select((has("key") and has("value")) | not)] | length')
+              if [ "$BAD_COUNT" != "0" ]; then echo "FAIL: $BAD_COUNT tags missing key or value field"; exit 1; fi
+
+              echo "PASS: all tags verified (cascade order and format)"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
+              kubectl patch eventbridgeconfig general-policy -n eventbridgeeventbus --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
+
+    # ── AC-12: syncedLabels dual-written to K8s labels AND to cloud tags ──
+    - name: ac12-synced-labels-dual-write
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: synced-labels
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+                syncedLabels:
+                  app-owner: platform
+                  tier: standard
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: synced-labels
+                namespace: eventbridgeeventbus
+                labels:
+                  aws.kropath.run/app-owner: platform
+                  aws.kropath.run/tier: standard
+        - script:
+            content: |
+              # syncedLabels also dual-written to cloud tags (order-independent jq check)
+              TAGS=$(kubectl get eventbus synced-labels -n eventbridgeeventbus -o json | jq -r '.spec.tags')
+              OWNER=$(echo "$TAGS" | jq -r '.[] | select(.key == "app-owner") | .value')
+              if [ "$OWNER" != "platform" ]; then echo "FAIL: app-owner=$OWNER in cloud tags, expected platform"; exit 1; fi
+              TIER=$(echo "$TAGS" | jq -r '.[] | select(.key == "tier") | .value')
+              if [ "$TIER" != "standard" ]; then echo "FAIL: tier=$TIER in cloud tags, expected standard"; exit 1; fi
+              echo "PASS: syncedLabels dual-written to K8s labels and cloud tags"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+
+    # ── AC-13: deletionPolicy annotation set correctly on ACK EventBus ────
+    - name: ac13-deletion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: deletion-policy-test
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: deletion-policy-test
+                namespace: eventbridgeeventbus
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+
+    # ── AC-14: configRef selects correct EventBridgeConfig (fallthrough) ──
+    - name: ac14-config-profile-selection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: team-policy
+                namespace: eventbridgeeventbus
+                labels:
+                  aws.kropath.run/resource-name: team-policy
+              spec:
+                mandatory:
+                  archiveRetentionDays: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  archiveRetentionDays: 0
+                  namingTemplate: "team-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig team-policy -n eventbridgeeventbus \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"team-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: config-select
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: team-policy
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: config-select
+                namespace: eventbridgeeventbus
+              spec:
+                name: team-config-select
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: config-select
+                namespace: eventbridgeeventbus
+              status:
+                resourceName: team-config-select
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeconfig team-policy -n eventbridgeeventbus --ignore-not-found=true
+
+    # ── AC-15: standard K8s metadata wiring (managed-by, instance, ownerRef) ─
+    - name: ac15-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEventBus
+              metadata:
+                name: metadata-test
+                namespace: eventbridgeeventbus
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: EventBus
+              metadata:
+                name: metadata-test
+                namespace: eventbridgeeventbus
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: metadata-test
+        - script:
+            content: |
+              # Verify ownerReference back to EventBridgeEventBus CR
+              OWNER_KIND=$(kubectl get eventbus metadata-test -n eventbridgeeventbus -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              if [ "$OWNER_KIND" != "EventBridgeEventBus" ]; then
+                echo "FAIL: ownerReference kind=$OWNER_KIND, expected EventBridgeEventBus"
+                exit 1
+              fi
+              OWNER_NAME=$(kubectl get eventbus metadata-test -n eventbridgeeventbus -o jsonpath='{.metadata.ownerReferences[0].name}')
+              if [ "$OWNER_NAME" != "metadata-test" ]; then
+                echo "FAIL: ownerReference name=$OWNER_NAME, expected metadata-test"
+                exit 1
+              fi
+              CONTROLLER=$(kubectl get eventbus metadata-test -n eventbridgeeventbus -o jsonpath='{.metadata.ownerReferences[0].controller}')
+              if [ "$CONTROLLER" != "true" ]; then
+                echo "FAIL: ownerReference controller=$CONTROLLER, expected true"
+                exit 1
+              fi
+              echo "PASS: standard metadata wiring verified"
+      cleanup:
+        - script:
+            content: |
+              for name in $(kubectl get eventbus -n eventbridgeeventbus -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+                kubectl patch eventbus "$name" -n eventbridgeeventbus --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              done
+              kubectl delete eventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
+              kubectl delete eventbridgeeventbus --all -n eventbridgeeventbus --ignore-not-found=true --wait=false
