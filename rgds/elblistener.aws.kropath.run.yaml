@@ -1,0 +1,203 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: elblistener.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ELBListener
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      # nameOverride is present for cross-RGD schema consistency but is a no-op:
+      # ACK Listener has no name field — the listener is identified by its ARN.
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # ARN of the load balancer this listener belongs to.
+      # One of loadBalancerArn or a direct reference is required by AWS.
+      loadBalancerArn: string | default=""
+      # protocol — ALB: HTTP | HTTPS; NLB: TCP | TLS | UDP | TCP_UDP; GWLB: omit.
+      protocol: string | default=""
+      # port — listener port; 0 = not set (GWLB listeners omit port).
+      port: integer | default=0
+      # sslPolicy — TLS security policy name (HTTPS/TLS only).
+      # Governance cascade: mandatory.sslPolicy > spec.sslPolicy > defaults.sslPolicy.
+      sslPolicy: string | default=""
+      # certificates — default SSL certificate(s) for HTTPS/TLS listeners.
+      certificates: "[]Certificate | default=[]"
+      # alpnPolicy — ALPN policy list for NLB TLS listeners.
+      alpnPolicy: "[]string | default=[]"
+      # defaultActions — required routing rules. Supports forward, redirect, fixed-response, and weighted-forward.
+      defaultActions: "[]ListenerAction | default=[]"
+      # mutualAuthentication — mTLS config for HTTPS listeners (mode=off disables; verify/passthrough enable).
+      mutualAuthentication:
+        mode: string | default=off
+        trustStoreArn: string | default=""
+        ignoreClientCertificateExpiry: boolean | default=false
+    types:
+      Certificate:
+        certificateArn: string | default=""
+      ListenerAction:
+        type: string | default=forward
+        order: integer | default=0
+        # For simple forward actions: ARN of the target group.
+        targetGroupArn: string | default=""
+        # weightedTargetGroups: list of {targetGroupArn, weight} for weighted-forward actions.
+        # Declared at ListenerAction top level because kro v0.9.2 does not support []CustomType
+        # inside an inline nested object inside a type (only inside the type directly).
+        weightedTargetGroups: "[]ForwardTargetGroup | default=[]"
+        # forwardConfig contains only stickiness config for weighted-forward.
+        forwardConfig:
+          targetGroupStickinessConfig:
+            enabled: boolean | default=false
+            durationSeconds: integer | default=0
+        # For redirect actions.
+        redirectConfig:
+          protocol: string | default=""
+          host: string | default=""
+          path: string | default=""
+          port: string | default=""
+          query: string | default=""
+          statusCode: string | default=""
+        # For fixed-response actions.
+        fixedResponseConfig:
+          statusCode: string | default=""
+          contentType: string | default=""
+          messageBody: string | default=""
+      ForwardTargetGroup:
+        targetGroupArn: string | default=""
+        weight: integer | default=0
+    status:
+      conditions: >-
+        ${listener.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: Protocol
+        type: string
+        jsonPath: .spec.protocol
+      - name: Port
+        type: integer
+        jsonPath: .spec.port
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ELBConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACK ELBv2 Listener CR — primary cloud resource.
+    # No status.predictedArn: Listener ARNs embed LB hash + listener-specific hash, not predictable.
+    # Use status.ackResourceMetadata.arn at runtime.
+    # nameOverride is a no-op: ACK Listener has no name field.
+    - id: listener
+      template:
+        apiVersion: elbv2.services.k8s.aws/v1alpha1
+        kind: Listener
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ELBListener
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          loadBalancerARN: ${schema.spec.loadBalancerArn}
+          protocol: ${schema.spec.protocol}
+          port: ${schema.spec.port}
+          # sslPolicy governance: mandatory overrides spec, spec overrides defaults.
+          sslPolicy: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?sslPolicy.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.sslPolicy
+              : (schema.spec.sslPolicy != ""
+                  ? schema.spec.sslPolicy
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?sslPolicy.orValue("") : ""))}
+          # certificates — ACK uses certificateARN (uppercase ARN). dyn() forces the
+          # single-key map literal to map(string, dyn); without it kro infers a
+          # homogeneous map(string, string) that cannot coerce to the ACK Certificate
+          # struct (whose isDefault field is bool). See docs/frequent-rgd-errors.md
+          # §"Single-Key Map Literal Cannot Coerce to Multi-Type ACK Struct".
+          certificates: >-
+            ${schema.spec.certificates.map(c, {"certificateARN": dyn(c.certificateArn)})}
+          alpnPolicy: ${schema.spec.alpnPolicy}
+          # defaultActions — type-conditional mapping avoids sending empty sub-config objects
+          # to ACK/AWS for action types that don't use them.
+          defaultActions: >-
+            ${schema.spec.defaultActions.map(a,
+              a.type == "forward" && a.weightedTargetGroups.size() > 0
+                ? {"type": "forward", "order": a.order, "forwardConfig": {
+                    "targetGroups": a.weightedTargetGroups.map(tg, {
+                      "targetGroupARN": tg.targetGroupArn, "weight": tg.weight}),
+                    "targetGroupStickinessConfig": {
+                      "enabled": a.forwardConfig.targetGroupStickinessConfig.enabled,
+                      "durationSeconds": a.forwardConfig.targetGroupStickinessConfig.durationSeconds}}}
+              : a.type == "forward"
+                ? {"type": "forward", "targetGroupARN": a.targetGroupArn, "order": a.order}
+              : a.type == "redirect"
+                ? {"type": "redirect", "order": a.order, "redirectConfig": {
+                    "protocol": a.redirectConfig.protocol,
+                    "host": a.redirectConfig.host,
+                    "path": a.redirectConfig.path,
+                    "port": a.redirectConfig.port,
+                    "query": a.redirectConfig.query,
+                    "statusCode": a.redirectConfig.statusCode
+                  }}
+              : a.type == "fixed-response"
+                ? {"type": "fixed-response", "order": a.order, "fixedResponseConfig": {
+                    "statusCode": a.fixedResponseConfig.statusCode,
+                    "contentType": a.fixedResponseConfig.contentType,
+                    "messageBody": a.fixedResponseConfig.messageBody
+                  }}
+              : {"type": a.type, "order": a.order, "targetGroupARN": a.targetGroupArn})}
+          # mutualAuthentication — mTLS for HTTPS listeners; pass mode=off (default) to disable.
+          mutualAuthentication:
+            mode: ${schema.spec.mutualAuthentication.mode}
+            trustStoreARN: ${schema.spec.mutualAuthentication.trustStoreArn}
+            ignoreClientCertificateExpiry: ${schema.spec.mutualAuthentication.ignoreClientCertificateExpiry}
+          # Cloud resource tags — ACK ELBv2 uses []Tag (key/value pairs), not map[string]string.
+          # Merge order: defaults (lowest) → spec → mandatory (highest).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .transformList(k, v, {"key": k, "value": v})}

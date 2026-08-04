@@ -740,3 +740,37 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **What was tried and did NOT fix it:** Moving the finalizer-clearing patch from the `cleanup:` block to the end of `try:` (so it runs before chainsaw's own automatic post-`try` resource deletion). The timeout still recurs on every step at a regular ~30s cadence, suggesting either kro re-adds the finalizer between the patch and chainsaw's automatic delete attempt, or chainsaw's automatic delete is targeting a different/child resource than the one being patched. Needs further investigation before another fix attempt — do not re-apply the "move to end of try" pattern expecting it to work; it demonstrably does not, on its own.
 
 ---
+
+## Single-Key Map Literal Cannot Coerce to Multi-Type ACK Struct
+
+* **Symptom (RGD `Inactive`, `GraphAccepted=False`):**
+    ```log
+    type mismatch in resource "listener" at path "spec.certificates":
+    expression "schema.spec.certificates.map(c, {"certificateARN": c.certificateArn})"
+    returns type "list(map(string, string))" but expected "list(__type_...)":
+    ... struct field "isDefault": type kind mismatch: got "string", expected "bool"
+    ```
+* **Why:** A CEL map literal whose values are all the same type (e.g. one `string` key)
+  is inferred by kro as a concrete homogeneous `map(string, string)`. When the target ACK
+  field is a struct that has fields of *other* kinds (here `isDefault: bool`), kro checks
+  every struct field against the map's single value type and rejects the coercion. Map
+  literals with mixed value types (e.g. `{"type": "forward", "order": a.order}` → string +
+  int) are inferred as `map(string, dyn)` and coerce fine — which is why multi-field
+  `.map()` renames (like ELB `defaultActions`) do not hit this and single-field ones do.
+* **What Works Instead:** Force the value(s) to `dyn` so the literal is inferred as
+  `map(string, dyn)`; kro then coerces by field name and leaves absent struct fields unset.
+    ```yaml
+    # ELB Listener certificates: rename certificateArn → ACK's certificateARN.
+    certificates: ${schema.spec.certificates.map(c, {"certificateARN": dyn(c.certificateArn)})}
+    ```
+  Alternatively rename the schema field to match the ACK field exactly and pass the struct
+  list through directly (`${schema.spec.certificates}`) — but that abandons the camelCase
+  schema convention and any test asserting the rename. Prefer `dyn()`.
+* **Provider bootstrap reminder:** an RGD referencing a new ACK group
+  (`elbv2.services.k8s.aws`, …) also needs (1) the service added to `ACK_SERVICES` in
+  `hack/install-provider-crds.sh` so its CRDs install, and (2) the API group added to the
+  aggregated ClusterRole in `tests/fixtures/rbac/kro-controller.yaml` so the kro
+  ServiceAccount may create/get the child resources. Missing (1) → RGD stuck `Inactive`
+  with `schema not found`; missing (2) → child never created, `forbidden` in instance status.
+
+---
