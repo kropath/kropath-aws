@@ -45,16 +45,27 @@ spec:
       certificates: "[]Certificate | default=[]"
       # alpnPolicy — ALPN policy list for NLB TLS listeners.
       alpnPolicy: "[]string | default=[]"
-      # defaultActions — required routing rules. Supports forward, redirect, and fixed-response.
+      # defaultActions — required routing rules. Supports forward, redirect, fixed-response, and weighted-forward.
       defaultActions: "[]ListenerAction | default=[]"
+      # mutualAuthentication — mTLS config for HTTPS listeners (mode=off disables; verify/passthrough enable).
+      mutualAuthentication:
+        mode: string | default=off
+        trustStoreArn: string | default=""
+        ignoreClientCertificateExpiry: boolean | default=false
     types:
       Certificate:
         certificateArn: string | default=""
       ListenerAction:
         type: string | default=forward
         order: integer | default=0
-        # For forward actions: ARN of the target group.
+        # For simple forward actions: ARN of the target group.
         targetGroupArn: string | default=""
+        # For weighted forward actions (multiple target groups with weights).
+        forwardConfig:
+          targetGroups: "[]ForwardTargetGroup | default=[]"
+          targetGroupStickinessConfig:
+            enabled: boolean | default=false
+            durationSeconds: integer | default=0
         # For redirect actions.
         redirectConfig:
           protocol: string | default=""
@@ -68,6 +79,9 @@ spec:
           statusCode: string | default=""
           contentType: string | default=""
           messageBody: string | default=""
+      ForwardTargetGroup:
+        targetGroupArn: string | default=""
+        weight: integer | default=0
     status:
       conditions: >-
         ${listener.?status.?conditions.orValue([])}
@@ -141,7 +155,14 @@ spec:
           # to ACK/AWS for action types that don't use them.
           defaultActions: >-
             ${schema.spec.defaultActions.map(a,
-              a.type == "forward"
+              a.type == "forward" && a.forwardConfig.targetGroups.size() > 0
+                ? {"type": "forward", "order": a.order, "forwardConfig": {
+                    "targetGroups": a.forwardConfig.targetGroups.map(tg, {
+                      "targetGroupARN": tg.targetGroupArn, "weight": tg.weight}),
+                    "targetGroupStickinessConfig": {
+                      "enabled": a.forwardConfig.targetGroupStickinessConfig.enabled,
+                      "durationSeconds": a.forwardConfig.targetGroupStickinessConfig.durationSeconds}}}
+              : a.type == "forward"
                 ? {"type": "forward", "targetGroupARN": a.targetGroupArn, "order": a.order}
               : a.type == "redirect"
                 ? {"type": "redirect", "order": a.order, "redirectConfig": {
@@ -159,6 +180,11 @@ spec:
                     "messageBody": a.fixedResponseConfig.messageBody
                   }}
               : {"type": a.type, "order": a.order, "targetGroupARN": a.targetGroupArn})}
+          # mutualAuthentication — mTLS for HTTPS listeners; pass mode=off (default) to disable.
+          mutualAuthentication:
+            mode: ${schema.spec.mutualAuthentication.mode}
+            trustStoreARN: ${schema.spec.mutualAuthentication.trustStoreArn}
+            ignoreClientCertificateExpiry: ${schema.spec.mutualAuthentication.ignoreClientCertificateExpiry}
           # Cloud resource tags — ACK ELBv2 uses []Tag (key/value pairs), not map[string]string.
           # Merge order: defaults (lowest) → spec → mandatory (highest).
           tags: >-
