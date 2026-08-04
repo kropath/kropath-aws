@@ -1,0 +1,591 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eventbridge-05 Chainsaw tests -- 16 acceptance criteria for EventBridgeEndpoint.
+# Namespace: eventbridgeendpoint. Default naming: {namespace}-{name} => eventbridgeendpoint-<cr-name>.
+# No predictedArn (Endpoint ARN only available post-creation from ACK status.ackResourceMetadata.arn).
+# No cloud tags (ACK Endpoint does not support tags).
+# replicationConfig.state=ENABLED requires roleArn → validationError if missing.
+#
+# CANONICAL pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step uses a UNIQUE config (acN-cfg) and a UNIQUE resource name, and
+# deletes NOTHING between steps (spec.skipDelete is the global default). The test cluster runs
+# kro but no ACK controllers, so a shared config mutated across steps would re-reconcile every
+# persisted instance and cross-contaminate later assertions; per-step configs avoid that.
+# effectiveConfig is injected via `kubectl patch --subresource=status` to mock kropath-controller.
+# EventBridgeConfig CRD forbids namingTemplate set in BOTH spec.mandatory and spec.defaults, so
+# each CR spec sets it in only one tier; the status patch may seed both.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: eventbridgeendpoint
+spec:
+  namespace: eventbridgeendpoint
+  steps:
+    # ── AC-1: creation with full spec (eventBuses, routingConfig, replicationConfig) ─
+    # ── AC-3: default naming {namespace}-{name} ────────────────────────────
+    # ── AC-6: replicationConfig.state defaults / DISABLED passthrough ──────
+    # ── AC-11: eventBuses array passthrough ────────────────────────────────
+    # ── AC-12: routingConfig.failoverConfig.primary.healthCheckArn → ACK healthCheck (string) ─
+    # ── AC-13: routingConfig.failoverConfig.secondary.route passthrough ────
+    - name: ac1-ac3-ac6-ac11-ac12-ac13-creation-full-spec
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac1-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac1-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: full-endpoint
+              spec:
+                configRef: ac1-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/primary-bus"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/secondary-bus"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/abc123"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: DISABLED
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: full-endpoint
+              spec:
+                name: eventbridgeendpoint-full-endpoint
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/primary-bus"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/secondary-bus"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheck: "arn:aws:route53::123456789012:healthcheck/abc123"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: DISABLED
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: full-endpoint
+              status:
+                resourceName: eventbridgeendpoint-full-endpoint
+                namingStatus: valid
+
+    # ── AC-4: nameOverride takes precedence ────────────────────────────────
+    - name: ac4-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac4-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac4-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: override-endpoint
+              spec:
+                configRef: ac4-cfg
+                nameOverride: "my-custom-endpoint"
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: override-endpoint
+              spec:
+                name: my-custom-endpoint
+
+    # ── AC-5: mandatory namingTemplate wins ───────────────────────────────
+    - name: ac5-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac5-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "corp-{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac5-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: naming-mandatory
+              spec:
+                configRef: ac5-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: naming-mandatory
+              spec:
+                name: corp-eventbridgeendpoint-naming-mandatory
+
+    # ── AC-2: unresolved tokens → namingStatus invalid, no ACK Endpoint ───
+    - name: ac2-naming-unresolved-tokens
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac2-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{tag.unknown}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac2-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{tag.unknown}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: naming-unresolved
+              spec:
+                configRef: ac2-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: naming-unresolved
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              # ACK Endpoint must NOT be created when naming is invalid. Poll; if the child
+              # ever appears the loop breaks early and the grep below fails the step.
+              for _ in $(seq 1 60); do
+                kubectl get endpoints.eventbridge.services.k8s.aws naming-unresolved -n eventbridgeendpoint >/dev/null 2>&1 && break
+                sleep 1
+              done
+              if kubectl get endpoints.eventbridge.services.k8s.aws naming-unresolved -n eventbridgeendpoint 2>/dev/null | grep -q "naming-unresolved"; then
+                echo "FAIL: ACK Endpoint should not exist with invalid naming"; exit 1
+              fi
+              echo "PASS: ACK Endpoint not created as expected"
+
+    # ── AC-7: replicationConfig.state=ENABLED without roleArn → error ──────
+    - name: ac7-replication-enabled-no-role-error
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac7-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac7-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: replication-no-role
+              spec:
+                configRef: ac7-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: ENABLED
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: replication-no-role
+              status:
+                (validationError != ""): true
+        - script:
+            content: |
+              # ACK Endpoint must NOT be created when replication enabled without roleArn.
+              for _ in $(seq 1 60); do
+                kubectl get endpoints.eventbridge.services.k8s.aws replication-no-role -n eventbridgeendpoint >/dev/null 2>&1 && break
+                sleep 1
+              done
+              if kubectl get endpoints.eventbridge.services.k8s.aws replication-no-role -n eventbridgeendpoint 2>/dev/null | grep -q "replication-no-role"; then
+                echo "FAIL: ACK Endpoint should not exist when replication enabled without roleArn"; exit 1
+              fi
+              echo "PASS: ACK Endpoint not created as expected"
+
+    # ── AC-8: replicationConfig.state=ENABLED with roleArn → ACK roleARN set ─
+    - name: ac8-replication-enabled-with-role
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac8-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac8-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: replication-with-role
+              spec:
+                configRef: ac8-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                replicationConfig:
+                  state: ENABLED
+                roleArn: "arn:aws:iam::123456789012:role/EndpointRole"
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: replication-with-role
+              spec:
+                replicationConfig:
+                  state: ENABLED
+                roleARN: "arn:aws:iam::123456789012:role/EndpointRole"
+
+    # ── AC-9: description passthrough ─────────────────────────────────────
+    - name: ac9-description-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac9-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac9-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: desc-endpoint
+              spec:
+                configRef: ac9-cfg
+                description: "Global endpoint for multi-region event routing"
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: desc-endpoint
+              spec:
+                description: "Global endpoint for multi-region event routing"
+
+    # ── AC-10: no predictedArn field on EventBridgeEndpoint ──────────────
+    - name: ac10-no-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac10-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac10-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: no-arn-endpoint
+              spec:
+                configRef: ac10-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - script:
+            content: |
+              PREDICTED=$(kubectl get eventbridgeendpoint no-arn-endpoint -n eventbridgeendpoint -o jsonpath='{.status.predictedArn}' 2>/dev/null || echo "null")
+              if [ "$PREDICTED" != "" ] && [ "$PREDICTED" != "null" ]; then
+                echo "FAIL: EventBridgeEndpoint should not have predictedArn, got: $PREDICTED"; exit 1
+              fi
+              echo "PASS: No predictedArn on EventBridgeEndpoint (by design)"
+
+    # ── AC-14: syncedLabels dual-write to K8s labels (no cloud tags — Endpoint has none) ─
+    - name: ac14-synced-labels-kubernetes-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac14-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac14-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: synced-labels-endpoint
+              spec:
+                configRef: ac14-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                syncedLabels:
+                  team: platform
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: synced-labels-endpoint
+                labels:
+                  aws.kropath.run/team: platform
+
+    # ── AC-15: standard K8s metadata wiring + deletionPolicy ──────────────
+    - name: ac15-standard-metadata-and-deletion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac15-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac15-cfg -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: meta-endpoint
+              spec:
+                configRef: ac15-cfg
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: meta-endpoint
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: meta-endpoint
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+        - script:
+            content: |
+              for _ in $(seq 1 60); do
+                kubectl get endpoints.eventbridge.services.k8s.aws meta-endpoint -n eventbridgeendpoint >/dev/null 2>&1 && break
+                sleep 1
+              done
+              OWNER_KIND=$(kubectl get endpoints.eventbridge.services.k8s.aws meta-endpoint -n eventbridgeendpoint -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              if [ "$OWNER_KIND" != "EventBridgeEndpoint" ]; then echo "FAIL: ownerRef kind=$OWNER_KIND"; exit 1; fi
+              echo "PASS"
+
+    # ── AC-16: configRef selects correct EventBridgeConfig ────────────────
+    - name: ac16-config-profile-selection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: team-endpoint-policy
+                labels:
+                  aws.kropath.run/resource-name: team-endpoint-policy
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "team-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig team-endpoint-policy -n eventbridgeendpoint --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"team-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              metadata:
+                name: team-endpoint
+              spec:
+                configRef: team-endpoint-policy
+                eventBuses:
+                  - eventBusARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/bus-a"
+                  - eventBusARN: "arn:aws:events:ap-southeast-1:123456789012:event-bus/bus-b"
+                routingConfig:
+                  failoverConfig:
+                    primary:
+                      healthCheckArn: "arn:aws:route53::123456789012:healthcheck/hc1"
+                    secondary:
+                      route: ap-southeast-1
+        - assert:
+            resource:
+              apiVersion: eventbridge.services.k8s.aws/v1alpha1
+              kind: Endpoint
+              metadata:
+                name: team-endpoint
+              spec:
+                name: team-team-endpoint
