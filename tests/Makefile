@@ -14,7 +14,7 @@
 
 CLUSTER_NAME ?= kropath-aws-test
 
-.PHONY: setup teardown test test-iam test-kms test-sqs test-secretsmanager test-sns test-dynamodb test-eventbridge test-elb test-rds test-cloudwatchlogs
+.PHONY: setup teardown test test-iam test-kms test-sqs test-secretsmanager test-sns test-dynamodb test-eventbridge test-elb test-rds test-cloudwatchlogs test-ec2
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -67,3 +67,6 @@ test-rds:
 
 test-cloudwatchlogs:
 	chainsaw test cloudwatchlogs/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-ec2:
+	chainsaw test ec2/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
