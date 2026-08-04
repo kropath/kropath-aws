@@ -1,0 +1,208 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: eventbridgeendpoint.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: EventBridgeEndpoint
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      # eventBuses: array of {eventBusARN: string} — passed through directly to ACK.
+      eventBuses: "[]EventBusRef | default=[]"
+      # routingConfig configures failover between primary and secondary regions.
+      routingConfig:
+        failoverConfig:
+          primary:
+            healthCheckArn: string | default=""
+          secondary:
+            route: string | default=""
+      # replicationConfig.state defaults to DISABLED (kropath safety override of ACK default ENABLED).
+      # Set to ENABLED and provide roleArn to enable cross-region event replication.
+      replicationConfig:
+        state: string | default=DISABLED
+      # roleArn is required when replicationConfig.state == ENABLED (enforced via ConfigMap advisory).
+      roleArn: string | default=""
+      description: string | default=""
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      EventBusRef:
+        eventBusARN: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      # Endpoint ARN is only available post-creation from ACK (no predictedArn for endpoints).
+      endpointArn: >-
+        ${ackEndpoint.?status.?ackResourceMetadata.?arn.orValue("")}
+      endpointState: >-
+        ${ackEndpoint.?status.?state.orValue("")}
+      conditions: >-
+        ${ackEndpoint.?status.?conditions.orValue([])}
+      validationError: >-
+        ${has(replicationRoleError.data) && has(replicationRoleError.data.error) ? replicationRoleError.data.error : ""}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: EndpointState
+        type: string
+        jsonPath: .status.endpointState
+  resources:
+    # Single governance config lookup (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EventBridgeConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Materialise effectiveName in a ConfigMap for status-block access.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.syncedLabels
+                              ? schema.spec.syncedLabels[part.split("}")[0]]
+                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                  ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                      : "{tag." + part.split("}")[0] + "}")))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # Advisory ConfigMap — created when replication is ENABLED but roleArn is not provided.
+    # x-kubernetes-validations are silently discarded by kro; use in-graph ConfigMap advisory instead.
+    - id: replicationRoleError
+      includeWhen:
+        - '${schema.spec.replicationConfig.state == "ENABLED" && schema.spec.roleArn == ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-replication-role-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "roleArn is required when replicationConfig.state is ENABLED"
+
+    # ACK EventBridge Endpoint CR — gated on valid naming and no validation errors.
+    # ACK Endpoint has no spec.tags field — cloud metadata written only to K8s labels/annotations.
+    - id: ackEndpoint
+      includeWhen:
+        # Gate on the schema condition directly, not on the advisory ConfigMap: kro cannot
+        # reference an EXCLUDED resource's .data in an includeWhen. The advisory CM still
+        # surfaces the error in status.validationError.
+        - '${!naming.data.effectiveName.contains("{") && !(schema.spec.replicationConfig.state == "ENABLED" && schema.spec.roleArn == "")}'
+      template:
+        apiVersion: eventbridge.services.k8s.aws/v1alpha1
+        kind: Endpoint
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeEndpoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          description: ${schema.spec.description}
+          # eventBuses passed through verbatim — array of {eventBusARN: string}.
+          eventBuses: ${schema.spec.eventBuses}
+          routingConfig:
+            failoverConfig:
+              primary:
+                # ACK field healthCheck is a plain string (the health-check ARN), not a
+                # nested object — confirmed against the installed Endpoint CRD schema.
+                healthCheck: ${schema.spec.routingConfig.failoverConfig.primary.healthCheckArn}
+              secondary:
+                route: ${schema.spec.routingConfig.failoverConfig.secondary.route}
+          replicationConfig:
+            state: ${schema.spec.replicationConfig.state}
+          # roleARN: capital ARN per ACK crd-cache; empty when replication disabled.
+          roleARN: ${schema.spec.roleArn}
