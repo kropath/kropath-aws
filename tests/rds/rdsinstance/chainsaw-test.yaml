@@ -1,0 +1,1045 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# KRO-401 Chainsaw tests — RDSInstance (IN-1 through IN-22).
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+# effectiveConfig is simulated via kubectl patch --subresource=status (no kropath-controller
+# running in the kind cluster — kro reconciles ACK child resources from patched status).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: rdsinstance
+spec:
+  skipDelete: true
+  namespace: rdsinstance
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # IN-1: Create RDSInstance with required fields (engine, dbInstanceClass);
+    #        ACK DBInstance created with effectiveName as dbInstanceIdentifier.
+    - name: in1-create-basic
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in1-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in1-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in1-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in1-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in1-inst
+                namespace: rdsinstance
+              spec:
+                dbInstanceIdentifier: rdsinstance-in1-inst
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in1-inst
+                namespace: rdsinstance
+              status:
+                resourceName: rdsinstance-in1-inst
+
+    # IN-2: storageEncrypted cascade: mandatory: true forces encryption;
+    #        instance storageEncrypted: false is overridden by OR cascade.
+    - name: in2-cascade-storageencrypted-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in2-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in2-cfg
+              spec:
+                mandatory:
+                  storageEncrypted: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in2-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in2-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in2-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                storageEncrypted: false
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in2-inst
+                namespace: rdsinstance
+              spec:
+                storageEncrypted: true
+
+    # IN-3: storageEncrypted cascade: defaults: true applies when instance omits the field.
+    - name: in3-cascade-storageencrypted-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in3-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in3-cfg
+              spec:
+                defaults:
+                  storageEncrypted: true
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in3-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in3-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in3-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in3-inst
+                namespace: rdsinstance
+              spec:
+                storageEncrypted: true
+
+    # IN-4: kmsKeyID cascade: mandatory non-empty forces KMS key on ACK DBInstance;
+    #        instance value is ignored.
+    - name: in4-cascade-kmskeyid-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in4-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in4-cfg
+              spec:
+                mandatory:
+                  kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/mandatory-key-id"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in4-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"arn:aws:kms:ap-southeast-2:123456789012:key/mandatory-key-id","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in4-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in4-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/instance-key"
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in4-inst
+                namespace: rdsinstance
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/mandatory-key-id"
+
+    # IN-5: deletionProtection cascade: mandatory: true forces protection;
+    #        ACK DBInstance.spec.deletionProtection: true.
+    - name: in5-cascade-deletionprotection-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in5-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in5-cfg
+              spec:
+                mandatory:
+                  deletionProtection: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in5-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in5-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in5-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in5-inst
+                namespace: rdsinstance
+              spec:
+                deletionProtection: true
+
+    # IN-6: backupRetentionPeriod minimum floor: max(mandatory, spec.backupRetentionPeriod).
+    #        Two sub-cases: spec exceeds floor (gets spec value) and spec below floor (gets mandatory).
+    - name: in6-cascade-backupretention-floor
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in6-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in6-cfg
+              spec:
+                mandatory:
+                  backupRetentionPeriod: 7
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in6-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in6-inst-hi
+                namespace: rdsinstance
+              spec:
+                configRef: in6-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                backupRetentionPeriod: 10
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in6-inst-lo
+                namespace: rdsinstance
+              spec:
+                configRef: in6-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                backupRetentionPeriod: 3
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in6-inst-hi
+                namespace: rdsinstance
+              spec:
+                backupRetentionPeriod: 10
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in6-inst-lo
+                namespace: rdsinstance
+              spec:
+                backupRetentionPeriod: 7
+
+    # IN-7: multiAZ cascade: mandatory: true forces spec.multiAZ: true on ACK DBInstance.
+    - name: in7-cascade-multiaz-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in7-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in7-cfg
+              spec:
+                mandatory:
+                  multiAZ: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in7-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":true,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in7-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in7-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in7-inst
+                namespace: rdsinstance
+              spec:
+                multiAZ: true
+
+    # IN-8: publiclyAccessible pointer: mandatory pointer false = forced private-only;
+    #        has() always returns true (effectiveConfig writes zero), so mandatory always controls.
+    #        Instance spec.publiclyAccessible: true is overridden to false.
+    - name: in8-cascade-publiclyaccessible-forced-private
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in8-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in8-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in8-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in8-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                publiclyAccessible: true
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in8-inst
+                namespace: rdsinstance
+              spec:
+                publiclyAccessible: false
+
+    # IN-9: manageMasterUserPassword cascade: mandatory: true forces Secrets Manager.
+    - name: in9-cascade-managemasterpassword-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in9-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in9-cfg
+              spec:
+                mandatory:
+                  manageMasterUserPassword: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in9-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":true,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in9-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in9-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in9-inst
+                namespace: rdsinstance
+              spec:
+                manageMasterUserPassword: true
+
+    # IN-10: storageType cascade: defaults: "gp3" applies when instance omits the field.
+    - name: in10-cascade-storagetype-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in10-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in10-cfg
+              spec:
+                defaults:
+                  storageType: gp3
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in10-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in10-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in10-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in10-inst
+                namespace: rdsinstance
+              spec:
+                storageType: gp3
+
+    # IN-11: performanceInsightsEnabled cascade: mandatory: true forces PI on;
+    #         instance cannot disable.
+    - name: in11-cascade-pi-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in11-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in11-cfg
+              spec:
+                mandatory:
+                  performanceInsightsEnabled: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in11-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":true,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in11-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in11-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in11-inst
+                namespace: rdsinstance
+              spec:
+                performanceInsightsEnabled: true
+
+    # IN-12: enableIAMDatabaseAuthentication cascade: mandatory: true forces IAM auth.
+    - name: in12-cascade-iamauth-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in12-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in12-cfg
+              spec:
+                mandatory:
+                  enableIAMDatabaseAuthentication: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in12-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":true,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in12-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in12-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in12-inst
+                namespace: rdsinstance
+              spec:
+                enableIAMDatabaseAuthentication: true
+
+    # IN-13: Naming default template {namespace}-{name}; status.resourceName, status.predictedArn,
+    #         status.namingStatus set correctly.
+    - name: in13-naming-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in13-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in13-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in13-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in13-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in13-inst
+                namespace: rdsinstance
+              spec:
+                dbInstanceIdentifier: rdsinstance-in13-inst
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in13-inst
+                namespace: rdsinstance
+              status:
+                resourceName: rdsinstance-in13-inst
+                namingStatus: valid
+                predictedArn: "arn:aws:rds:ap-southeast-2:123456789012:db/rdsinstance-in13-inst"
+
+    # IN-14: spec.nameOverride non-empty: effectiveName = override; namingStatus valid.
+    - name: in14-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in14-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in14-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in14-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in14-cfg
+                nameOverride: "in14-custom-instance"
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in14-inst
+                namespace: rdsinstance
+              spec:
+                dbInstanceIdentifier: in14-custom-instance
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in14-inst
+                namespace: rdsinstance
+              status:
+                resourceName: in14-custom-instance
+                namingStatus: valid
+
+    # IN-15: Unresolved naming token: status.namingStatus: "invalid-unresolved-tokens".
+    - name: in15-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in15-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in15-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "{unknown-token}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in15-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{unknown-token}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in15-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in15-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in15-inst
+                namespace: rdsinstance
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # IN-16: Tags/syncedLabels/syncedAnnotations cascade; mergedSyncedLabels dual-write
+    #         (ADR-015 §6.1): in metadata.labels AND cloud spec.tags.
+    - name: in16-tags-synced-labels-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in16-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in16-cfg
+              spec:
+                mandatory:
+                  tags:
+                    env: prod
+                  syncedLabels:
+                    team: infra
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    tier: db
+        - script:
+            content: |
+              kubectl patch rdsconfig in16-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{"env":"prod"},"syncedLabels":{"team":"infra"},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{"tier":"db"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in16-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in16-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                tags:
+                  component: data
+        - script:
+            content: |
+              TAGS=$(kubectl get dbinstance in16-inst -n rdsinstance -o json | jq -c '.spec.tags')
+              echo "$TAGS" | jq -e '.[] | select(.key=="env" and .value=="prod")' > /dev/null
+              echo "$TAGS" | jq -e '.[] | select(.key=="tier" and .value=="db")' > /dev/null
+              echo "$TAGS" | jq -e '.[] | select(.key=="component" and .value=="data")' > /dev/null
+              echo "$TAGS" | jq -e '.[] | select(.key=="team" and .value=="infra")' > /dev/null
+              kubectl get dbinstance in16-inst -n rdsinstance -o json | \
+                jq -e '.metadata.labels["kropath.run/team"] == "infra"' > /dev/null
+
+    # IN-17: Standard metadata labels (app.kubernetes.io/managed-by: kro,
+    #          app.kubernetes.io/instance: <K8s-name>) wired to ACK DBInstance.metadata.labels.
+    - name: in17-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in17-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in17-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in17-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in17-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in17-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in17-inst
+                namespace: rdsinstance
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: in17-inst
+
+    # IN-18: deletionPolicy: delete wires services.k8s.aws/deletion-policy: delete
+    #          on ACK DBInstance.
+    - name: in18-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in18-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in18-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in18-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in18-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in18-cfg
+                deletionPolicy: delete
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in18-inst
+                namespace: rdsinstance
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # IN-19: Restore from snapshot: spec.dbSnapshotIdentifier non-empty wired to ACK DBInstance.
+    - name: in19-restore-from-snapshot
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in19-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in19-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in19-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in19-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in19-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                dbSnapshotIdentifier: "rds:in19-source-2026-01-01"
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in19-inst
+                namespace: rdsinstance
+              spec:
+                dbSnapshotIdentifier: "rds:in19-source-2026-01-01"
+
+    # IN-20: masterUserPassword SecretKeyReference passthrough (G-1):
+    #          spec.masterUserPassword wired to ACK DBInstance.spec.masterUserPassword.
+    - name: in20-masterpassword-secretref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in20-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in20-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in20-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in20-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in20-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                masterUserPassword:
+                  name: my-rds-secret
+                  key: password
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in20-inst
+                namespace: rdsinstance
+              spec:
+                masterUserPassword:
+                  name: my-rds-secret
+                  key: password
+
+    # IN-21: Mutual exclusivity of masterUserPassword and manageMasterUserPassword (G-2):
+    #          when both set, advisory passwordMutualExclusionError ConfigMap is created.
+    - name: in21-password-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in21-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in21-cfg
+              spec:
+                mandatory:
+                  manageMasterUserPassword: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in21-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":true,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in21-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in21-cfg
+                engine: mysql
+                dbInstanceClass: db.t3.micro
+                masterUserPassword:
+                  name: my-secret
+                  key: password
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: in21-inst
+                namespace: rdsinstance
+              data:
+                (error != null): true
+
+    # IN-22: Aurora member instance: spec.dbClusterIdentifier non-empty wired to ACK DBInstance.
+    - name: in22-aurora-cluster-member
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSConfig
+              metadata:
+                name: in22-cfg
+                namespace: rdsinstance
+                labels:
+                  aws.kropath.run/resource-name: in22-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch rdsconfig in22-cfg -n rdsinstance \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"storageEncrypted":false,"kmsKeyID":"","deletionProtection":false,"backupRetentionPeriod":0,"multiAZ":false,"publiclyAccessible":false,"storageType":"","autoMinorVersionUpgrade":false,"copyTagsToSnapshot":false,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"storageEncrypted":true,"kmsKeyID":"","deletionProtection":true,"backupRetentionPeriod":7,"multiAZ":false,"publiclyAccessible":false,"storageType":"gp3","autoMinorVersionUpgrade":true,"copyTagsToSnapshot":true,"performanceInsightsEnabled":false,"enableIAMDatabaseAuthentication":false,"manageMasterUserPassword":false,"namingTemplate":"{namespace}-{name}","serverlessV2ScalingMinCapacity":0,"serverlessV2ScalingMaxCapacity":0,"backtrackWindow":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSInstance
+              metadata:
+                name: in22-inst
+                namespace: rdsinstance
+              spec:
+                configRef: in22-cfg
+                engine: aurora-mysql
+                dbInstanceClass: db.r6g.large
+                dbClusterIdentifier: aurora-cluster-01
+        - assert:
+            resource:
+              apiVersion: rds.services.k8s.aws/v1alpha1
+              kind: DBInstance
+              metadata:
+                name: in22-inst
+                namespace: rdsinstance
+              spec:
+                dbClusterIdentifier: aurora-cluster-01
