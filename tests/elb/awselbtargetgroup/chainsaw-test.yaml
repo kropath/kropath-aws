@@ -37,11 +37,12 @@ spec:
               set -e
               NS=awselbtargetgroup
               # Delete AWSELBTargetGroup CRs
-              for name in tg-instance tg-ip tg-lambda tg-alb tg-tcp \
+              for name in tg-instance tg-ip tg-lambda tg-alb tg-geneve \
                           tg-h2 tg-grpc tg-hc tg-hc-on \
                           tg-matcher-h tg-matcher-g tg-attrs \
                           name-std name-mand name-ovrd name-unresl \
-                          tags-mrg slbl-dual sanno std-meta del-del; do
+                          tags-mrg slbl-dual sanno std-meta del-del \
+                          tg-sticky tg-static; do
                 kubectl delete awselbtargetgroup "${name}" -n "${NS}" --ignore-not-found=true
               done
               # Delete ELBConfig CRs
@@ -399,31 +400,31 @@ spec:
                 vpcID: vpc-0003
 
     # ──────────────────────────────────────────────────────────────────────────
-    # AC-5: NLB target group — protocol=TCP for network load balancer targets.
+    # AC-5: GWLB target group — protocol=GENEVE for Gateway Load Balancer targets.
     # ──────────────────────────────────────────────────────────────────────────
-    - name: ac5-protocol-tcp
+    - name: ac5-protocol-geneve
       try:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
               kind: AWSELBTargetGroup
               metadata:
-                name: tg-tcp
+                name: tg-geneve
               spec:
                 targetType: instance
-                protocol: TCP
-                port: 443
+                protocol: GENEVE
+                port: 6081
                 vpcId: vpc-0001
         - assert:
             resource:
               apiVersion: elbv2.services.k8s.aws/v1alpha1
               kind: TargetGroup
               metadata:
-                name: tg-tcp
+                name: tg-geneve
               spec:
                 targetType: instance
-                protocol: TCP
-                port: 443
+                protocol: GENEVE
+                port: 6081
 
     # ──────────────────────────────────────────────────────────────────────────
     # AC-6: protocolVersion=HTTP2 flows to ACK TargetGroup spec.protocolVersion.
@@ -965,3 +966,80 @@ spec:
                 annotations:
                   services.k8s.aws/deletion-policy: delete
               spec: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22: stickiness — spec.stickiness.type set folds stickiness attributes
+    #         (stickiness.enabled, stickiness.type, stickiness.lb_cookie.duration_seconds)
+    #         into the ACK TargetGroup attributes list.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22-stickiness
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AWSELBTargetGroup
+              metadata:
+                name: tg-sticky
+              spec:
+                targetType: instance
+                protocol: HTTP
+                port: 80
+                vpcId: vpc-0001
+                stickiness:
+                  enabled: true
+                  type: lb_cookie
+                  durationSeconds: 86400
+        - script:
+            content: |
+              for __poll_wait_child in $(seq 1 60); do
+                kubectl get targetgroups.elbv2.services.k8s.aws tg-sticky -n awselbtargetgroup >/dev/null 2>&1 && break
+                sleep 1
+              done
+              ATTRS=$(kubectl get targetgroups.elbv2.services.k8s.aws tg-sticky -n awselbtargetgroup \
+                -o json | jq -c '.spec.attributes')
+              echo "$ATTRS" | jq -e 'any(.key == "stickiness.enabled" and .value == "true")' \
+                >/dev/null || { echo "FAIL: stickiness.enabled=true not in attributes; attrs=$ATTRS"; exit 1; }
+              echo "$ATTRS" | jq -e 'any(.key == "stickiness.type" and .value == "lb_cookie")' \
+                >/dev/null || { echo "FAIL: stickiness.type=lb_cookie not in attributes; attrs=$ATTRS"; exit 1; }
+              echo "$ATTRS" | jq -e 'any(.key == "stickiness.lb_cookie.duration_seconds" and .value == "86400")' \
+                >/dev/null || { echo "FAIL: stickiness.lb_cookie.duration_seconds=86400 not in attributes; attrs=$ATTRS"; exit 1; }
+              echo "PASS: stickiness attributes folded into ACK TargetGroup attributes list"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-23: static targets — spec.targets[] registers static instance/ip targets
+    #         on the ACK TargetGroup CR.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac23-static-targets
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AWSELBTargetGroup
+              metadata:
+                name: tg-static
+              spec:
+                targetType: instance
+                protocol: HTTP
+                port: 80
+                vpcId: vpc-0001
+                targets:
+                  - id: i-0abc123456789def0
+                    port: 8080
+                    availabilityZone: us-east-1a
+                  - id: i-0def987654321abc0
+                    port: 8080
+                    availabilityZone: us-east-1b
+        - assert:
+            resource:
+              apiVersion: elbv2.services.k8s.aws/v1alpha1
+              kind: TargetGroup
+              metadata:
+                name: tg-static
+              spec:
+                targets:
+                  - id: i-0abc123456789def0
+                    port: 8080
+                    availabilityZone: us-east-1a
+                  - id: i-0def987654321abc0
+                    port: 8080
+                    availabilityZone: us-east-1b
