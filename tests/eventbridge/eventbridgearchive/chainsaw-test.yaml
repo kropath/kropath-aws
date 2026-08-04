@@ -16,6 +16,13 @@
 # Namespace: eventbridgearchive. Default naming: {namespace}-{name} => eventbridgearchive-<cr-name>.
 # eventBusRef tests create an EventBridgeEventBus in this namespace to supply status.predictedArn.
 # No tags field on EventBridgeArchive (ACK Archive does not support tags).
+#
+# CANONICAL pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step uses a UNIQUE config (acN-cfg) and a UNIQUE resource name, and
+# deletes NOTHING between steps (spec.skipDelete is the global default). The test cluster runs
+# kro but no ACK controllers, so a shared config mutated across steps would re-reconcile every
+# persisted instance and cross-contaminate later assertions; per-step configs avoid that.
+# effectiveConfig is injected via `kubectl patch --subresource=status` to mock kropath-controller.
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
@@ -23,33 +30,6 @@ metadata:
 spec:
   namespace: eventbridgearchive
   steps:
-    # ── Seed: namespace + governance config ──────────────────────────────────
-    - name: purge-stale-leftovers
-      try:
-        - script:
-            content: |
-              for kind in archive eventbridgearchive eventbus eventbridgeeventbus; do
-                for name in $(kubectl get "$kind" -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                  kubectl patch "$kind" "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-                done
-                kubectl delete "$kind" --all -n eventbridgearchive --ignore-not-found --wait=false
-              done
-              kubectl delete eventbridgeconfig --all -n eventbridgearchive --ignore-not-found --wait=false
-              kubectl delete namespace eventbridgearchive --ignore-not-found
-              sleep 3
-
-    - name: seed-namespace-and-config
-      try:
-        - apply:
-            file: 00-eventbridgearchive-namespace.yaml
-        - apply:
-            file: 01-general-policy-eventbridgeconfig.yaml
-        - script:
-            content: |
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
-                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
-
     # ── AC-1: creation with eventBusArn direct ───────────────────────────
     # ── AC-3: default naming {namespace}-{name} ───────────────────────────
     # ── AC-11: ACK Archive spec.archiveName set from effectiveName ─────────
@@ -58,12 +38,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac1-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac1-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: arn-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac1-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - assert:
             resource:
@@ -71,9 +65,8 @@ spec:
               kind: Archive
               metadata:
                 name: arn-archive
-                namespace: eventbridgearchive
               spec:
-                archiveName: eventbridgearchive-arn-archive
+                name: eventbridgearchive-arn-archive
                 eventSourceARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - assert:
             resource:
@@ -81,18 +74,9 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: arn-archive
-                namespace: eventbridgearchive
               status:
                 resourceName: eventbridgearchive-arn-archive
                 namingStatus: valid
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-2: creation with eventBusRef cross-referencing EventBridgeEventBus ─
     # ── AC-12: eventBusRef resolves to EventBus.status.predictedArn ────────
@@ -101,21 +85,34 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac2-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac2-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeEventBus
               metadata:
                 name: ref-bus
-                namespace: eventbridgearchive
                 labels:
                   aws.kropath.run/resource-name: ref-bus
               spec:
-                configRef: general-policy
+                configRef: ac2-cfg
         - assert:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeEventBus
               metadata:
                 name: ref-bus
-                namespace: eventbridgearchive
               status:
                 predictedArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/eventbridgearchive-ref-bus"
         - apply:
@@ -124,9 +121,8 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: ref-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac2-cfg
                 eventBusRef: ref-bus
         - assert:
             resource:
@@ -134,18 +130,8 @@ spec:
               kind: Archive
               metadata:
                 name: ref-archive
-                namespace: eventbridgearchive
               spec:
                 eventSourceARN: "arn:aws:events:ap-southeast-2:123456789012:event-bus/eventbridgearchive-ref-bus"
-      cleanup:
-        - script:
-            content: |
-              for kind in archive eventbridgearchive eventbus eventbridgeeventbus; do
-                for name in $(kubectl get "$kind" -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                  kubectl patch "$kind" "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-                done
-                kubectl delete "$kind" --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              done
 
     # ── AC-4: eventBusRef + eventBusArn mutual exclusion → validationError ─
     - name: ac4-eventbus-mutual-exclusion-error
@@ -153,12 +139,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac4-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac4-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: bus-exclusion
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac4-cfg
                 eventBusRef: some-bus
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/another-bus"
         - assert:
@@ -167,19 +167,16 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: bus-exclusion
-                namespace: eventbridgearchive
               status:
                 (validationError != ""): true
         - script:
             content: |
-              if kubectl get archive bus-exclusion -n eventbridgearchive 2>/dev/null | grep -q "bus-exclusion"; then
+              # ACK Archive must NOT be created with a mutual-exclusion error.
+              sleep 10
+              if kubectl get archives.eventbridge.services.k8s.aws bus-exclusion -n eventbridgearchive 2>/dev/null | grep -q "bus-exclusion"; then
                 echo "FAIL: ACK Archive should not exist with mutual exclusion error"; exit 1
               fi
               echo "PASS"
-      cleanup:
-        - script:
-            content: |
-              kubectl delete eventbridgearchive bus-exclusion -n eventbridgearchive --ignore-not-found=true
 
     # ── AC-5: nameOverride takes precedence ────────────────────────────────
     - name: ac5-naming-override
@@ -187,12 +184,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac5-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac5-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: override-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac5-cfg
                 nameOverride: "my-custom-archive"
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - assert:
@@ -201,28 +212,26 @@ spec:
               kind: Archive
               metadata:
                 name: override-archive
-                namespace: eventbridgearchive
               spec:
-                archiveName: my-custom-archive
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
+                name: my-custom-archive
 
     # ── AC-6: mandatory namingTemplate wins ───────────────────────────────
     - name: ac6-naming-mandatory-template
       try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac6-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "corp-{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
         - script:
             content: |
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
-                -p '{"status":{"effectiveConfig":null}}'
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
+              kubectl patch eventbridgeconfig ac6-cfg -n eventbridgearchive --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
         - apply:
             resource:
@@ -230,9 +239,8 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: naming-mandatory
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac6-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - assert:
             resource:
@@ -240,30 +248,26 @@ spec:
               kind: Archive
               metadata:
                 name: naming-mandatory
-                namespace: eventbridgearchive
               spec:
-                archiveName: corp-eventbridgearchive-naming-mandatory
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
+                name: corp-eventbridgearchive-naming-mandatory
 
     # ── AC-7: unresolved tokens → namingStatus invalid, no ACK Archive ─────
     - name: ac7-naming-unresolved-tokens
       try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac7-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{tag.unknown}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
         - script:
             content: |
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
-                -p '{"status":{"effectiveConfig":null}}'
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
+              kubectl patch eventbridgeconfig ac7-cfg -n eventbridgearchive --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{tag.unknown}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
         - apply:
             resource:
@@ -271,9 +275,8 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: naming-unresolved
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac7-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - assert:
             resource:
@@ -281,33 +284,35 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: naming-unresolved
-                namespace: eventbridgearchive
               status:
                 namingStatus: invalid-unresolved-tokens
         - script:
             content: |
-              if kubectl get archive naming-unresolved -n eventbridgearchive 2>/dev/null | grep -q "naming-unresolved"; then
+              # ACK Archive must NOT be created when naming is invalid.
+              sleep 10
+              if kubectl get archives.eventbridge.services.k8s.aws naming-unresolved -n eventbridgearchive 2>/dev/null | grep -q "naming-unresolved"; then
                 echo "FAIL: ACK Archive should not exist with invalid naming"; exit 1
               fi
               echo "PASS"
-      cleanup:
-        - script:
-            content: |
-              kubectl delete eventbridgearchive naming-unresolved -n eventbridgearchive --ignore-not-found=true
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
 
     # ── AC-8: retentionDays=0 means keep forever (default) ─────────────────
     # ── AC-9: retentionDays floor governance (mandatory.archiveRetentionDays) ─
     - name: ac8-ac9-retention-days-governance
       try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac8-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 30, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
         - script:
             content: |
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
-                -p '{"status":{"effectiveConfig":null}}'
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
+              kubectl patch eventbridgeconfig ac8-cfg -n eventbridgearchive --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":30,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
         - apply:
             resource:
@@ -315,9 +320,8 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: retention-floor
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac8-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
                 retentionDays: 7
         - assert:
@@ -326,7 +330,6 @@ spec:
               kind: Archive
               metadata:
                 name: retention-floor
-                namespace: eventbridgearchive
               spec:
                 retentionDays: 30
         - apply:
@@ -335,9 +338,8 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: retention-user-higher
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac8-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
                 retentionDays: 90
         - assert:
@@ -346,7 +348,6 @@ spec:
               kind: Archive
               metadata:
                 name: retention-user-higher
-                namespace: eventbridgearchive
               spec:
                 retentionDays: 90
         - apply:
@@ -355,9 +356,8 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: retention-zero
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac8-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
                 retentionDays: 0
         - assert:
@@ -366,19 +366,8 @@ spec:
               kind: Archive
               metadata:
                 name: retention-zero
-                namespace: eventbridgearchive
               spec:
                 retentionDays: 0
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive --subresource=status --type=merge -p '{"status":{"effectiveConfig":null}}' || true
-              kubectl patch eventbridgeconfig general-policy -n eventbridgearchive --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}' || true
 
     # ── AC-10: eventPattern passthrough ──────────────────────────────────
     - name: ac10-event-pattern-passthrough
@@ -386,12 +375,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac10-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac10-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: pattern-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac10-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
                 eventPattern: '{"source":["aws.ec2"],"detail-type":["EC2 Instance State-change Notification"]}'
         - assert:
@@ -400,17 +403,8 @@ spec:
               kind: Archive
               metadata:
                 name: pattern-archive
-                namespace: eventbridgearchive
               spec:
                 eventPattern: '{"source":["aws.ec2"],"detail-type":["EC2 Instance State-change Notification"]}'
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-13: description passthrough ────────────────────────────────────
     - name: ac13-description-passthrough
@@ -418,12 +412,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac13-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac13-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: desc-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac13-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
                 description: "My archive for EC2 events"
         - assert:
@@ -432,17 +440,8 @@ spec:
               kind: Archive
               metadata:
                 name: desc-archive
-                namespace: eventbridgearchive
               spec:
                 description: "My archive for EC2 events"
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-14: predictedArn computed from effectiveName ──────────────────
     - name: ac14-predicted-arn
@@ -450,12 +449,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac14-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac14-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: predicted-arn-test
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac14-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - assert:
             resource:
@@ -463,17 +476,8 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: predicted-arn-test
-                namespace: eventbridgearchive
               status:
                 predictedArn: "arn:aws:events:ap-southeast-2:123456789012:archive/eventbridgearchive-predicted-arn-test"
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-15: syncedLabels dual-write to K8s labels (no cloud tags — Archive has none) ─
     - name: ac15-synced-labels-kubernetes-labels
@@ -481,12 +485,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac15-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac15-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: synced-labels-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac15-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
                 syncedLabels:
                   app-owner: platform
@@ -496,17 +514,8 @@ spec:
               kind: Archive
               metadata:
                 name: synced-labels-archive
-                namespace: eventbridgearchive
                 labels:
                   aws.kropath.run/app-owner: platform
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-16: deletionPolicy annotation ─────────────────────────────────
     - name: ac16-deletion-policy
@@ -514,12 +523,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac16-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac16-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: del-policy-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac16-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
                 deletionPolicy: delete
         - assert:
@@ -528,17 +551,8 @@ spec:
               kind: Archive
               metadata:
                 name: del-policy-archive
-                namespace: eventbridgearchive
                 annotations:
                   services.k8s.aws/deletion-policy: delete
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-17-18: standard K8s metadata wiring ────────────────────────────
     - name: ac17-ac18-standard-metadata
@@ -546,12 +560,26 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac17-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac17-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: meta-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac17-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - assert:
             resource:
@@ -559,23 +587,18 @@ spec:
               kind: Archive
               metadata:
                 name: meta-archive
-                namespace: eventbridgearchive
                 labels:
                   app.kubernetes.io/managed-by: kro
                   app.kubernetes.io/instance: meta-archive
         - script:
             content: |
-              OWNER_KIND=$(kubectl get archive meta-archive -n eventbridgearchive -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              for _ in $(seq 1 60); do
+                kubectl get archives.eventbridge.services.k8s.aws meta-archive -n eventbridgearchive >/dev/null 2>&1 && break
+                sleep 1
+              done
+              OWNER_KIND=$(kubectl get archives.eventbridge.services.k8s.aws meta-archive -n eventbridgearchive -o jsonpath='{.metadata.ownerReferences[0].kind}')
               if [ "$OWNER_KIND" != "EventBridgeArchive" ]; then echo "FAIL: ownerRef kind=$OWNER_KIND"; exit 1; fi
               echo "PASS"
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-19: no cloud tags field on ACK Archive ─────────────────────────
     - name: ac19-no-cloud-tags-field
@@ -583,28 +606,38 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac19-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac19-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: no-tags-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac19-cfg
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
         - script:
             content: |
-              TAGS=$(kubectl get archive no-tags-archive -n eventbridgearchive -o jsonpath='{.spec.tags}' 2>/dev/null || echo "null")
+              for _ in $(seq 1 60); do
+                kubectl get archives.eventbridge.services.k8s.aws no-tags-archive -n eventbridgearchive >/dev/null 2>&1 && break
+                sleep 1
+              done
+              TAGS=$(kubectl get archives.eventbridge.services.k8s.aws no-tags-archive -n eventbridgearchive -o jsonpath='{.spec.tags}' 2>/dev/null || echo "null")
               if [ "$TAGS" != "" ] && [ "$TAGS" != "null" ] && [ "$TAGS" != "{}" ]; then
                 echo "FAIL: ACK Archive should have no tags field, got: $TAGS"; exit 1
               fi
               echo "PASS: No cloud tags field on ACK Archive"
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
 
     # ── AC-20: configRef selects correct EventBridgeConfig ────────────────
     - name: ac20-config-profile-selection
@@ -615,26 +648,14 @@ spec:
               kind: EventBridgeConfig
               metadata:
                 name: team-archive-policy
-                namespace: eventbridgearchive
                 labels:
                   aws.kropath.run/resource-name: team-archive-policy
               spec:
-                mandatory:
-                  archiveRetentionDays: 0
-                  namingTemplate: ""
-                  tags: {}
-                  syncedLabels: {}
-                  syncedAnnotations: {}
-                defaults:
-                  archiveRetentionDays: 0
-                  namingTemplate: "team-{name}"
-                  tags: {}
-                  syncedLabels: {}
-                  syncedAnnotations: {}
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "team-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
         - script:
             content: |
-              kubectl patch eventbridgeconfig team-archive-policy -n eventbridgearchive \
-                --subresource=status --type=merge \
+              kubectl patch eventbridgeconfig team-archive-policy -n eventbridgearchive --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"team-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
         - apply:
             resource:
@@ -642,7 +663,6 @@ spec:
               kind: EventBridgeArchive
               metadata:
                 name: team-archive
-                namespace: eventbridgearchive
               spec:
                 configRef: team-archive-policy
                 eventBusArn: "arn:aws:events:ap-southeast-2:123456789012:event-bus/my-bus"
@@ -652,18 +672,8 @@ spec:
               kind: Archive
               metadata:
                 name: team-archive
-                namespace: eventbridgearchive
               spec:
-                archiveName: team-team-archive
-      cleanup:
-        - script:
-            content: |
-              for name in $(kubectl get archive -n eventbridgearchive -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-                kubectl patch archive "$name" -n eventbridgearchive --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-              done
-              kubectl delete archive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgearchive --all -n eventbridgearchive --ignore-not-found=true --wait=false
-              kubectl delete eventbridgeconfig team-archive-policy -n eventbridgearchive --ignore-not-found=true
+                name: team-team-archive
 
     # ── AC-21: eventBusRef not found → eventSourceARN falls back to empty, no ACK Archive ─
     - name: ac21-eventbusref-not-found-no-archive
@@ -671,21 +681,32 @@ spec:
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
+              kind: EventBridgeConfig
+              metadata:
+                name: ac21-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec:
+                mandatory: {archiveRetentionDays: 0, namingTemplate: "", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+                defaults: {archiveRetentionDays: 0, namingTemplate: "{namespace}-{name}", tags: {}, syncedLabels: {}, syncedAnnotations: {}}
+        - script:
+            content: |
+              kubectl patch eventbridgeconfig ac21-cfg -n eventbridgearchive --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"archiveRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"archiveRetentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
               kind: EventBridgeArchive
               metadata:
                 name: missing-ref-archive
-                namespace: eventbridgearchive
               spec:
-                configRef: general-policy
+                configRef: ac21-cfg
                 eventBusRef: nonexistent-bus
         - script:
             content: |
-              sleep 5
-              if kubectl get archive missing-ref-archive -n eventbridgearchive 2>/dev/null | grep -q "missing-ref-archive"; then
+              # ACK Archive must NOT be created when eventBusRef does not resolve.
+              sleep 10
+              if kubectl get archives.eventbridge.services.k8s.aws missing-ref-archive -n eventbridgearchive 2>/dev/null | grep -q "missing-ref-archive"; then
                 echo "FAIL: ACK Archive should not exist when eventBusRef does not resolve"; exit 1
               fi
               echo "PASS"
-      cleanup:
-        - script:
-            content: |
-              kubectl delete eventbridgearchive missing-ref-archive -n eventbridgearchive --ignore-not-found=true

@@ -35,10 +35,21 @@ spec:
       state: string | default=ENABLED
       roleArn: string | default=""
       # targets is passed through directly to ACK Rule spec.targets (array of Target objects).
-      targets: array | default=[]
+      # kro requires a named element type — bare `array` is not a valid kro schema type.
+      targets: "[]Target | default=[]"
       tags: map[string]string | default={}
       syncedLabels: map[string]string | default={}
       syncedAnnotations: map[string]string | default={}
+    types:
+      # Scalar Target fields (matching ACK eventbridge Rule target items). Nested
+      # parameter blocks (ecsParameters, inputTransformer, …) are intentionally omitted;
+      # add them here if a scenario needs them.
+      Target:
+        id: string | default=""
+        arn: string | default=""
+        roleARN: string | default=""
+        input: string | default=""
+        inputPath: string | default=""
     status:
       resourceName: >-
         ${naming.data.effectiveName}
@@ -56,9 +67,9 @@ spec:
       conditions: >-
         ${ackRule.?status.?conditions.orValue([])}
       validationError: >-
-        ${has(eventBusExclusionError.data) && has(eventBusExclusionError.data.error)
+        ${has(eventBusExclusionError.data) && eventBusExclusionError.data.error != ""
           ? eventBusExclusionError.data.error
-          : (has(scheduleExclusionError.data) && has(scheduleExclusionError.data.error)
+          : (has(scheduleExclusionError.data) && scheduleExclusionError.data.error != ""
               ? scheduleExclusionError.data.error
               : "")}
     additionalPrinterColumns:
@@ -149,7 +160,7 @@ spec:
               .replace("{name}", schema.metadata.name)
               .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
               .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
-              .replace("{configRef}", schema.spec.configRef)}
+              .replace("{configRef}", schema.spec.configRef))}
           # resolvedEventBusName feeds ACK spec.eventBusName and predictedArn computation.
           # Precedence: eventBusRef cross-ref (→ EventBus.status.resourceName) > eventBusName direct > "".
           resolvedEventBusName: >-
@@ -159,9 +170,11 @@ spec:
 
     # Advisory ConfigMap — created only when both eventBusRef and eventBusName are set simultaneously.
     # Exactly one must be provided (spec §3 mutual exclusion).
+    # Advisory ConfigMap — ALWAYS created (no includeWhen); data.error is the message only when
+    # both eventBusRef and eventBusName are set. Always-creating it lets the status block read
+    # its data unconditionally — kro cannot reference an EXCLUDED resource in a status/includeWhen
+    # expression, which silently nulls the whole field.
     - id: eventBusExclusionError
-      includeWhen:
-        - '${schema.spec.eventBusRef != "" && schema.spec.eventBusName != ""}'
       template:
         apiVersion: v1
         kind: ConfigMap
@@ -179,12 +192,11 @@ spec:
               controller: true
               blockOwnerDeletion: true
         data:
-          error: "eventBusRef and eventBusName are mutually exclusive — set exactly one"
+          error: '${schema.spec.eventBusRef != "" && schema.spec.eventBusName != "" ? "eventBusRef and eventBusName are mutually exclusive — set exactly one" : ""}'
 
-    # Advisory ConfigMap — created only when both eventPattern and scheduleExpression are set.
+    # Advisory ConfigMap — ALWAYS created; data.error set only when both eventPattern and
+    # scheduleExpression are set.
     - id: scheduleExclusionError
-      includeWhen:
-        - '${schema.spec.eventPattern != "" && schema.spec.scheduleExpression != ""}'
       template:
         apiVersion: v1
         kind: ConfigMap
@@ -202,12 +214,15 @@ spec:
               controller: true
               blockOwnerDeletion: true
         data:
-          error: "eventPattern and scheduleExpression are mutually exclusive — set exactly one"
+          error: '${schema.spec.eventPattern != "" && schema.spec.scheduleExpression != "" ? "eventPattern and scheduleExpression are mutually exclusive — set exactly one" : ""}'
 
     # ACK EventBridge Rule CR — gated on valid naming and no mutual exclusion errors.
     - id: ackRule
       includeWhen:
-        - '${!naming.data.effectiveName.contains("{") && !(has(eventBusExclusionError.data) && has(eventBusExclusionError.data.error)) && !(has(scheduleExclusionError.data) && has(scheduleExclusionError.data.error))}'
+        # Gate on schema conditions directly, not on the advisory ConfigMaps: kro cannot
+        # reference an EXCLUDED resource's .data in an includeWhen. Advisory CMs still surface
+        # the errors in status.validationError.
+        - '${!naming.data.effectiveName.contains("{") && !(schema.spec.eventBusRef != "" && schema.spec.eventBusName != "") && !(schema.spec.eventPattern != "" && schema.spec.scheduleExpression != "")}'
       template:
         apiVersion: eventbridge.services.k8s.aws/v1alpha1
         kind: Rule
