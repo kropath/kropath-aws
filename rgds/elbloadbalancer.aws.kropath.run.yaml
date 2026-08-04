@@ -15,12 +15,12 @@
 apiVersion: kro.run/v1alpha1
 kind: ResourceGraphDefinition
 metadata:
-  name: awselbtargetgroup.aws.kropath.run
+  name: elbloadbalancer.aws.kropath.run
 spec:
   schema:
     apiVersion: v1alpha1
     group: aws.kropath.run
-    kind: AWSELBTargetGroup
+    kind: ELBLoadBalancer
     scope: Namespaced
     spec:
       configRef: string | default=general-policy
@@ -29,64 +29,53 @@ spec:
       tags: map[string]string | default={}
       syncedLabels: map[string]string | default={}
       syncedAnnotations: map[string]string | default={}
-      # Target type — instance (default) | ip | lambda | alb; immutable after creation
-      targetType: string | default=instance
-      # Protocol — ALB: HTTP | HTTPS; NLB: TCP | TLS | UDP | TCP_UDP; GWLB: GENEVE; lambda/alb: omit
-      protocol: string | default=""
-      # Protocol version — HTTP1 (default) | HTTP2 | GRPC; HTTP/HTTPS only
-      protocolVersion: string | default=""
-      # Port targets receive traffic on (int64); 0 = not set (Lambda targets only)
-      port: integer | default=0
-      # VPC ID — required by AWS API for non-Lambda targets
-      vpcId: string | default=""
-      # IP address type — ipv4 (default) | ipv6
+      # LB type — application | network | gateway; immutable after creation
+      type: string | required=true
+      # Scheme — internet-facing (default) | internal; GWLB always internal
+      scheme: string | default=""
+      # IP address type — ipv4 (default) | dualstack | dualstack-without-public-ipv4
       ipAddressType: string | default=ipv4
-      # Health check configuration
-      healthCheck:
-        # enabled is tri-state: declared without default so has() can distinguish unset from false.
-        # Unset → ACK uses AWS default (always true for instance/ip/alb; false for lambda).
-        # Set to false → explicitly disable (Lambda target groups only).
+      # Subnet IDs; mutually exclusive with subnetMappings
+      subnets: "[]string | default=[]"
+      # Subnet mappings with optional EIP/private IP; mutually exclusive with subnets
+      subnetMappings: "[]SubnetMapping | default=[]"
+      # Security group IDs (ALB and NLB only; ignored for GWLB)
+      securityGroups: "[]string | default=[]"
+      # Governance — boolean fields declared without default to support tri-state:
+      #   unset → fall through to defaults tier
+      #   true/false → instance tier takes precedence over defaults
+      deletionProtection: boolean
+      # Access logging configuration
+      accessLogging:
         enabled: boolean
-        protocol: string | default=""
-        port: string | default=""
-        path: string | default=""
-        intervalSeconds: integer | default=0
-        timeoutSeconds: integer | default=0
-        healthyThresholdCount: integer | default=0
-        unhealthyThresholdCount: integer | default=0
-      # matcher: HTTP/gRPC success codes for health checks
-      matcher:
-        httpCode: string | default=""
-        grpcCode: string | default=""
-      # Additional target group attributes beyond the typed fields above
-      additionalAttributes: "[]TGAttribute | default=[]"
-      # stickiness — target group stickiness config; type="" means not configured.
-      stickiness:
-        enabled: boolean | default=false
-        type: string | default=""
-        # durationSeconds is a string (e.g. "3600") because ELBv2 attributes are string key-value pairs.
-        durationSeconds: string | default=""
-      # targets — static target registrations for instance/ip targets.
-      targets: "[]TGTarget | default=[]"
+        s3Bucket: string | default=""
+        s3Prefix: string | default=""
+      # Cross-zone load balancing (NLB/GWLB governance; ALB is always cross-zone)
+      crossZoneLoadBalancing: boolean
+      # Idle timeout in seconds (ALB only, 1-4000); 0 = not set at this tier
+      idleTimeoutSeconds: integer | default=0
+      # Additional LB attributes beyond the typed governance fields above
+      additionalAttributes: "[]LBAttribute | default=[]"
     types:
-      TGAttribute:
+      SubnetMapping:
+        subnetId: string | default=""
+        allocationId: string | default=""
+        privateIPv4Address: string | default=""
+        ipv6Address: string | default=""
+      LBAttribute:
         key: string | default=""
         value: string | default=""
-      TGTarget:
-        id: string | default=""
-        port: integer | default=0
-        availabilityZone: string | default=""
     status:
       resourceName: >-
         ${naming.data.resourceName}
       namingStatus: >-
         ${naming.data.namingStatus}
       conditions: >-
-        ${tg.?status.?conditions.orValue([])}
+        ${lb.?status.?conditions.orValue([])}
     additionalPrinterColumns:
-      - name: TargetType
+      - name: Type
         type: string
-        jsonPath: .spec.targetType
+        jsonPath: .spec.type
       - name: ResourceName
         type: string
         jsonPath: .status.resourceName
@@ -109,26 +98,28 @@ spec:
 
     # Naming ConfigMap — materialises effectiveName and resourceName (with .lowerAscii() for ELB
     # constraints) and namingStatus without requiring schema.* access in the status block.
+    # Labeled with aws.kropath.run/resource-name for any future externalRef lookups.
     - id: naming
       template:
         apiVersion: v1
         kind: ConfigMap
         metadata:
-          name: ${schema.metadata.name}-elbtg-naming
+          name: ${schema.metadata.name}-elblb-naming
           namespace: ${schema.metadata.namespace}
           labels:
             aws.kropath.run/resource-name: ${schema.metadata.name}
-            aws.kropath.run/kropath-type: elbtg-naming
+            aws.kropath.run/kropath-type: elblb-naming
           ownerReferences:
             - apiVersion: aws.kropath.run/v1alpha1
-              kind: AWSELBTargetGroup
+              kind: ELBLoadBalancer
               name: ${schema.metadata.name}
               uid: ${schema.metadata.uid}
               controller: true
               blockOwnerDeletion: true
         data:
-          # effectiveName: resolved via naming template with {tag.X} dynamic substitution.
+          # effectiveName: base name resolved via naming template with {tag.X} dynamic substitution.
           # Template priority: mandatory → defaults → fallback "{namespace}-{name}".
+          # {tag.X} tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
           effectiveName: >-
             ${(schema.spec.nameOverride != ""
               ? schema.spec.nameOverride
@@ -251,13 +242,13 @@ spec:
               ? "invalid-unresolved-tokens"
               : "valid"}
 
-    # ACK ELBv2 TargetGroup CR — primary cloud resource.
+    # ACK ELBv2 LoadBalancer CR — primary cloud resource.
     # No status.predictedArn: ELBv2 ARNs include a hash suffix assigned by AWS at creation.
     # Use status.ackResourceMetadata.arn at runtime.
-    - id: tg
+    - id: lb
       template:
         apiVersion: elbv2.services.k8s.aws/v1alpha1
-        kind: TargetGroup
+        kind: LoadBalancer
         metadata:
           name: ${schema.metadata.name}
           namespace: ${schema.metadata.namespace}
@@ -273,63 +264,90 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           ownerReferences:
             - apiVersion: aws.kropath.run/v1alpha1
-              kind: AWSELBTargetGroup
+              kind: ELBLoadBalancer
               name: ${schema.metadata.name}
               uid: ${schema.metadata.uid}
               controller: true
               blockOwnerDeletion: true
         spec:
-          # Cloud resource name — controlled by naming template / nameOverride (max 32 chars)
           name: ${naming.data.resourceName}
-          targetType: ${schema.spec.targetType}
-          protocol: ${schema.spec.protocol}
-          protocolVersion: ${schema.spec.protocolVersion}
-          port: ${schema.spec.port}
-          vpcID: ${schema.spec.vpcId}
-          ipAddressType: ${schema.spec.ipAddressType}
-          # Health check fields — pass-through from spec; 0 / "" means not set (AWS uses defaults).
-          # healthCheckEnabled is tri-state in schema (bare boolean, no default=false) so has() can
-          # distinguish "not set" (use AWS default) from "explicitly false" (Lambda targets only).
-          healthCheckEnabled: >-
-            ${has(schema.spec.healthCheck) && has(schema.spec.healthCheck.enabled)
-              ? schema.spec.healthCheck.enabled
-              : true}
-          healthCheckProtocol: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.protocol : ""}
-          healthCheckPort: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.port : ""}
-          healthCheckPath: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.path : ""}
-          healthCheckIntervalSeconds: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.intervalSeconds : 0}
-          healthCheckTimeoutSeconds: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.timeoutSeconds : 0}
-          healthyThresholdCount: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.healthyThresholdCount : 0}
-          unhealthyThresholdCount: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.unhealthyThresholdCount : 0}
-          # matcher: HTTP/gRPC success codes for health check responses
-          matcher:
-            httpCode: ${schema.spec.matcher.httpCode}
-            grpcCode: ${schema.spec.matcher.grpcCode}
-          # Additional target group attributes (e.g. deregistration_delay.timeout_seconds).
-          # Stickiness fields are folded in when stickiness.type is set.
+          type: ${schema.spec.type}
+          # scheme: resolved via three-tier cascade (mandatory.internalOnly → instance → defaults.internalOnly)
+          # GWLB is always internal; scheme is not set for GWLB (ACK ignores it, but we omit for clarity).
+          scheme: >-
+            ${schema.spec.type == "gateway"
+              ? ""
+              : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?internalOnly.orValue(false)
+                  ? "internal"
+                  : (schema.spec.scheme != ""
+                      ? schema.spec.scheme
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?internalOnly.orValue(false)
+                          ? "internal"
+                          : "internet-facing")))}
+          ipAddressType: >-
+            ${schema.spec.ipAddressType != "" ? schema.spec.ipAddressType : "ipv4"}
+          # Subnets: pass through user-specified IDs (mutually exclusive with subnetMappings)
+          subnets: ${schema.spec.subnets}
+          # subnetMappings: map kropath camelCase fields to ACK camelCase fields (subnetId→subnetID)
+          subnetMappings: >-
+            ${schema.spec.subnetMappings.map(m, {
+              "subnetID": m.subnetId,
+              "allocationID": m.allocationId,
+              "privateIPv4Address": m.privateIPv4Address,
+              "ipv6Address": m.ipv6Address
+            })}
+          # securityGroups: ALB and NLB only; not set for GWLB
+          securityGroups: >-
+            ${schema.spec.type != "gateway" ? schema.spec.securityGroups : []}
+          # attributes: governance-derived typed attributes followed by user additionalAttributes.
+          # Typed attributes are appended last so they take precedence over any duplicate keys
+          # in additionalAttributes (AWS apply order: last value for a key wins).
+          #
+          # Boolean governance fields (deletionProtection, crossZoneLoadBalancing, accessLogging.enabled)
+          # are declared without | default=false to support tri-state (unset/true/false).
+          # has() checks distinguish "not set" from "explicitly false".
+          #
+          # Cascade: mandatory → instance (if has()) → defaults
           attributes: >-
-            ${schema.spec.additionalAttributes.map(a, {"key": a.key, "value": a.value})
-              .concat(schema.spec.stickiness.type != ""
-                ? ([{"key": "stickiness.enabled", "value": schema.spec.stickiness.enabled ? "true" : "false"},
-                    {"key": "stickiness.type", "value": schema.spec.stickiness.type}]
-                   .concat(schema.spec.stickiness.durationSeconds != ""
-                     ? [{"key": "stickiness.lb_cookie.duration_seconds",
-                         "value": schema.spec.stickiness.durationSeconds}]
-                     : []))
-                : [])}
-          # Static target registrations.
-          targets: >-
-            ${schema.spec.targets.map(t,
-              {"id": t.id, "port": t.port, "availabilityZone": t.availabilityZone})}
+            ${schema.spec.additionalAttributes.map(a, {"key": a.key, "value": a.value}) + [
+              {"key": "deletion_protection.enabled", "value": string(
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deletionProtection.orValue(false)
+                  ? true
+                  : (has(schema.spec.deletionProtection)
+                      ? schema.spec.deletionProtection
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?deletionProtection.orValue(false))))},
+              {"key": "access_logs.s3.enabled", "value": string(
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?accessLogsEnabled.orValue(false)
+                  ? true
+                  : (has(schema.spec.accessLogging) && has(schema.spec.accessLogging.enabled)
+                      ? schema.spec.accessLogging.enabled
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?accessLogsEnabled.orValue(false))))},
+              {"key": "access_logs.s3.bucket", "value":
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?accessLogsS3Bucket.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.accessLogsS3Bucket
+                  : (has(schema.spec.accessLogging) && schema.spec.accessLogging.s3Bucket != ""
+                      ? schema.spec.accessLogging.s3Bucket
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?accessLogsS3Bucket.orValue("") : ""))},
+              {"key": "access_logs.s3.prefix", "value":
+                has(schema.spec.accessLogging) ? schema.spec.accessLogging.s3Prefix : ""},
+              {"key": "load_balancing.cross_zone.enabled", "value": string(
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?crossZoneEnabled.orValue(false)
+                  ? true
+                  : (has(schema.spec.crossZoneLoadBalancing)
+                      ? schema.spec.crossZoneLoadBalancing
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?crossZoneEnabled.orValue(false))))},
+              {"key": "idle_timeout.timeout_seconds", "value": string(
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?idleTimeoutSeconds.orValue(0) != 0
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.idleTimeoutSeconds
+                  : (schema.spec.idleTimeoutSeconds != 0
+                      ? schema.spec.idleTimeoutSeconds
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?idleTimeoutSeconds.orValue(0) != 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.idleTimeoutSeconds
+                          : 60)))}
+            ]}
           # Cloud resource tags — ACK ELBv2 uses []Tag (key/value pairs), not map[string]string.
-          # Merge order: defaults (lowest) → spec → mandatory (highest).
+          # Merge order: defaults (lowest priority) → spec → mandatory (highest priority).
+          # .transformList(k, v, {key: k, value: v}) converts merged map to ACK tag format.
           # syncedLabels and syncedAnnotations are included in cloud tags (ADR-015 §6.1).
           tags: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
