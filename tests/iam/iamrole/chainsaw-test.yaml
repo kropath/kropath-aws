@@ -1,22 +1,9 @@
-# Copyright 2026 kropath Authors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
----
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
   name: iamrole
 spec:
+  skipDelete: true
   namespace: iamrole
   steps:
     - name: seed-effective-config
@@ -167,10 +154,17 @@ spec:
         - script:
             # Order-independent tag check via jq — chainsaw's assertion engine does not
             # support CEL's .exists(); a per-item list assert would be positional and flake
-            # on CEL map-iteration order (see docs/frequent-rgd-errors.md §6).
+            # on CEL map-iteration order (see docs/frequent-rgd-errors.md §6). Poll until
+            # kro's multi-pass reconcile has merged both syncedLabel-derived tags; a one-shot
+            # read races the reconcile. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get roles.iam.services.k8s.aws lambda-role -n iamrole -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get roles.iam.services.k8s.aws lambda-role -n iamrole -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 2 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 2 ] || { echo "FAIL: expected 2 tags, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "production")' >/dev/null || { echo "FAIL: missing tag environment=production"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "team" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag team=platform"; exit 1; }
@@ -289,8 +283,20 @@ spec:
         - apply:
             file: 09-boundary-optout-role.yaml
         - script:
+            # Poll until kro has created the ACK Role child with no boundary — a one-shot
+            # read races kro's create/reconcile (and under skipDelete may read a not-yet-
+            # reconciled leftover). The opt-out RGD path always yields an empty boundary once
+            # the child exists. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              boundary="$(kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole -o jsonpath='{.spec.permissionsBoundary}')"
+              for i in $(seq 1 60); do
+                if kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole >/dev/null 2>&1; then
+                  boundary="$(kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole -o jsonpath='{.spec.permissionsBoundary}' 2>/dev/null || true)"
+                  [ -z "$boundary" ] && break
+                fi
+                sleep 1
+              done
+              boundary="$(kubectl get roles.iam.services.k8s.aws boundary-optout-role -n iamrole -o jsonpath='{.spec.permissionsBoundary}' 2>/dev/null || true)"
               test -z "$boundary"
 
         - apply:
@@ -440,9 +446,16 @@ spec:
                 name: iamrole-tags-merge-role
                 assumeRolePolicyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
         - script:
+            # Poll until kro's merge has produced all four tags — a one-shot read races the
+            # multi-pass reconcile. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get roles.iam.services.k8s.aws tags-merge-role -n iamrole -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get roles.iam.services.k8s.aws tags-merge-role -n iamrole -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 4 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 4 ] || { echo "FAIL: expected 4 tags, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag cost-centre=platform"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "mandatory")' >/dev/null || { echo "FAIL: missing tag environment=mandatory"; exit 1; }
@@ -585,16 +598,6 @@ spec:
                 namespace: iamrole
               spec:
                 name: kro222-kro222-role
-      cleanup:
-        - script:
-            content: |
-              kubectl delete iamrole kro222-role -n iamrole --ignore-not-found=true
-              kubectl delete iamconfig custom-iam-config -n iamrole --ignore-not-found=true
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # KRO-236: {tag.X} dynamic token resolution in namingTemplate for IAMRole.
-    # ──────────────────────────────────────────────────────────────────────────
-
     - name: kro236-iamrole-tag-token-resolved-from-spec-tags
       try:
         - apply:
@@ -659,12 +662,6 @@ spec:
               status:
                 resourceName: iamrole-kro236-tag-role-platform
                 namingStatus: valid
-      cleanup:
-        - script:
-            content: |
-              kubectl delete iamrole kro236-tag-role -n iamrole --ignore-not-found=true
-              kubectl delete iamconfig kro236-role-tag-config -n iamrole --ignore-not-found=true
-
     - name: kro236-iamrole-tag-token-unresolved-invalid-status
       try:
         - apply:
@@ -718,12 +715,6 @@ spec:
                 namespace: iamrole
               status:
                 namingStatus: invalid-unresolved-tokens
-      cleanup:
-        - script:
-            content: |
-              kubectl delete iamrole kro236-missing-tag-role -n iamrole --ignore-not-found=true
-              kubectl delete iamconfig kro236-role-missing-tag-config -n iamrole --ignore-not-found=true
-
     - name: kro236-iamrole-mandatory-tag-overrides-spec-tag
       try:
         - apply:
@@ -789,8 +780,3 @@ spec:
               status:
                 resourceName: iamrole-kro236-mandatory-tag-role-mandatory-team
                 namingStatus: valid
-      cleanup:
-        - script:
-            content: |
-              kubectl delete iamrole kro236-mandatory-tag-role -n iamrole --ignore-not-found=true
-              kubectl delete iamconfig kro236-role-mandatory-tag-config -n iamrole --ignore-not-found=true

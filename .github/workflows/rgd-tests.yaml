@@ -18,6 +18,11 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "rgds/**"
+      - "crds/**"
+      - "tests/**"
+      - ".github/workflows/**"
   pull_request:
     paths:
       - "rgds/**"
@@ -36,6 +41,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history so tests/select-tests.sh can diff against the base commit
+          # to determine which resource families actually changed.
+          fetch-depth: 0
 
       # kind runs via Docker on ubuntu-latest — no remote cluster or cloud credentials needed.
       # Single-node control-plane uses under 2 GB of the 7 GB runner RAM.
@@ -55,9 +64,33 @@ jobs:
       - name: Run Chainsaw E2E tests
         run: |
           (cd tests && make chainsaw-e2e)
-      - name: Run tests
+
+      - name: Select tests for changed files
+        id: select
+        env:
+          # github.event.before/after cover the delta of THIS push only (present for
+          # push events, and for pull_request "synchronize" — every push after the
+          # first). pull_request.base.sha is the merge-base with the target branch,
+          # which only makes sense on a PR's very first run ("opened"/"reopened") —
+          # using it on every run would accumulate the whole PR's diff forever, so it
+          # must be the fallback, not the primary. Order here matters: `before` must
+          # be checked first, since pull_request.base.sha is always non-empty and
+          # would otherwise short-circuit it out on every run.
+          BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          (cd tests && make test)
+          targets=$(tests/select-tests.sh)
+          echo "targets=${targets}" >> "$GITHUB_OUTPUT"
+          if [ -z "${targets}" ]; then
+            echo "No resource-family changes detected in rgds/crds/tests — skipping per-service suites."
+          else
+            echo "Running: ${targets}"
+          fi
+
+      - name: Run tests
+        if: steps.select.outputs.targets != ''
+        run: |
+          (cd tests && make ${{ steps.select.outputs.targets }})
 
       # - name: Install kro operator (pinned v0.9.2)
       #   run: |

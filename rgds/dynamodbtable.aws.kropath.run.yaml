@@ -1,0 +1,385 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: dynamodbtable.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: DynamoDBTable
+    scope: Namespaced
+    spec:
+      # Standard governance fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Required table structure — keySchema and localSecondaryIndexes are immutable after creation
+      attributeDefinitions: "[]AttributeDefinition | required=true"
+      keySchema: "[]KeySchema | required=true"
+      # Billing mode — "" defers to governance cascade (default: PAY_PER_REQUEST)
+      billingMode: string | default=""
+      provisionedThroughput:
+        readCapacityUnits: integer | default=0
+        writeCapacityUnits: integer | default=0
+      # On-demand capacity caps — only meaningful when billingMode is PAY_PER_REQUEST
+      onDemandThroughput:
+        maxReadRequestUnits: integer | default=0
+        maxWriteRequestUnits: integer | default=0
+      # Encryption — enabled is a boolean sentinel (no default) so has() detects if set
+      encryption:
+        enabled: boolean
+        kmsMasterKeyId: string | default=""
+      # Deletion protection — boolean sentinel (no default)
+      deletionProtectionEnabled: boolean
+      # Point-in-time recovery — boolean sentinel (no default)
+      pointInTimeRecoveryEnabled: boolean
+      # Table class — "" defers to governance cascade (default: STANDARD)
+      tableClass: string | default=""
+      # Contributor insights action — "ENABLE" | "DISABLE" | "" (no-op)
+      contributorInsights: string | default=""
+      # DynamoDB Streams
+      streamSpecification:
+        streamEnabled: boolean | default=false
+        streamViewType: string | default=""
+      # Time-to-Live
+      timeToLive:
+        attributeName: string | default=""
+        enabled: boolean | default=false
+      # Local secondary indexes (immutable after creation)
+      localSecondaryIndexes: "[]LocalSecondaryIndex | default=[]"
+      # Global secondary indexes
+      globalSecondaryIndexes: "[]GlobalSecondaryIndex | default=[]"
+      # Resource policy document reference (optional PolicyDocument CR name)
+      resourcePolicyRef: string | default=""
+    types:
+      AttributeDefinition:
+        attributeName: string | required=true
+        attributeType: string | required=true
+      KeySchema:
+        attributeName: string | required=true
+        keyType: string | required=true
+      LocalSecondaryIndex:
+        indexName: string | required=true
+        keySchema: "[]KeySchema"
+        projection:
+          projectionType: string | default=ALL
+          nonKeyAttributes: "[]string | default=[]"
+      GlobalSecondaryIndex:
+        indexName: string | required=true
+        keySchema: "[]KeySchema"
+        projection:
+          projectionType: string | default=ALL
+          nonKeyAttributes: "[]string | default=[]"
+        provisionedThroughput:
+          readCapacityUnits: integer | default=0
+          writeCapacityUnits: integer | default=0
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{")
+          ? "arn:aws:dynamodb:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":table/" + naming.data.resourceName
+          : ""}
+      tableArn: >-
+        ${ackTable.?status.?ackResourceMetadata.?arn.orValue("")}
+      conditions: >-
+        ${ackTable.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: DynamoDBConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Resource policy document lookup (optional PolicyDocument CR).
+    # Sentinel pattern: when resourcePolicyRef is empty, selector never matches and policyDoc is [].
+    - id: policyDoc
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: PolicyDocument
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.resourcePolicyRef != "" ? schema.spec.resourcePolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap to materialise resourceName and namingStatus.
+    # Computed here so the status block can reference naming.data.* without requiring schema.* access
+    # (schema is out of scope in the status block — see frequent-rgd-errors.md section 3).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: dynamodbtable-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # resourceName: base name with full {tag.X} dynamic substitution support.
+          # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+          # Any {tag.X} token whose key is absent in all tiers is kept verbatim so namingStatus
+          # (computed below from resourceName) reports "invalid-unresolved-tokens".
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK DynamoDB Table CR — primary cloud resource.
+    # Only created when resourceName has no unresolved {tag.X} tokens.
+    - id: ackTable
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+      template:
+        apiVersion: dynamodb.services.k8s.aws/v1alpha1
+        kind: Table
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: DynamoDBTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          tableName: ${naming.data.resourceName}
+          # Key schema and attribute definitions — passed through verbatim; keySchema is immutable
+          attributeDefinitions: ${schema.spec.attributeDefinitions}
+          keySchema: ${schema.spec.keySchema}
+          # Billing mode — mandatory -> instance -> defaults -> built-in fallback (PAY_PER_REQUEST)
+          billingMode: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?billingMode.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.billingMode
+              : (schema.spec.billingMode != ""
+                  ? schema.spec.billingMode
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?billingMode.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.billingMode
+                      : "PAY_PER_REQUEST"))}
+          # Provisioned capacity — only meaningful when billingMode is PROVISIONED
+          provisionedThroughput:
+            readCapacityUnits: >-
+              ${schema.spec.provisionedThroughput.readCapacityUnits > 0
+                ? schema.spec.provisionedThroughput.readCapacityUnits
+                : 0}
+            writeCapacityUnits: >-
+              ${schema.spec.provisionedThroughput.writeCapacityUnits > 0
+                ? schema.spec.provisionedThroughput.writeCapacityUnits
+                : 0}
+          # On-demand capacity caps — only meaningful when billingMode is PAY_PER_REQUEST.
+          # Passed through verbatim from instance spec (>0 guard mirrors provisionedThroughput).
+          onDemandThroughput:
+            maxReadRequestUnits: >-
+              ${schema.spec.onDemandThroughput.maxReadRequestUnits > 0
+                ? schema.spec.onDemandThroughput.maxReadRequestUnits
+                : 0}
+            maxWriteRequestUnits: >-
+              ${schema.spec.onDemandThroughput.maxWriteRequestUnits > 0
+                ? schema.spec.onDemandThroughput.maxWriteRequestUnits
+                : 0}
+          # SSE — boolean sentinel cascade; has() always returns true for bare booleans so
+          # use OR logic: mandatory(true) || instance(true) || defaults(true) → enabled.
+          sseSpecification:
+            enabled: >-
+              ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.encryptionEnabled)
+                || schema.spec.?encryption.?enabled.orValue(false)
+                || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.encryptionEnabled)}
+            sseType: >-
+              ${((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.encryptionEnabled)
+                || schema.spec.?encryption.?enabled.orValue(false)
+                || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.encryptionEnabled))
+                ? "KMS" : ""}
+            kmsMasterKeyID: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsMasterKeyId.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsMasterKeyId
+                : (schema.spec.encryption.kmsMasterKeyId != ""
+                    ? schema.spec.encryption.kmsMasterKeyId
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsMasterKeyId.orValue("") : ""))}
+          # Deletion protection — boolean sentinel cascade (OR logic; see SSE comment above)
+          deletionProtectionEnabled: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.deletionProtectionEnabled)
+              || schema.spec.?deletionProtectionEnabled.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.deletionProtectionEnabled)}
+          # Point-in-time recovery — boolean sentinel cascade (OR logic; see SSE comment above)
+          continuousBackups:
+            pointInTimeRecoveryEnabled: >-
+              ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.pointInTimeRecoveryEnabled)
+                || schema.spec.?pointInTimeRecoveryEnabled.orValue(false)
+                || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.pointInTimeRecoveryEnabled)}
+          # Table class — mandatory -> instance -> defaults -> built-in fallback (STANDARD)
+          tableClass: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?tableClass.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.tableClass
+              : (schema.spec.tableClass != ""
+                  ? schema.spec.tableClass
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?tableClass.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.tableClass
+                      : "STANDARD"))}
+          # Contributor insights action — mandatory -> instance -> defaults
+          contributorInsights: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?contributorInsights.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.contributorInsights
+              : (schema.spec.contributorInsights != ""
+                  ? schema.spec.contributorInsights
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?contributorInsights.orValue("") : ""))}
+          # Streams — passed through verbatim from instance spec
+          streamSpecification:
+            streamEnabled: ${schema.spec.streamSpecification.streamEnabled}
+            streamViewType: ${schema.spec.streamSpecification.streamViewType}
+          # Time-to-Live — passed through verbatim from instance spec
+          timeToLive:
+            attributeName: ${schema.spec.timeToLive.attributeName}
+            enabled: ${schema.spec.timeToLive.enabled}
+          # Local secondary indexes (immutable after creation) — passed through verbatim
+          localSecondaryIndexes: ${schema.spec.localSecondaryIndexes}
+          # Global secondary indexes — passed through verbatim
+          globalSecondaryIndexes: ${schema.spec.globalSecondaryIndexes}
+          # Resource policy — JSON string from PolicyDocument CR when resourcePolicyRef is set
+          resourcePolicy: >-
+            ${schema.spec.resourcePolicyRef != "" && policyDoc.size() > 0
+              ? policyDoc[0].spec.documentJSON
+              : ""}
+          # Cloud resource tags — ACK DynamoDB Table spec.tags is array<{key, value}> (not map).
+          # Merge order: defaults -> instance spec -> mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 section 6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}

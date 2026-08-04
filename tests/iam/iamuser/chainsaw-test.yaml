@@ -17,13 +17,15 @@ kind: Test
 metadata:
   name: iamuser
 spec:
+  # Canonical pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+  # skipDelete"): unique user name per step, delete nothing between steps; skipDelete stops
+  # chainsaw's end-of-test cascade delete. No ACK controllers run, so deleting a kro IAMUser
+  # (→ ACK User child) would hang on the never-cleared finalizer.
+  skipDelete: true
   namespace: iamuser
   steps:
     - name: seed-effective-config
       try:
-        - script:
-            content: |
-              kubectl delete iamconfig user-general-policy -n iamuser --ignore-not-found=true
         - apply:
             file: 00-iamconfig.yaml
         - script:
@@ -125,9 +127,6 @@ spec:
     # AC-4: namespace-local IAMConfig with mandatory.blockIamUserAccessKeys=true suppresses access key
     - name: ac4-namespace-local-block
       try:
-        - script:
-            content: |
-              kubectl delete iamconfig namespace-strict-policy -n iamuser --ignore-not-found=true
         - apply:
             file: 15-namespace-strict-config.yaml
         - script:
@@ -306,9 +305,17 @@ spec:
               spec:
                 name: iamuser-tags-user
         - script:
+            # Poll until kro's multi-pass reconcile has merged mandatory + spec tags — a
+            # one-shot read races the spec-tags-first pass (only team=ops) before the
+            # mandatory tag (cost-centre) lands. timeout padded for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get user tags-user -n iamuser -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get user tags-user -n iamuser -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 2 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 2 ] || { echo "FAIL: expected 2 tags, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "platform")' >/dev/null || { echo "FAIL: missing tag cost-centre=platform"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "team" and .value == "ops")' >/dev/null || { echo "FAIL: missing tag team=ops"; exit 1; }
@@ -340,9 +347,17 @@ spec:
               spec:
                 name: iamuser-synced-labels-user
         - script:
+            # Poll until kro's reconcile has projected the syncedLabel into cloud tags — a
+            # one-shot read can catch an intermediate empty/partial tag set. timeout padded
+            # for --parallel load.
+            timeout: 3m
             content: |
-              TAGS=$(kubectl get user synced-labels-user -n iamuser -o json | jq -c '.spec.tags')
-              COUNT=$(echo "$TAGS" | jq 'length')
+              for i in $(seq 1 60); do
+                TAGS=$(kubectl get user synced-labels-user -n iamuser -o json | jq -c '.spec.tags')
+                COUNT=$(echo "$TAGS" | jq 'length')
+                [ "$COUNT" -eq 1 ] && break
+                sleep 1
+              done
               [ "$COUNT" -eq 1 ] || { echo "FAIL: expected 1 tag, got $COUNT: $TAGS"; exit 1; }
               echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "production")' >/dev/null || { echo "FAIL: missing tag environment=production"; exit 1; }
 
@@ -428,11 +443,6 @@ spec:
               status:
                 resourceName: iamuser-kro236-tag-user-platform
                 namingStatus: valid
-      cleanup:
-        - script:
-            content: |
-              kubectl delete iamuser kro236-tag-user -n iamuser --ignore-not-found=true
-              kubectl delete iamconfig kro236-user-tag-config -n iamuser --ignore-not-found=true
 
     - name: kro236-iamuser-tag-token-unresolved-invalid-status
       try:
@@ -482,11 +492,6 @@ spec:
                 namespace: iamuser
               status:
                 namingStatus: invalid-unresolved-tokens
-      cleanup:
-        - script:
-            content: |
-              kubectl delete iamuser kro236-missing-tag-user -n iamuser --ignore-not-found=true
-              kubectl delete iamconfig kro236-user-missing-tag-config -n iamuser --ignore-not-found=true
 
     - name: kro236-iamuser-mandatory-tag-overrides-spec-tag
       try:
@@ -548,8 +553,3 @@ spec:
               status:
                 resourceName: iamuser-kro236-mandatory-tag-user-mandatory-team
                 namingStatus: valid
-      cleanup:
-        - script:
-            content: |
-              kubectl delete iamuser kro236-mandatory-tag-user -n iamuser --ignore-not-found=true
-              kubectl delete iamconfig kro236-user-mandatory-tag-config -n iamuser --ignore-not-found=true

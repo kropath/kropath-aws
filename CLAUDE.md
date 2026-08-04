@@ -9,6 +9,24 @@ Every session, before editing any RGD, CRD, or test file:
 
 Skipping this will cause you to re-discover known traps and revert known-good patterns.
 
+> **Canonical chainsaw test structure (REQUIRED as of 2026-08-04):** every suite uses a
+> **unique resource name per step** and **`spec.skipDelete: true`** (also the global default
+> in `.chainsaw.yaml`), and deletes **nothing** between steps — see `docs/frequent-rgd-errors.md`
+> §"CANONICAL: Unique-Name-Per-Step + `skipDelete`". All 24 suites have been migrated to this
+> pattern; `tests/dynamodb/dynamodbtable/chainsaw-test.yaml` is the reference. This supersedes
+> the older delete-then-recreate / `--wait=false` / finalizer-strip / per-step-cleanup /
+> `purge-stale-leftovers` / poll-script workarounds — they fought the fact that the test
+> cluster has kro but **no ACK controllers**, so ACK finalizers are never removed and any
+> delete of an ACK child hangs. When writing or fixing a suite, follow the canonical pattern
+> FIRST; do not reintroduce inter-step deletes for ACK-child resources.
+>
+> Two carve-outs remain: (1) a **shared governance config CR** (`IAMConfig`, `S3BucketConfig`,
+> …) that a suite re-patches across steps may still be `kubectl delete`+recreated to reset it —
+> config CRs are not ACK resources and have no finalizer, so their delete never hangs; prefer,
+> though, giving each step its own uniquely-named config. (2) A genuine **lifecycle test** that
+> mutates one resource across steps (e.g. deletion-policy retain→delete on the same Role) keeps
+> the single resource by design; unique-per-step names do not apply there.
+
 ## This Repo
 
 **kropath-aws** — ACK-based CRDs and kro RGDs for AWS resources.
@@ -72,6 +90,10 @@ All gotchas in the list above apply when authoring new resources, not just when 
 
 **Writing test cases — mandatory rules:**
 
+- **Canonical pattern FIRST (see the Session-Bootstrap note above):** unique resource name per
+  step, `spec.skipDelete: true`, and NO inter-step deletes/`cleanup:`/`finally:`/finalizer-strips
+  for ACK-child resources. The `purge-stale-leftovers` / config-reset rules below apply ONLY to
+  shared governance **config CRs** (no ACK finalizer) or genuine single-resource lifecycle tests.
 - **`effectiveConfig` must always include both `mandatory` AND `defaults`** — omitting either tier causes a `no such key: <tier>` CEL error at runtime (CEL's `has(a.b.c)` fails when the intermediate key `b` is absent). Always include all three sub-objects: `mandatory`, `defaults`, and `aws`.
 - **Never assert a CEL-generated list by exact position — and note that chainsaw has NO working declarative order-independent list construct for this.** Any list field produced by a CEL `.merge().transformList()` chain (ACK `spec.tags`, S3 `spec.tagging`, KMS `tagKey`/`tagValue` tags, etc.) has map-derived iteration order that is not guaranteed stable across runs. Two patterns that look like fixes are NOT: a per-item list assert (`tags: - (key == 'x'): true`) is still positional (chainsaw pairs assert-item `[i]` with actual-item `[i]`, no cross-position search); a whole-array CEL `.exists()` check (`(tags.exists(t, ...)): true`) fails outright with `Internal error: unknown function: exists` because chainsaw's assertion engine is JMESPath-style (kyverno-json), not full CEL. Both were tried and confirmed broken via real CI failures. **Use a `- script:` step with `kubectl ... -o json | jq` instead** — plain shell, genuinely order-independent. See `docs/frequent-rgd-errors.md` §6 "Flaky List/Array Asserts — CEL Map-to-List Transforms Have Unstable Order" for the working jq pattern. Exception: lists that echo raw user input verbatim (e.g. `allowedKeySpecs`, `policies` ARNs) are apply-order-stable and may use plain positional asserts.
 - **Purge step must delete every resource tier the test owns** — if a test uses both `AWSKropathConfig` and `IAMConfig`, both must appear in `purge-stale-leftovers`. Omitting one tier leaves stale state that makes the test appear to pass in isolation while masking a wrong assert.

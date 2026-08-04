@@ -25,8 +25,7 @@
 
 set -euo pipefail
 
-ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb rds sns sqs secretsmanager eks ecr cloudwatch}"
-ACK_CHART_VERSION="${ACK_CHART_VERSION:-}"
+ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb rds sns sqs secretsmanager eks ecr cloudwatch elbv2}"
 SKIP_ACK="${SKIP_ACK:-false}"
 SKIP_KCC="${SKIP_KCC:-true}"
 SKIP_ASO="${SKIP_ASO:-true}"
@@ -37,11 +36,6 @@ ACK_NAMESPACE="ack-system"
 resolve_ack_chart_version() {
   local svc="$1"
 
-  if [[ -n "${ACK_CHART_VERSION}" ]]; then
-    echo "${ACK_CHART_VERSION}"
-    return 0
-  fi
-
   curl -fsSL "https://api.github.com/repos/aws-controllers-k8s/${svc}-controller/releases/latest" \
     | jq -r '.tag_name | ltrimstr("v")'
 }
@@ -51,15 +45,17 @@ if [ "${SKIP_ACK}" = "false" ]; then
   echo "Installing ACK CRDs (services: ${ACK_SERVICES})..."
   kubectl create namespace "${ACK_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
+  mkdir -p "tmp"
   for service in ${ACK_SERVICES}; do
     version=$(resolve_ack_chart_version "${service}")
     echo "  -> ACK ${service}..."
+
     # Extract CRDs only from the Helm chart (no controller pod required locally).
-    helm show crds "oci://${ACK_REGISTRY}/${service}-chart" \
-      --version "${version}" 2>/dev/null \
-      | kubectl apply --server-side -f - \
-      || echo "    WARNING: Could not install ACK CRDs for ${service} — chart may not exist at this version."
+    helm pull "oci://${ACK_REGISTRY}/${service}-chart" \
+      --version "${version}" --untar --untardir tmp/
+    kubectl apply --server-side -f "tmp/${service}-chart/crds" || echo "    WARNING: Could not install ACK CRDs for ${service} — chart may not exist at this version."
   done
+  rm -rf tmp
   echo "ACK CRDs installed."
 else
   echo "Skipping ACK CRDs (SKIP_ACK=true)."

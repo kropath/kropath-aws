@@ -31,7 +31,7 @@ chainsaw test ./tests/chainsaw/
 
 `hack/setup-local.sh` performs the following steps in order:
 
-1. **Creates the Kind cluster** `kro-aws` using `hack/kind-config.yaml`.
+1. **Creates the Kind cluster** `kropath-aws` using `hack/kind-config.yaml`.
 2. **Installs [kro](https://github.com/awslabs/kro)** via Helm from the official OCI registry.
 3. **Applies kropath CRDs** from `crds/` (if the directory exists).
 4. **Installs provider CRDs** via `hack/install-provider-crds.sh`.
@@ -52,21 +52,21 @@ chainsaw test ./tests/chainsaw/
 
 The cluster is defined in `hack/kind-config.yaml`:
 
-- **Name**: `kro-aws`
+- **Name**: `kropath-aws`
 - **Topology**: 1 control-plane node + 2 worker nodes
-- **Context**: `kind-kro-aws`
+- **Context**: `kind-kropath-aws`
 - **Port mappings**: `18080->80`, `18443->443` for ingress testing
 
 To create or recreate the cluster manually:
 
 ```bash
-kind create cluster --name kro-aws --config hack/kind-config.yaml
+kind create cluster --name kropath-aws --config hack/kind-config.yaml
 ```
 
 To delete it:
 
 ```bash
-kind delete cluster --name kro-aws
+kind delete cluster --name kropath-aws
 ```
 
 ## Provider CRD Installation
@@ -113,7 +113,7 @@ chainsaw test ./tests/chainsaw/
 chainsaw test ./tests/chainsaw/smoke/
 
 # Override the cluster context
-chainsaw test ./tests/chainsaw/ --kube-context kind-kro-aws
+chainsaw test ./tests/chainsaw/ --kube-context kind-kropath-aws
 
 # Increase verbosity for debugging
 chainsaw test ./tests/chainsaw/ --verbose
@@ -160,9 +160,9 @@ The ACK service may not have a published chart at the version specified. Set `AC
 
 ### Cluster already exists
 
-`setup-local.sh` skips cluster creation if `kro-aws` already exists. To start fresh:
+`setup-local.sh` skips cluster creation if `kropath-aws` already exists. To start fresh:
 
 ```bash
-kind delete cluster --name kro-aws
+kind delete cluster --name kropath-aws
 ./hack/setup-local.sh
 ```
