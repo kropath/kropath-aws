@@ -49,6 +49,45 @@ This document tracks technical friction points, syntax limitations, and runtime 
 
 ---
 
+### List Concatenation Uses the `+` Operator — kro's CEL Has No `.concat()`
+
+* **What Fails:** Appending one list to another with a `.concat()` method call. kro's CEL environment does **not** register a `concat` function, so the RGD never compiles:
+    ```yaml
+    # ❌ RGD stays Inactive — kro rejects it at validation time
+    attributes: >-
+      ${schema.spec.additionalAttributes.map(a, {"key": a.key, "value": a.value})
+        .concat(schema.spec.stickiness.type != ""
+          ? [{"key": "stickiness.enabled", "value": schema.spec.stickiness.enabled ? "true" : "false"}]
+          : [])}
+    ```
+  The RGD's `Ready`/`GraphAccepted` condition reports:
+    ```
+    failed to validate resource "tg": failed to compile template expression "...": ERROR: <input>:2:10: undeclared reference to 'concat' (in container '')
+    Reason: InvalidResourceGraph
+    State:  Inactive
+    ```
+
+* **Why it is dangerous:** An `Inactive` RGD is silent in normal use, but the CI `setup` step waits for **every** RGD to become `Ready` (`kubectl wait ... --for=condition=... resourcegraphdefinition --all`). One RGD stuck `Inactive` makes that wait **time out**, and — because the wait is over all RGDs at once — the failure log lists *every* RGD as "timed out waiting for the condition", masking which one is actually broken. The real culprit is only visible via `kubectl describe rgd <name>` → look for `Reason: InvalidResourceGraph`. Symptom seen in CI: `make: *** [Makefile:20: setup] Error 1` with a wall of unrelated-looking RGD timeouts.
+
+* **What Works Instead:** Use the CEL `+` operator, which concatenates lists (and works for the nested case too):
+    ```yaml
+    # ✅ compiles; RGD reaches Active
+    attributes: >-
+      ${schema.spec.additionalAttributes.map(a, {"key": a.key, "value": a.value})
+        + (schema.spec.stickiness.type != ""
+          ? ([{"key": "stickiness.enabled", "value": schema.spec.stickiness.enabled ? "true" : "false"},
+              {"key": "stickiness.type", "value": schema.spec.stickiness.type}]
+             + (schema.spec.stickiness.durationSeconds != ""
+               ? [{"key": "stickiness.lb_cookie.duration_seconds", "value": schema.spec.stickiness.durationSeconds}]
+               : []))
+          : [])}
+    ```
+  Note: `+` concatenates *positionally* — it does **not** deduplicate keys. For cross-tier tag/label maps where later tiers must overwrite earlier ones, do **not** use `+` on transformed lists; merge maps first and `.transformList()` last (see "Cross-Tier Tag/Label Merge — Prefer Map Merge Over List Concatenation" in §4). Use `+` only when you genuinely want to append list segments that carry no key-uniqueness contract (e.g. folding optional stickiness attributes onto a passthrough attribute list).
+
+* **First move when an RGD is `Inactive`:** `kubectl describe rgd <name>.aws.kropath.run` and read the `GraphAccepted`/`Ready` condition `Message` — it quotes the exact CEL expression and column where compilation failed. Do not trust the CI "timed out on all RGDs" wall; describe the RGDs to find the one with `InvalidResourceGraph`.
+
+---
+
 ## 3. Top-Level Status Scoping Constraints
 
 ### Scope Tracking of `schema` and `instance` Tokens
