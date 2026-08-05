@@ -813,3 +813,60 @@ This document tracks technical friction points, syntax limitations, and runtime 
   with `schema not found`; missing (2) → child never created, `forbidden` in instance status.
 
 ---
+
+### kro Simple-Schema Has No `number` Type — Use `float` for Floating-Point Fields
+
+* **What Fails:** An RGD schema field declared `myField: number` (e.g. `serverlessV2ScalingMinCapacity: number | default=0`) makes the RGD stuck `Inactive`/`GraphAccepted=False`:
+    ```
+    failed to build OpenAPI schema for instance: field serverlessV2ScalingMinCapacity: unknown type: number
+    ```
+* **Why:** kro v0.9.2 simple-schema recognizes exactly four atomic scalar types — `string`, `integer`, `boolean`, `float` (source: `pkg/simpleschema/types/atomic.go`). `number` is **not** one of them, even though it is the OpenAPI wire type. `float` is what maps to the OpenAPI `number` type internally (`float` in → `type: number` out in the generated CRD).
+* **What Works Instead:** Declare floating-point governance fields as `float`:
+    ```yaml
+    serverlessV2ScalingMinCapacity: float | default=0
+    serverlessV2ScalingMaxCapacity: float | default=0
+    ```
+* **The cascade trap this creates in `setup.sh`:** `setup.sh` ends with `kubectl wait rgd --all --for=condition=Ready --timeout=120s`. **One** `Inactive` RGD makes that single `wait` time out, and the timeout message lists **every** RGD not yet `Ready` at the 120s mark — typically the alphabetically-last ones (`s3bucket`, `secretsmanager`, `sns`, `sqs`, …) that simply had not finished reconciling. Those are **red herrings**: the only broken RGD is the `Inactive` one. Always `kubectl get rgd` and look for `STATE=Inactive` first; do not chase the RGDs merely listed in the `wait` timeout. Confirm the real cause with `kubectl get rgd <name> -o jsonpath='{.status.conditions}'` (look for `reason: InvalidResourceGraph`).
+
+### Config-CRD Mutual-Exclusion `x-kubernetes-validations` Broken by Non-Zero `spec.defaults` CRD Defaults
+
+* **What Fails:** A governance config CRD (`<Service>Config`) has both (a) `spec.mandatory` / `spec.defaults` tiers with per-field CRD `default:` values, and (b) mutual-exclusion validation rules like *"`storageEncrypted` cannot be set in both mandatory and defaults simultaneously"*. A **minimal, legitimate** config — e.g. `spec.mandatory.storageEncrypted: true` plus any `spec.defaults` field (say `namingTemplate`) — is rejected at CREATE:
+    ```
+    RDSConfig "in2-cfg" is invalid: <nil>: Invalid value: storageEncrypted cannot be set in both mandatory and defaults simultaneously.
+    ```
+* **Why:** This is the value-guarded cousin of "[Boolean Field Presence Check (`has()`) Broken by CRD Defaults](#boolean-field-presence-check-has-broken-by-crd-defaults)". The rules are value-guarded (`&& defaults.X == true`), so a mandatory field colliding with a materialized **zero-value** default (`false`/`""`/`0`) is fine. But when the `spec.defaults` tier carries **non-zero "secure baseline" defaults** (`storageEncrypted: true`, `backupRetentionPeriod: 7`, `storageType: "gp3"`, `namingTemplate: "{namespace}-{name}"`, …), merely creating any `spec.defaults` object makes the apiserver materialize `defaults.storageEncrypted: true` — which then collides with an explicit `mandatory.storageEncrypted: true` and trips the rule. CRD-schema defaults on a tier are **fundamentally incompatible** with a cross-tier mutual-exclusion contract: you could never put a field in `mandatory` because the same field auto-materializes `true` in `defaults`.
+* **What Works Instead:** Remove **all scalar `default:` values** from `spec.mandatory` and `spec.defaults` (keep the `default: {}` on the tier objects and on `tags`/`syncedLabels`/`syncedAnnotations` maps). Then `has()`/materialization reflects true admin intent, the mutual-exclusion rules only fire when the admin **explicitly** sets both tiers, and both the negative tests (explicit dual-tier → rejected) and the positive cascade tests (single-tier → accepted) pass. The `status.effectiveConfig` tiers (consumed by the RGD, and in tests patched manually) must **never** carry defaults either.
+
+### Numeric (`float`) Instance-Spec Values Must Be Unquoted in Test Fixtures
+
+* **What Fails:** After changing an RGD schema field to `float` (OpenAPI `number`), a test fixture that passes a **quoted** value fails at CREATE of the instance/child:
+    ```
+    RDSCluster "cl7-cluster" is invalid: spec.serverlessV2ScalingMinCapacity: Invalid value: "string": ... must be of type number: "string"
+    ```
+* **Why:** `serverlessV2ScalingMinCapacity: "0.5"` is a YAML **string**, not a number. A `number`-typed field rejects it.
+* **What Works Instead:** Write numeric literals unquoted — `serverlessV2ScalingMinCapacity: 0.5`. **Do not confuse this with** the "[YAML 1.1 Boolean Coercion](#yaml-11-boolean-coercion-of-single-letterword-field-values-the-norway-problem)" / *"quote inline CEL ternary YAML values"* rules — those apply to **CEL expression strings** in the RGD YAML (where a bare `${...}` starting with a special char must be quoted), never to plain numeric literals in instance fixtures.
+
+### A `- script:` Querying a kro Child Must Be Preceded by an `- assert:` on That Child
+
+* **What Fails:** A chainsaw step does `- apply:` (the kro instance CR) immediately followed by a `- script:` that runs `kubectl get <child> ... | jq`. The script races the kro reconciler and reads the child before it exists:
+    ```
+    === STDERR
+    Error from server (NotFound): dbinstances.rds.services.k8s.aws "in16-inst" not found
+    === ERROR
+    exit status 4
+    ```
+* **Why:** `- script:` steps run **once** with no retry. `- assert:` steps, by contrast, retry until `AssertTimeout` (5m). A bare script has no wait, so it fires the instant the apply returns — before kro has generated the child.
+* **What Works Instead:** Insert a minimal `- assert:` on the child (any stable field, e.g. `spec.engine`) between the `- apply:` and the `- script:`. Chainsaw blocks on the assert until the child materializes, then the order-independent `jq` checks run against a real object:
+    ```yaml
+    - apply: { resource: { kind: RDSInstance, ... } }
+    - assert:
+        resource:
+          apiVersion: rds.services.k8s.aws/v1alpha1
+          kind: DBInstance
+          metadata: { name: in16-inst, namespace: rdsinstance }
+          spec: { engine: mysql }
+    - script: { content: "kubectl get dbinstance in16-inst ... | jq ..." }
+    ```
+  Two related fixture bugs surface in the same steps: (1) **synced labels carry the `aws.kropath.run/` prefix** — assert `.metadata.labels["aws.kropath.run/team"]`, never bare `kropath.run/team`; (2) **advisory ConfigMaps are named `${schema.metadata.name}-<suffix>`** (e.g. `in21-inst-password-exclusion-error`), not the bare instance name — assert the full generated name.
+
+---

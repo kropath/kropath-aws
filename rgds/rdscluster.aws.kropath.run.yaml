@@ -1,0 +1,502 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+# RDSCluster RGD
+#
+# Composes: rds.services.k8s.aws/DBCluster (ACK RDS Controller v1.10.2)
+# ACK CRD cache: docs/crd-cache/aws/rds-controller-v1.10.2.md §DBCluster
+#
+# Governance cascade (13 standard fields + 3 cluster-only via RDSConfig effectiveConfig — ADR-010):
+#   storageEncrypted, kmsKeyID, deletionProtection, backupRetentionPeriod,
+#   publiclyAccessible, storageType, autoMinorVersionUpgrade,
+#   copyTagsToSnapshot, performanceInsightsEnabled, enableIAMDatabaseAuthentication,
+#   manageMasterUserPassword, namingTemplate,
+#   + serverlessV2ScalingMinCapacity, serverlessV2ScalingMaxCapacity, backtrackWindow (cluster-only).
+#
+# NOTE: multiAZ is NOT in ACK DBCluster.spec — omitted (cluster multi-AZ is determined
+# by availabilityZones count / dbClusterInstanceClass, not a spec boolean).
+#
+# Boolean pointer fields (OR logic — any "true" tier wins):
+#   storageEncrypted, deletionProtection, autoMinorVersionUpgrade, copyTagsToSnapshot,
+#   enableIAMDatabaseAuthentication, manageMasterUserPassword, enablePerformanceInsights.
+#
+# publiclyAccessible uses has() check (mandatory false = forced private-only, Multi-AZ DB cluster).
+#
+# backupRetentionPeriod uses minimum-floor semantics:
+#   max(effCfg.mandatory.backupRetentionPeriod, spec.backupRetentionPeriod) (OD-3).
+#
+# Cluster-only governance fields:
+#   serverlessV2ScalingMinCapacity / MaxCapacity — double, 0.0 sentinel = "not set".
+#   backtrackWindow — integer, 0 sentinel = "not set" (Aurora MySQL backtrack seconds).
+#
+# ACK DBCluster.spec.performanceInsightsEnabled is named enablePerformanceInsights.
+# Governance key performanceInsightsEnabled maps to ACK field enablePerformanceInsights.
+#
+# Tags: ACK DBCluster spec.tags is array<{key, value}> (not map — planning doc line 382 incorrect).
+#   Converted via .transformList(k, v, {"key": k, "value": v}).
+#
+# Cloud resource name: ACK DBCluster.spec.dbClusterIdentifier = effectiveName.
+# Predicted ARN format: arn:aws:rds:<region>:<accountId>:cluster/<effectiveName>
+#
+# masterUserPassword (G-1): SecretKeyReference passthrough via schema.spec.masterUserPassword.
+#   Verify kro supports SecretKeyReference object passthrough in local cluster before PR merge.
+#
+# IN-21 mutual exclusion (masterUserPassword vs manageMasterUserPassword):
+#   Enforced via advisory error ConfigMap (kro discards x-kubernetes-validations on regenerate).
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: rdscluster.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: RDSCluster
+    scope: Namespaced
+    spec:
+      # Standard kropath governance fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # ACK DBCluster required field (developer-specified, not governance-overridable)
+      engine: string
+      # Optional engine/cluster type
+      engineVersion: string | default=""
+      engineMode: string | default=""
+      dbClusterInstanceClass: string | default=""
+      # Optional networking and identity
+      dbSubnetGroupName: string | default=""
+      availabilityZones: "[]string | default=[]"
+      vpcSecurityGroupIDs: "[]string | default=[]"
+      port: integer | default=0
+      databaseName: string | default=""
+      dbClusterParameterGroupName: string | default=""
+      # Auth
+      masterUsername: string | default=""
+      # masterUserPassword SecretKeyReference (G-1) — see mutual exclusion below
+      masterUserPassword:
+        name: string | default=""
+        key: string | default=""
+      # Log exports
+      enableCloudwatchLogsExports: "[]string | default=[]"
+      # Restore / replication
+      snapshotIdentifier: string | default=""
+      sourceDBClusterIdentifier: string | default=""
+      globalClusterIdentifier: string | default=""
+      replicationSourceIdentifier: string | default=""
+      # Optional storage (Multi-AZ DB cluster)
+      allocatedStorage: integer | default=0
+      iops: integer | default=0
+      # Boolean pointer governance fields — do NOT declare | default=false.
+      # Governance boolean pointers: bare boolean, no default=false.
+      # See rdsinstance RGD comments for rationale.
+      storageEncrypted: boolean
+      deletionProtection: boolean
+      autoMinorVersionUpgrade: boolean
+      copyTagsToSnapshot: boolean
+      enableIAMDatabaseAuthentication: boolean
+      manageMasterUserPassword: boolean
+      publiclyAccessible: boolean
+      # Cluster-specific boolean fields (not in standard governance, instance-set only)
+      enablePerformanceInsights: boolean
+      enableHTTPEndpoint: boolean
+      enableGlobalWriteForwarding: boolean
+      # Non-pointer governance fields
+      storageType: string | default=""
+      kmsKeyID: string | default=""
+      backupRetentionPeriod: integer | default=0
+      # Cluster-only governance fields (from RDSConfig effectiveConfig, double/int)
+      serverlessV2ScalingMinCapacity: float | default=0
+      serverlessV2ScalingMaxCapacity: float | default=0
+      backtrackWindow: integer | default=0
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{")
+          ? "arn:aws:rds:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":cluster/" + naming.data.resourceName
+          : ""}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: RDSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — materialises effectiveName, resourceName, namingStatus.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: rdscluster-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # Advisory error ConfigMap for mutual exclusion: masterUserPassword vs manageMasterUserPassword.
+    # Appears in graph only when conflict exists (same pattern as rdsinstance RGD).
+    - id: passwordMutualExclusionError
+      includeWhen:
+        - >-
+          ${schema.spec.masterUserPassword.name != ""
+            && ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.manageMasterUserPassword)
+                || schema.spec.?manageMasterUserPassword.orValue(false)
+                || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.manageMasterUserPassword))}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-password-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: rdscluster-error
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "masterUserPassword and manageMasterUserPassword cannot both be set; unset one of the two"
+          hint: "When manageMasterUserPassword is true (via spec or governance), do not provide spec.masterUserPassword"
+
+    # ACK DBCluster CR — primary cloud resource.
+    # Only created when resourceName has no unresolved {tag.X} tokens.
+    - id: ackDBCluster
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+      template:
+        apiVersion: rds.services.k8s.aws/v1alpha1
+        kind: DBCluster
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource identifier (effectiveName). AWS stores dbClusterIdentifier lowercase.
+          dbClusterIdentifier: ${naming.data.resourceName}
+          # Required instance field — developer-specified, not governance-overridable.
+          engine: ${schema.spec.engine}
+          # Optional engine configuration
+          engineVersion: '${schema.spec.engineVersion != "" ? schema.spec.engineVersion : ""}'
+          engineMode: '${schema.spec.engineMode != "" ? schema.spec.engineMode : ""}'
+          dbClusterInstanceClass: '${schema.spec.dbClusterInstanceClass != "" ? schema.spec.dbClusterInstanceClass : ""}'
+          # Networking
+          dbSubnetGroupName: '${schema.spec.dbSubnetGroupName != "" ? schema.spec.dbSubnetGroupName : ""}'
+          availabilityZones: ${schema.spec.availabilityZones}
+          vpcSecurityGroupIDs: ${schema.spec.vpcSecurityGroupIDs}
+          port: '${schema.spec.port > 0 ? schema.spec.port : 0}'
+          databaseName: '${schema.spec.databaseName != "" ? schema.spec.databaseName : ""}'
+          dbClusterParameterGroupName: '${schema.spec.dbClusterParameterGroupName != "" ? schema.spec.dbClusterParameterGroupName : ""}'
+          # Auth
+          masterUsername: '${schema.spec.masterUsername != "" ? schema.spec.masterUsername : ""}'
+          # masterUserPassword SecretKeyReference passthrough (G-1).
+          # Mutual exclusion with manageMasterUserPassword enforced by advisory ConfigMap above.
+          masterUserPassword:
+            name: ${schema.spec.masterUserPassword.name}
+            key: ${schema.spec.masterUserPassword.key}
+          # Log exports
+          enableCloudwatchLogsExports: ${schema.spec.enableCloudwatchLogsExports}
+          # Restore / replication
+          snapshotIdentifier: '${schema.spec.snapshotIdentifier != "" ? schema.spec.snapshotIdentifier : ""}'
+          sourceDBClusterIdentifier: '${schema.spec.sourceDBClusterIdentifier != "" ? schema.spec.sourceDBClusterIdentifier : ""}'
+          globalClusterIdentifier: '${schema.spec.globalClusterIdentifier != "" ? schema.spec.globalClusterIdentifier : ""}'
+          replicationSourceIdentifier: '${schema.spec.replicationSourceIdentifier != "" ? schema.spec.replicationSourceIdentifier : ""}'
+          # Optional storage (Multi-AZ DB cluster)
+          allocatedStorage: '${schema.spec.allocatedStorage > 0 ? schema.spec.allocatedStorage : 0}'
+          iops: '${schema.spec.iops > 0 ? schema.spec.iops : 0}'
+          # storageType cascade: mandatory (non-"") → instance (non-"") → defaults → ""
+          storageType: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?storageType.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.storageType
+              : (schema.spec.storageType != ""
+                  ? schema.spec.storageType
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?storageType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.storageType
+                      : ""))}
+          # kmsKeyID cascade: mandatory (non-"") → instance (non-"") → defaults
+          kmsKeyID: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsKeyID
+              : (schema.spec.kmsKeyID != ""
+                  ? schema.spec.kmsKeyID
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") : ""))}
+          # backupRetentionPeriod minimum-floor semantics (OD-3):
+          #   Aurora clusters must have backupRetentionPeriod >= 1; AWS API enforces this.
+          backupRetentionPeriod: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?backupRetentionPeriod.orValue(0) > 0
+              ? (schema.spec.backupRetentionPeriod > rsrcCfg[0].status.effectiveConfig.mandatory.backupRetentionPeriod
+                  ? schema.spec.backupRetentionPeriod
+                  : rsrcCfg[0].status.effectiveConfig.mandatory.backupRetentionPeriod)
+              : (schema.spec.backupRetentionPeriod > 0
+                  ? schema.spec.backupRetentionPeriod
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?backupRetentionPeriod.orValue(0) : 0))}
+          # storageEncrypted: OR cascade — any "true" tier enables encryption.
+          storageEncrypted: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?storageEncrypted.orValue(false))
+              || schema.spec.?storageEncrypted.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?storageEncrypted.orValue(false))}
+          # deletionProtection: OR cascade
+          deletionProtection: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?deletionProtection.orValue(false))
+              || schema.spec.?deletionProtection.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?deletionProtection.orValue(false))}
+          # publiclyAccessible: has() cascade — mandatory false = forced private-only.
+          # Multi-AZ DB cluster only; Aurora clusters ignore this field per AWS API.
+          publiclyAccessible: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.publiclyAccessible)
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.publiclyAccessible
+              : (has(schema.spec.publiclyAccessible)
+                  ? schema.spec.publiclyAccessible
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.publiclyAccessible)
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.publiclyAccessible
+                      : false))}
+          # autoMinorVersionUpgrade: OR cascade
+          autoMinorVersionUpgrade: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?autoMinorVersionUpgrade.orValue(false))
+              || schema.spec.?autoMinorVersionUpgrade.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?autoMinorVersionUpgrade.orValue(false))}
+          # copyTagsToSnapshot: OR cascade
+          copyTagsToSnapshot: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?copyTagsToSnapshot.orValue(false))
+              || schema.spec.?copyTagsToSnapshot.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?copyTagsToSnapshot.orValue(false))}
+          # enablePerformanceInsights: OR cascade.
+          # Governance key: performanceInsightsEnabled; ACK DBCluster field: enablePerformanceInsights.
+          enablePerformanceInsights: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?performanceInsightsEnabled.orValue(false))
+              || schema.spec.?enablePerformanceInsights.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?performanceInsightsEnabled.orValue(false))}
+          # enableIAMDatabaseAuthentication: OR cascade
+          enableIAMDatabaseAuthentication: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?enableIAMDatabaseAuthentication.orValue(false))
+              || schema.spec.?enableIAMDatabaseAuthentication.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?enableIAMDatabaseAuthentication.orValue(false))}
+          # manageMasterUserPassword: OR cascade
+          manageMasterUserPassword: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?manageMasterUserPassword.orValue(false))
+              || schema.spec.?manageMasterUserPassword.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?manageMasterUserPassword.orValue(false))}
+          # enableHTTPEndpoint and enableGlobalWriteForwarding: instance-only, no governance.
+          enableHTTPEndpoint: ${schema.spec.?enableHTTPEndpoint.orValue(false)}
+          enableGlobalWriteForwarding: ${schema.spec.?enableGlobalWriteForwarding.orValue(false)}
+          # Cluster-only governance fields from effectiveConfig:
+          #
+          # serverlessV2ScalingConfiguration: cascade mandatory → instance → defaults.
+          # Uses 0.0 sentinel (double-type fields). For provisioned clusters, set both
+          # to 0.0 (no governance config). ACK skips zero-value serverless config.
+          # Ref: commit bb1c794 "fix: use 0.0 sentinel in CEL rules for double-type fields".
+          serverlessV2ScalingConfiguration:
+            minCapacity: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?serverlessV2ScalingMinCapacity.orValue(0.0) > 0.0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.serverlessV2ScalingMinCapacity
+                : (schema.spec.serverlessV2ScalingMinCapacity > 0.0
+                    ? schema.spec.serverlessV2ScalingMinCapacity
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?serverlessV2ScalingMinCapacity.orValue(0.0) : 0.0))}
+            maxCapacity: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?serverlessV2ScalingMaxCapacity.orValue(0.0) > 0.0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.serverlessV2ScalingMaxCapacity
+                : (schema.spec.serverlessV2ScalingMaxCapacity > 0.0
+                    ? schema.spec.serverlessV2ScalingMaxCapacity
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?serverlessV2ScalingMaxCapacity.orValue(0.0) : 0.0))}
+          # backtrackWindow cascade: mandatory (>0) → instance (>0) → defaults.
+          # Aurora MySQL only; 0 = disabled.
+          backtrackWindow: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?backtrackWindow.orValue(0) > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.backtrackWindow
+              : (schema.spec.backtrackWindow > 0
+                  ? schema.spec.backtrackWindow
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?backtrackWindow.orValue(0) : 0))}
+          # Cloud resource tags — ACK DBCluster spec.tags is array<{key, value}> (not map).
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
