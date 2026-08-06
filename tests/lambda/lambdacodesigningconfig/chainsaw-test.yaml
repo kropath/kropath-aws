@@ -1,0 +1,545 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-lambda-07: LambdaCodeSigningConfig Chainsaw tests — 9 ACs, 10 scenarios
+#
+# Key constraints (from spec + RGD):
+#   - Naming EXEMPT (KRO-236): no effectiveName, nameOverride, resourceName, predictedArn
+#   - Has cloud tags: allCloudMetadata → ACK CodeSigningConfig spec.tags
+#   - AC-4 tags merge uses jq for order-independent assertion
+#   - AC-9 cross-resource ref: tested via LambdaFunction codeSigningConfigRef
+#   - Canonical pattern: unique resource name per step, skipDelete: true
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: lambdacodesigningconfig
+spec:
+  namespace: lambdacodesigningconfig
+  skipDelete: true
+  steps:
+
+    # ── purge stale leftovers from previous runs ──────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              NS=lambdacodesigningconfig
+              kubectl delete lambdacodesigningconfig --all -n $NS --ignore-not-found --wait=false
+              kubectl delete codesigningconfigs.lambda.services.k8s.aws --all -n $NS --ignore-not-found --wait=false
+              kubectl delete lambdafunction --all -n $NS --ignore-not-found --wait=false
+              kubectl delete lambdaconfig --all -n $NS --ignore-not-found --wait=false
+              sleep 2
+            timeout: 30s
+
+    # ── shared governance config: general-policy ─────────────────────────────
+    - name: setup-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: general-policy
+                namespace: lambdacodesigningconfig
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig general-policy -n lambdacodesigningconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+
+    # ── AC-1: basic creation with Warn mode ───────────────────────────────────
+    - name: ac1-basic-create-warn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac1
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+                untrustedArtifactOnDeployment: Warn
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: CodeSigningConfig
+              metadata:
+                name: csc-ac1
+                namespace: lambdacodesigningconfig
+              spec:
+                codeSigningPolicies:
+                  untrustedArtifactOnDeployment: Warn
+        - script:
+            content: |
+              ARNS=$(kubectl get codesigningconfig csc-ac1 -n lambdacodesigningconfig \
+                -o jsonpath='{.spec.allowedPublishers.signingProfileVersionARNs}')
+              echo "signingProfileVersionARNs: $ARNS"
+              echo "$ARNS" | grep -q "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890" \
+                || { echo "FAIL: signing profile ARN not found"; exit 1; }
+
+    # ── AC-2: enforce mode ────────────────────────────────────────────────────
+    - name: ac2-enforce-mode
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac2
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+                untrustedArtifactOnDeployment: Enforce
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: CodeSigningConfig
+              metadata:
+                name: csc-ac2
+                namespace: lambdacodesigningconfig
+              spec:
+                codeSigningPolicies:
+                  untrustedArtifactOnDeployment: Enforce
+
+    # ── AC-3: description ─────────────────────────────────────────────────────
+    - name: ac3-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac3
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+                description: "Production code signing policy for payment service"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: CodeSigningConfig
+              metadata:
+                name: csc-ac3
+                namespace: lambdacodesigningconfig
+              spec:
+                description: "Production code signing policy for payment service"
+
+    # ── AC-4: tags merge (mandatory wins on key conflict) ─────────────────────
+    # mandatory.tags: {service: lambda, cost-centre: platform} wins over instance + defaults
+    - name: ac4-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac4-cfg
+                namespace: lambdacodesigningconfig
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac4-cfg -n lambdacodesigningconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {"cost-centre": "platform", "service": "lambda"},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac4
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: ac4-cfg
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+                tags:
+                  team: payments
+        - script:
+            content: |
+              TAGS=$(kubectl get codesigningconfig csc-ac4 -n lambdacodesigningconfig \
+                -o json | jq -r '.spec.tags')
+              echo "spec.tags: $TAGS"
+              echo "$TAGS" | jq -e '."cost-centre" == "platform"' \
+                || { echo "FAIL: mandatory cost-centre tag missing"; exit 1; }
+              echo "$TAGS" | jq -e '.service == "lambda"' \
+                || { echo "FAIL: mandatory service tag missing"; exit 1; }
+              echo "$TAGS" | jq -e '.team == "payments"' \
+                || { echo "FAIL: instance team tag missing"; exit 1; }
+
+    # ── AC-5: synced labels — dual location (K8s labels + cloud tags) ─────────
+    # mandatory.syncedLabels: {environment: production}
+    # → K8s metadata.labels: aws.kropath.run/environment: production
+    # → spec.tags: environment: production (via allCloudMetadata)
+    - name: ac5-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac5-cfg
+                namespace: lambdacodesigningconfig
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac5-cfg -n lambdacodesigningconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {},
+                        "syncedLabels": {"environment": "production"},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac5
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: ac5-cfg
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: CodeSigningConfig
+              metadata:
+                name: csc-ac5
+                namespace: lambdacodesigningconfig
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            content: |
+              TAGS=$(kubectl get codesigningconfig csc-ac5 -n lambdacodesigningconfig \
+                -o json | jq -r '.spec.tags')
+              echo "spec.tags: $TAGS"
+              echo "$TAGS" | jq -e '.environment == "production"' \
+                || { echo "FAIL: syncedLabel environment not in spec.tags"; exit 1; }
+
+    # ── AC-6: standard metadata ───────────────────────────────────────────────
+    - name: ac6-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac6
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: CodeSigningConfig
+              metadata:
+                name: csc-ac6
+                namespace: lambdacodesigningconfig
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: csc-ac6
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              OWNER=$(kubectl get codesigningconfig csc-ac6 -n lambdacodesigningconfig \
+                -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              [ "$OWNER" = "LambdaCodeSigningConfig" ] \
+                || { echo "FAIL: ownerRef.kind should be LambdaCodeSigningConfig, got $OWNER"; exit 1; }
+              CTRL=$(kubectl get codesigningconfig csc-ac6 -n lambdacodesigningconfig \
+                -o jsonpath='{.metadata.ownerReferences[0].controller}')
+              [ "$CTRL" = "true" ] || { echo "FAIL: ownerRef.controller should be true"; exit 1; }
+              echo "PASS: standard metadata verified"
+
+    # ── AC-7a: deletion policy retain (default) ───────────────────────────────
+    - name: ac7a-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac7a
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: CodeSigningConfig
+              metadata:
+                name: csc-ac7a
+                namespace: lambdacodesigningconfig
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ── AC-7b: deletion policy delete ────────────────────────────────────────
+    - name: ac7b-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac7b
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: CodeSigningConfig
+              metadata:
+                name: csc-ac7b
+                namespace: lambdacodesigningconfig
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ── AC-8: naming exemption — codeSigningConfigId from ACK status ──────────
+    # No status.resourceName, predictedArn, or namingStatus.
+    - name: ac8-naming-exemption-status
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac8
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+        - script:
+            content: |
+              kubectl patch codesigningconfig csc-ac8 -n lambdacodesigningconfig \
+                --type=merge --subresource=status \
+                -p '{"status":{"codeSigningConfigID":"csc-abc12345"}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: csc-ac8
+              status:
+                codeSigningConfigId: csc-abc12345
+        - script:
+            content: |
+              STATUS=$(kubectl get lambdacodesigningconfig csc-ac8 -n lambdacodesigningconfig -o json | jq '.status')
+              echo "status: $STATUS"
+              # Verify no naming fields exist
+              echo "$STATUS" | jq -e 'has("resourceName") | not' \
+                || { echo "FAIL: status.resourceName should not exist (naming exempt)"; exit 1; }
+              echo "$STATUS" | jq -e 'has("predictedArn") | not' \
+                || { echo "FAIL: status.predictedArn should not exist (naming exempt)"; exit 1; }
+              echo "$STATUS" | jq -e 'has("namingStatus") | not' \
+                || { echo "FAIL: status.namingStatus should not exist (naming exempt)"; exit 1; }
+              echo "PASS: naming exemption verified"
+
+    # ── AC-9: cross-resource reference from LambdaFunction ───────────────────
+    # LambdaFunction spec.codeSigningConfigRef resolves CSC ARN via
+    # cscCr[0].status.ackResourceMetadata.arn (externalRef + selector.matchLabels).
+    - name: ac9-function-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaCodeSigningConfig
+              metadata:
+                name: my-signing-config
+                namespace: lambdacodesigningconfig
+                labels:
+                  aws.kropath.run/resource-name: my-signing-config
+              spec:
+                configRef: general-policy
+                allowedPublishers:
+                  signingProfileVersionArns:
+                    - "arn:aws:signer:us-east-1:123456789012:/signing-profiles/MyProfile/1234567890"
+        - script:
+            content: |
+              # Patch the ACK child CodeSigningConfig with a simulated ackResourceMetadata.arn
+              kubectl patch codesigningconfig my-signing-config -n lambdacodesigningconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "ackResourceMetadata": {
+                      "arn": "arn:aws:lambda:us-east-1:123456789012:code-signing-config:csc-abc123"
+                    },
+                    "codeSigningConfigID": "csc-abc123"
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: fn-cfg
+                namespace: lambdacodesigningconfig
+                labels:
+                  aws.kropath.run/resource-name: fn-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig fn-cfg -n lambdacodesigningconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {},
+                        "namingTemplate": "",
+                        "runtime": "",
+                        "memorySize": 0,
+                        "timeout": 0,
+                        "tracingMode": "",
+                        "kmsKeyArn": ""
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {},
+                        "namingTemplate": "{namespace}-{name}",
+                        "runtime": "python3.12",
+                        "memorySize": 128,
+                        "timeout": 30,
+                        "tracingMode": "PassThrough",
+                        "kmsKeyArn": ""
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-csc-ref
+                namespace: lambdacodesigningconfig
+              spec:
+                configRef: fn-cfg
+                codeSigningConfigRef: my-signing-config
+                code:
+                  s3Bucket: test-bucket
+                  s3Key: function.zip
+                runtime: python3.12
+                handler: index.handler
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Function
+              metadata:
+                name: fn-csc-ref
+                namespace: lambdacodesigningconfig
+              spec:
+                codeSigningConfigARN: "arn:aws:lambda:us-east-1:123456789012:code-signing-config:csc-abc123"
