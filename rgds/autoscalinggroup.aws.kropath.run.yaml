@@ -1,0 +1,441 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: autoscalinggroup.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: AutoScalingGroup
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Scaling limits
+      minSize: integer | required
+      maxSize: integer | required
+      desiredCapacity: integer | default=0
+
+      # Launch source (launch template)
+      launchTemplate:
+        name: string | required
+        version: string | default=$Latest
+
+      # Mixed instances policy (optional — enables On-Demand + Spot mixing)
+      # kro v0.9.2 always emits this struct; zero values mean single-LT mode.
+      mixedInstancesPolicy:
+        onDemandBaseCapacity: integer | default=0
+        onDemandPercentageAboveBaseCapacity: integer | default=100
+        spotAllocationStrategy: string | default=capacity-optimized
+        spotMaxPrice: string | default=""
+        overrides: "[]MixedInstanceOverride | default=[]"
+
+      # Network placement
+      availabilityZones: "[]string | default=[]"
+      vpcZoneIdentifier: string | default=""
+
+      # Health checking (both are governable)
+      # healthCheckType: "" sentinel means "not set by instance; fall through to defaults then hardcoded EC2"
+      healthCheckType: string | default=""
+      # healthCheckGracePeriod: 0 sentinel means "not set by instance; fall through to defaults then hardcoded 300"
+      healthCheckGracePeriod: integer | default=0
+
+      # Scaling behaviour
+      defaultCooldown: integer | default=300
+      defaultInstanceWarmup: integer | default=0
+
+      # Instance lifecycle
+      terminationPolicies: "[]string | default=[]"
+      # newInstancesProtectedFromScaleIn and capacityRebalance: declared as bare boolean (no | default=false)
+      # so has() can distinguish explicit false from absent, enabling the three-level governance cascade.
+      newInstancesProtectedFromScaleIn: boolean
+      capacityRebalance: boolean
+      # maxInstanceLifetime: 0 sentinel means disabled; fall through to defaults
+      maxInstanceLifetime: integer | default=0
+
+      # Target group integration
+      targetGroupARNs: "[]string | default=[]"
+
+      # Lifecycle hooks
+      lifecycleHooks: "[]LifecycleHookSpec | default=[]"
+
+      # Warm pool (optional)
+      warmPool:
+        poolState: string | default=Stopped
+        minSize: integer | default=0
+        maxGroupPreparedCapacity: integer | default=-1
+        reuseOnScaleIn: boolean | default=false
+
+      # Instance maintenance policy
+      instanceMaintenancePolicy:
+        minHealthyPercentage: integer | default=90
+        maxHealthyPercentage: integer | default=120
+
+    types:
+      MixedInstanceOverride:
+        instanceType: string | default=""
+        weightedCapacity: string | default=""
+      LifecycleHookSpec:
+        name: string | default=""
+        transition: string | default=""
+        defaultResult: string | default=CONTINUE
+        heartbeatTimeout: integer | default=3600
+        notificationTargetArn: string | default=""
+        notificationMetadata: string | default=""
+        roleArn: string | default=""
+
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      predictedArn: >-
+        ${(naming.data.namingStatus == "valid") ? "arn:aws:autoscaling:" + (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "") + ":" + (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "") + ":autoScalingGroup:*:autoScalingGroupName/" + naming.data.effectiveName : ""}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      conditions: >-
+        ${asg.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: MinSize
+        type: integer
+        jsonPath: .spec.minSize
+      - name: MaxSize
+        type: integer
+        jsonPath: .spec.maxSize
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # kro infers rsrcCfg as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: AutoScalingConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — materialises effectiveName, resourceName and namingStatus without
+    # requiring schema.* access in the status block. No .lowerAscii() for ASG names (case-sensitive).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-asg-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: asg-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # effectiveName: resolved via naming template with {tag.X} dynamic substitution.
+          # Template priority: mandatory → defaults → fallback "{namespace}-{name}".
+          # No .lowerAscii() — ASG names are case-sensitive.
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          # resourceName: same as effectiveName (ASG names are case-sensitive; no .lowerAscii())
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK AutoScalingGroup CR — wraps autoscaling.services.k8s.aws/AutoScalingGroup.
+    # Governance fields (5): newInstancesProtectedFromScaleIn, capacityRebalance,
+    # healthCheckType, healthCheckGracePeriod, maxInstanceLifetime.
+    # All resolved via 3-level cascade: mandatory → spec → defaults (ADR-010 / ADR-015 §5.3).
+    - id: asg
+      template:
+        apiVersion: autoscaling.services.k8s.aws/v1alpha1
+        kind: AutoScalingGroup
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource name — controlled by naming template / nameOverride.
+          # ASG names are case-sensitive; no .lowerAscii() applied (ADR-015 §9).
+          autoScalingGroupName: ${naming.data.resourceName}
+
+          # Scaling limits
+          minSize: ${schema.spec.minSize}
+          maxSize: ${schema.spec.maxSize}
+          desiredCapacity: ${schema.spec.desiredCapacity}
+
+          # Launch source — single launch template (used when mixedInstancesPolicy not configured).
+          launchTemplate:
+            launchTemplateName: ${schema.spec.launchTemplate.name}
+            version: ${schema.spec.launchTemplate.version}
+
+          # Mixed instances policy — enables On-Demand + Spot mixing.
+          # kro v0.9.2 always emits this struct; when not configured by user, fields carry defaults.
+          # Single-LT mode is indicated by onDemandPercentageAboveBaseCapacity=100 and no overrides.
+          mixedInstancesPolicy:
+            instancesDistribution:
+              onDemandBaseCapacity: ${schema.spec.mixedInstancesPolicy.onDemandBaseCapacity}
+              onDemandPercentageAboveBaseCapacity: ${schema.spec.mixedInstancesPolicy.onDemandPercentageAboveBaseCapacity}
+              spotAllocationStrategy: ${schema.spec.mixedInstancesPolicy.spotAllocationStrategy}
+              spotMaxPrice: ${schema.spec.mixedInstancesPolicy.spotMaxPrice}
+            launchTemplate:
+              overrides: >-
+                ${schema.spec.mixedInstancesPolicy.overrides.map(o, {"instanceType": o.instanceType, "weightedCapacity": o.weightedCapacity})}
+
+          # Network placement
+          availabilityZones: ${schema.spec.availabilityZones}
+          vpcZoneIdentifier: ${schema.spec.vpcZoneIdentifier}
+
+          # Health checking — governed by AutoScalingConfig.
+          # String governance: mandatory != "" → mandatory; spec != "" → spec; defaults != "" → defaults; else hardcoded "EC2".
+          healthCheckType: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?healthCheckType.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.healthCheckType
+              : (schema.spec.healthCheckType != ""
+                  ? schema.spec.healthCheckType
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?healthCheckType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.healthCheckType
+                      : "EC2"))}
+          # Integer governance: mandatory != 0 → mandatory; spec != 0 → spec; defaults != 0 → defaults; else 300.
+          # Note: spec.healthCheckGracePeriod: 0 is treated as "not set" (falls through to defaults).
+          # To achieve 0-second grace period, set it in AutoScalingConfig.defaults.healthCheckGracePeriod.
+          healthCheckGracePeriod: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?healthCheckGracePeriod.orValue(0) != 0)
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.healthCheckGracePeriod
+              : (schema.spec.healthCheckGracePeriod != 0
+                  ? schema.spec.healthCheckGracePeriod
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?healthCheckGracePeriod.orValue(0) != 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.healthCheckGracePeriod
+                      : 300))}
+
+          # Scaling behaviour
+          defaultCooldown: ${schema.spec.defaultCooldown}
+          defaultInstanceWarmup: ${schema.spec.defaultInstanceWarmup}
+
+          # Instance lifecycle
+          terminationPolicies: ${schema.spec.terminationPolicies}
+
+          # Boolean governance: mandatory=true wins unconditionally.
+          # kro v0.9.2 strips zero-value booleans from stored instance spec, so explicit false is
+          # indistinguishable from absent. The cascade can only reliably turn a flag ON (OR logic).
+          # See frequent-rgd-errors.md §"Boolean Cascade Cannot Disable a Default-True Flag".
+          newInstancesProtectedFromScaleIn: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?newInstancesProtectedFromScaleIn.orValue(false))
+              || (has(schema.spec.newInstancesProtectedFromScaleIn) && schema.spec.newInstancesProtectedFromScaleIn)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?newInstancesProtectedFromScaleIn.orValue(false))}
+          capacityRebalance: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?capacityRebalance.orValue(false))
+              || (has(schema.spec.capacityRebalance) && schema.spec.capacityRebalance)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?capacityRebalance.orValue(false))}
+
+          # Integer governance: 0 = not enforced sentinel.
+          maxInstanceLifetime: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxInstanceLifetime.orValue(0) != 0)
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxInstanceLifetime
+              : (schema.spec.maxInstanceLifetime != 0
+                  ? schema.spec.maxInstanceLifetime
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?maxInstanceLifetime.orValue(0) != 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.maxInstanceLifetime
+                      : 0))}
+
+          # Target group integration
+          targetGroupARNs: ${schema.spec.targetGroupARNs}
+
+          # Lifecycle hooks — map kropath LifecycleHookSpec to ACK LifecycleHookSpecification.
+          lifecycleHookSpecificationList: >-
+            ${schema.spec.lifecycleHooks.map(h, {
+              "lifecycleHookName": h.name,
+              "lifecycleTransition": h.transition,
+              "defaultResult": h.defaultResult,
+              "heartbeatTimeout": h.heartbeatTimeout,
+              "notificationTargetARN": h.notificationTargetArn,
+              "notificationMetadata": h.notificationMetadata,
+              "roleARN": h.roleArn
+            })}
+
+          # Warm pool — kro v0.9.2 always emits this struct; zero values = no warm pool configured.
+          warmPoolConfiguration:
+            poolState: ${schema.spec.warmPool.poolState}
+            minSize: ${schema.spec.warmPool.minSize}
+            maxGroupPreparedCapacity: ${schema.spec.warmPool.maxGroupPreparedCapacity}
+            instanceReusePolicy:
+              reuseOnScaleIn: ${schema.spec.warmPool.reuseOnScaleIn}
+
+          # Instance maintenance policy
+          instanceMaintenancePolicy:
+            minHealthyPercentage: ${schema.spec.instanceMaintenancePolicy.minHealthyPercentage}
+            maxHealthyPercentage: ${schema.spec.instanceMaintenancePolicy.maxHealthyPercentage}
+
+          # Cloud resource tags — ACK AutoScalingGroup uses []Tag{key, value} (no propagateAtLaunch).
+          # Merge order: defaults (lowest) → spec → mandatory (highest); mandatory wins on key conflict.
+          # syncedLabels and syncedAnnotations are included in cloud tags (ADR-015 §6.1).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .transformList(k, v, {"key": k, "value": v})}
