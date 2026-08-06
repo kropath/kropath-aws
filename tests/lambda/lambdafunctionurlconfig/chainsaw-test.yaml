@@ -1,0 +1,538 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Chainsaw test suite for LambdaFunctionURLConfig RGD (aws-lambda-05).
+# 10 ACs: basic auth types, qualifier, CORS, tags, synced labels,
+# standard metadata, deletion policy, naming exemption, function resolution.
+#
+# Canonical pattern: unique resource name per step, spec.skipDelete: true,
+# no ACK-child inter-step deletes (no real ACK controller in test cluster).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: lambdafunctionurlconfig
+spec:
+  namespace: lambdafunctionurlconfig
+  skipDelete: true
+  steps:
+
+    # ── purge stale leftovers from previous runs ──────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              NS=lambdafunctionurlconfig
+              kubectl delete lambdafunctionurlconfig --all -n $NS --ignore-not-found --wait=false
+              kubectl delete lambdafunction --all -n $NS --ignore-not-found --wait=false
+              kubectl delete lambdaconfig --all -n $NS --ignore-not-found --wait=false
+              sleep 2
+            timeout: 30s
+
+    # ── shared setup: LambdaConfig + fn-shared LambdaFunction ─────────────────
+    - name: fn-setup
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: fn-general
+                namespace: lambdafunctionurlconfig
+                labels:
+                  aws.kropath.run/resource-name: fn-general
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig fn-general -n lambdafunctionurlconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {},
+                        "namingTemplate": ""
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {},
+                        "namingTemplate": "{namespace}-{name}"
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-shared
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                code:
+                  s3Bucket: test-bucket
+                  s3Key: test-function.zip
+                runtime: python3.12
+                handler: index.handler
+                role: arn:aws:iam::123456789012:role/lambda-role
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-shared
+                namespace: lambdafunctionurlconfig
+              status:
+                (resourceName != ''): true
+
+    # ── AC-1: basic IAM-auth URL creation ─────────────────────────────────────
+    # Given: functionRef=fn-shared, authType=AWS_IAM, qualifier=""
+    # Then: ACK FunctionURLConfig has authType=AWS_IAM, functionRef.from.name=fn-shared
+    - name: ac1-iam-auth-url
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac1
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-shared
+                authType: AWS_IAM
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac1
+                namespace: lambdafunctionurlconfig
+              spec:
+                authType: AWS_IAM
+                functionRef:
+                  from:
+                    name: fn-shared
+
+    # ── AC-2: public (NONE) auth URL ──────────────────────────────────────────
+    # Given: authType=NONE
+    # Then: ACK FunctionURLConfig has authType=NONE
+    - name: ac2-none-auth-url
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac2
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-shared
+                authType: NONE
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac2
+                namespace: lambdafunctionurlconfig
+              spec:
+                authType: NONE
+                functionRef:
+                  from:
+                    name: fn-shared
+
+    # ── AC-3: qualifier (alias-specific URL) ──────────────────────────────────
+    # Given: qualifier=prod
+    # Then: ACK FunctionURLConfig has qualifier=prod
+    - name: ac3-qualifier
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac3
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-shared
+                authType: AWS_IAM
+                qualifier: prod
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac3
+                namespace: lambdafunctionurlconfig
+              spec:
+                authType: AWS_IAM
+                qualifier: prod
+                functionRef:
+                  from:
+                    name: fn-shared
+
+    # ── AC-4: full CORS configuration ─────────────────────────────────────────
+    # Given: all CORS fields set
+    # Then: ACK FunctionURLConfig spec.cors matches
+    - name: ac4-cors-full
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac4
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-shared
+                authType: AWS_IAM
+                cors:
+                  allowCredentials: true
+                  allowHeaders:
+                    - content-type
+                    - authorization
+                  allowMethods:
+                    - GET
+                    - POST
+                  allowOrigins:
+                    - https://example.com
+                  exposeHeaders:
+                    - x-custom-header
+                  maxAge: 86400
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac4
+                namespace: lambdafunctionurlconfig
+              spec:
+                cors:
+                  allowCredentials: true
+                  maxAge: 86400
+        - script:
+            content: |
+              CORS=$(kubectl get functionurlconfig url-ac4 -n lambdafunctionurlconfig -o json | jq '.spec.cors')
+              echo "$CORS" | jq -e '(.allowHeaders | contains(["content-type","authorization"]))' || { echo "FAIL: allowHeaders mismatch"; exit 1; }
+              echo "$CORS" | jq -e '(.allowMethods | contains(["GET","POST"]))' || { echo "FAIL: allowMethods mismatch"; exit 1; }
+              echo "$CORS" | jq -e '(.allowOrigins | contains(["https://example.com"]))' || { echo "FAIL: allowOrigins mismatch"; exit 1; }
+              echo "$CORS" | jq -e '(.exposeHeaders | contains(["x-custom-header"]))' || { echo "FAIL: exposeHeaders mismatch"; exit 1; }
+              echo "AC-4 CORS OK"
+
+    # ── AC-5: tags in K8s metadata only (no spec.tags on ACK child) ───────────
+    # Given: mandatory.tags={cost-centre:platform}, spec.tags={app:webhook}
+    # Then: K8s labels have aws.kropath.run/cost-centre and aws.kropath.run/app;
+    #       ACK FunctionURLConfig has NO spec.tags field
+    - name: ac5-tags-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac5-cfg
+                namespace: lambdafunctionurlconfig
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac5-cfg -n lambdafunctionurlconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {"cost-centre": "platform"},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {},
+                        "namingTemplate": ""
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {},
+                        "namingTemplate": "{namespace}-{name}"
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac5
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: ac5-cfg
+                functionRef: fn-shared
+                authType: NONE
+                tags:
+                  app: webhook
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac5
+                namespace: lambdafunctionurlconfig
+                labels:
+                  aws.kropath.run/cost-centre: platform
+                  aws.kropath.run/app: webhook
+        - script:
+            content: |
+              # Verify no spec.tags on ACK FunctionURLConfig child
+              HAS_TAGS=$(kubectl get functionurlconfig url-ac5 -n lambdafunctionurlconfig -o json | jq 'has("spec") and (.spec | has("tags"))')
+              if [ "$HAS_TAGS" = "true" ]; then
+                echo "FAIL: spec.tags unexpectedly present on ACK FunctionURLConfig"
+                exit 1
+              fi
+              echo "AC-5 OK: no spec.tags on ACK child"
+
+    # ── AC-6: synced labels in K8s metadata ──────────────────────────────────
+    # Given: mandatory.syncedLabels={environment:production}
+    # Then: ACK FunctionURLConfig metadata.labels has aws.kropath.run/environment:production
+    - name: ac6-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac6-cfg
+                namespace: lambdafunctionurlconfig
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac6-cfg -n lambdafunctionurlconfig \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {},
+                        "syncedLabels": {"environment": "production"},
+                        "syncedAnnotations": {},
+                        "namingTemplate": ""
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {},
+                        "namingTemplate": "{namespace}-{name}"
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac6
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: ac6-cfg
+                functionRef: fn-shared
+                authType: NONE
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac6
+                namespace: lambdafunctionurlconfig
+                labels:
+                  aws.kropath.run/environment: production
+
+    # ── AC-7: standard K8s metadata ───────────────────────────────────────────
+    # Given: any FunctionURLConfig CR (using fn-general, default deletionPolicy=retain)
+    # Then: managed-by:kro, instance:<name>, deletion-policy:retain, ownerRef back to CR
+    - name: ac7-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac7
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-shared
+                authType: AWS_IAM
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac7
+                namespace: lambdafunctionurlconfig
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: url-ac7
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: LambdaFunctionURLConfig
+                    name: url-ac7
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # ── AC-8: deletion-policy delete ──────────────────────────────────────────
+    # Given: spec.deletionPolicy=delete
+    # Then: annotation services.k8s.aws/deletion-policy: delete
+    - name: ac8-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac8
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-shared
+                authType: AWS_IAM
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac8
+                namespace: lambdafunctionurlconfig
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ── AC-9: naming exemption ────────────────────────────────────────────────
+    # Given: any FunctionURLConfig CR
+    # Then: no status.resourceName, status.predictedArn, or status.namingStatus on the CR
+    #       status.functionUrl is the only URL-specific status field
+    - name: ac9-naming-exemption
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac9
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-shared
+                authType: AWS_IAM
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac9
+                namespace: lambdafunctionurlconfig
+        - script:
+            content: |
+              STATUS=$(kubectl get lambdafunctionurlconfig url-ac9 -n lambdafunctionurlconfig -o json | jq '.status // {}')
+              for FIELD in resourceName predictedArn namingStatus; do
+                if echo "$STATUS" | jq -e "has(\"$FIELD\")" > /dev/null 2>&1; then
+                  echo "FAIL: status.$FIELD unexpectedly present (naming exemption violated)"
+                  exit 1
+                fi
+              done
+              echo "AC-9 OK: no naming fields in status"
+              # Also confirm functionUrl field is declared (even if empty in test env)
+              HAS_URL=$(echo "$STATUS" | jq 'has("functionUrl")')
+              echo "status.functionUrl present: $HAS_URL"
+
+    # ── AC-10: function resolution via externalRef ────────────────────────────
+    # Given: spec.functionRef=fn-order-processor, LambdaFunction/fn-order-processor exists
+    # Then: ACK FunctionURLConfig spec.functionRef.from.name=fn-order-processor
+    - name: ac10-function-ref-resolution
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-order-processor
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                code:
+                  s3Bucket: test-bucket
+                  s3Key: order-processor.zip
+                runtime: python3.12
+                handler: handler.process
+                role: arn:aws:iam::123456789012:role/lambda-role
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-order-processor
+                namespace: lambdafunctionurlconfig
+              status:
+                (resourceName != ''): true
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunctionURLConfig
+              metadata:
+                name: url-ac10
+                namespace: lambdafunctionurlconfig
+              spec:
+                configRef: fn-general
+                functionRef: fn-order-processor
+                authType: AWS_IAM
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: FunctionURLConfig
+              metadata:
+                name: url-ac10
+                namespace: lambdafunctionurlconfig
+              spec:
+                authType: AWS_IAM
+                functionRef:
+                  from:
+                    name: fn-order-processor
