@@ -1,0 +1,230 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-lambda-04: LambdaAlias RGD
+# Composes: lambda.services.k8s.aws/Alias
+# Naming applies: effectiveName, predictedArn, namingStatus.
+# ACK Alias has no spec.tags — governance tags forwarded to K8s metadata labels only
+# (not to cloud). predictedArn format:
+#   arn:aws:lambda:<region>:<accountId>:function:<parentFnName>:<aliasEffectiveName>
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: lambdaalias.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: LambdaAlias
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Parent function reference — local LambdaFunction CR name
+      functionRef: string | default=""
+
+      # Version targeting — version number (e.g. "1") or "$LATEST"
+      functionVersion: string | default=""
+
+      # Human-readable alias description
+      description: string | default=""
+
+      # Weighted routing — version number → weight string (e.g. {"2": "0.1"})
+      routingConfig:
+        additionalVersionWeights: map[string]string | default={}
+
+      # Provisioned concurrency; 0 = not set
+      provisionedConcurrentExecutions: integer | default=0
+
+      # Async invocation configuration
+      functionEventInvokeConfig:
+        maximumEventAgeInSeconds: integer | default=0
+        maximumRetryAttempts: integer | default=-1
+        destinationConfig:
+          onSuccess:
+            destination: string | default=""
+          onFailure:
+            destination: string | default=""
+
+      # Resource-based policy grants
+      permissions: "[]Permission | default=[]"
+
+    types:
+      Permission:
+        action: string | required=true
+        principal: string | required=true
+        statementId: string | required=true
+        sourceArn: string | default=""
+        sourceAccount: string | default=""
+
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) && fnCr.size() > 0 && has(fnCr[0].status.resourceName) && naming.data.effectiveName != "" && !naming.data.effectiveName.contains("{")
+          ? "arn:aws:lambda:" + rsrcCfg[0].status.effectiveConfig.aws.region + ":" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":function:" + fnCr[0].status.resourceName + ":" + naming.data.effectiveName
+          : ""}
+      conditions: >-
+        ${alias.?status.?conditions.orValue([])}
+
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    # ── governance config lookup ──────────────────────────────────────────────
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: LambdaConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+        selector:
+          matchLabels:
+            aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── parent function reference ─────────────────────────────────────────────
+    # Sentinel keeps externalRef bound as [] when functionRef is empty.
+    - id: fnCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: LambdaFunction
+        metadata:
+          namespace: ${schema.metadata.namespace}
+        selector:
+          matchLabels:
+            aws.kropath.run/resource-name: '${schema.spec.functionRef != "" ? schema.spec.functionRef : "kro-empty-fallback-sentinel"}'
+
+    # ── naming ConfigMap ──────────────────────────────────────────────────────
+    # Materialises effectiveName with full {tag.X} dynamic token support.
+    # Cascade order for tag lookup: mandatory → spec → defaults (mandatory wins).
+    # Any {tag.X} token whose key is absent from merged tags is kept verbatim so
+    # namingStatus reports "invalid-unresolved-tokens".
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+                ? schema.spec.nameOverride
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                    : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                        : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)
+              .replace("{kind}", "lambdaalias")}
+
+    # ── ACK Alias child resource ──────────────────────────────────────────────
+    - id: alias
+      template:
+        apiVersion: lambda.services.k8s.aws/v1alpha1
+        kind: Alias
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)) ? rsrcCfg[0].status.effectiveConfig.defaults.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Alias cloud name (immutable after creation)
+          name: ${naming.data.effectiveName}
+          functionVersion: "${schema.spec.functionVersion}"
+          description: "${schema.spec.description}"
+          # Resolved cloud function name from LambdaFunction status.resourceName
+          functionName: >-
+            ${fnCr.size() > 0 && has(fnCr[0].status.resourceName) ? fnCr[0].status.resourceName : ""}
+          routingConfig:
+            additionalVersionWeights: ${schema.spec.routingConfig.additionalVersionWeights}
+          provisionedConcurrencyConfig:
+            provisionedConcurrentExecutions: ${schema.spec.provisionedConcurrentExecutions}
+          functionEventInvokeConfig:
+            maximumEventAgeInSeconds: ${schema.spec.functionEventInvokeConfig.maximumEventAgeInSeconds}
+            maximumRetryAttempts: ${schema.spec.functionEventInvokeConfig.maximumRetryAttempts}
+            destinationConfig:
+              onSuccess:
+                destination: "${schema.spec.functionEventInvokeConfig.destinationConfig.onSuccess.destination}"
+              onFailure:
+                destination: "${schema.spec.functionEventInvokeConfig.destinationConfig.onFailure.destination}"
+          permissions: ${schema.spec.permissions}

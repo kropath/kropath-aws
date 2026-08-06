@@ -1,0 +1,594 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-lambda-06: LambdaLayerVersion Chainsaw tests — 11 ACs
+#
+# Key constraints (from spec + RGD):
+#   - No ACK spec.tags — tags forwarded to K8s metadata labels only
+#   - Has naming (effectiveName → spec.layerName), no status.predictedArn
+#   - Exposes status.layerArn + status.versionNumber (read from ACK status)
+#   - Canonical pattern: unique resource name per step, skipDelete: true,
+#     no inter-step ACK-child deletes (no ACK controller in test cluster)
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: lambdalayerversion
+spec:
+  namespace: lambdalayerversion
+  skipDelete: true
+  steps:
+
+    # ── purge stale leftovers from previous runs ──────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              NS=lambdalayerversion
+              kubectl delete lambdalayerversion --all -n $NS --ignore-not-found --wait=false
+              kubectl delete layerversions.lambda.services.k8s.aws --all -n $NS --ignore-not-found --wait=false
+              kubectl delete lambdaconfig --all -n $NS --ignore-not-found --wait=false
+              kubectl delete configmap --selector=app.kubernetes.io/managed-by=kro -n $NS --ignore-not-found --wait=false
+              sleep 2
+            timeout: 30s
+
+    # ── shared governance config ──────────────────────────────────────────────
+    # general-policy: defaults.namingTemplate="{namespace}-{name}", no tags
+    - name: setup-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: general-policy
+                namespace: lambdalayerversion
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig general-policy -n lambdalayerversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "namingTemplate": "",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "namingTemplate": "{namespace}-{name}",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+
+    # ── AC-1: basic layer creation ────────────────────────────────────────────
+    # s3Bucket, s3Key, compatibleRuntimes, description forwarded to ACK LayerVersion
+    - name: ac1-layer-basic-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac1
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: shared-utils/v1.zip
+                compatibleRuntimes:
+                  - python3.12
+                  - python3.11
+                description: "Shared utility functions"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac1
+              status:
+                resourceName: lambdalayerversion-layer-ac1
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac1
+                namespace: lambdalayerversion
+              spec:
+                layerName: lambdalayerversion-layer-ac1
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: shared-utils/v1.zip
+                description: "Shared utility functions"
+        - script:
+            content: |
+              RUNTIMES=$(kubectl get layerversion layer-ac1 -n lambdalayerversion -o jsonpath='{.spec.compatibleRuntimes}')
+              echo "compatibleRuntimes: $RUNTIMES"
+              echo "$RUNTIMES" | grep -q "python3.12" || { echo "FAIL: python3.12 not in compatibleRuntimes"; exit 1; }
+              echo "$RUNTIMES" | grep -q "python3.11" || { echo "FAIL: python3.11 not in compatibleRuntimes"; exit 1; }
+
+    # ── AC-2: compatible architectures ───────────────────────────────────────
+    - name: ac2-layer-compatible-architectures
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac2
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: multi-arch-layer.zip
+                compatibleArchitectures:
+                  - x86_64
+                  - arm64
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac2
+                namespace: lambdalayerversion
+              spec:
+                layerName: lambdalayerversion-layer-ac2
+        - script:
+            content: |
+              ARCHS=$(kubectl get layerversion layer-ac2 -n lambdalayerversion -o jsonpath='{.spec.compatibleArchitectures}')
+              echo "compatibleArchitectures: $ARCHS"
+              echo "$ARCHS" | grep -q "x86_64" || { echo "FAIL: x86_64 not in compatibleArchitectures"; exit 1; }
+              echo "$ARCHS" | grep -q "arm64" || { echo "FAIL: arm64 not in compatibleArchitectures"; exit 1; }
+
+    # ── AC-3: license info ───────────────────────────────────────────────────
+    - name: ac3-layer-license-info
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac3
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: licensed-layer.zip
+                licenseInfo: "Apache-2.0"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac3
+                namespace: lambdalayerversion
+              spec:
+                layerName: lambdalayerversion-layer-ac3
+                licenseInfo: "Apache-2.0"
+
+    # ── AC-4: S3 object version pinning ──────────────────────────────────────
+    - name: ac4-layer-s3-object-version
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac4
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: shared-utils/v1.zip
+                  s3ObjectVersion: abc123def456
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac4
+                namespace: lambdalayerversion
+              spec:
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: shared-utils/v1.zip
+                  s3ObjectVersion: abc123def456
+
+    # ── AC-5: tags — K8s metadata only, no cloud spec.tags ───────────────────
+    # KropathConfig mandatory.tags + LambdaConfig mandatory.tags + instance spec.tags
+    # merged into K8s metadata labels with aws.kropath.run/ prefix.
+    # ACK LayerVersion has no spec.tags field.
+    - name: ac5-layer-tags-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac5-cfg
+                namespace: lambdalayerversion
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac5-cfg -n lambdalayerversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "namingTemplate": "",
+                        "tags": {"service": "lambda"},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "namingTemplate": "{namespace}-{name}",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac5
+                namespace: lambdalayerversion
+              spec:
+                configRef: ac5-cfg
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: tagged-layer.zip
+                tags:
+                  app: layers
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac5
+                namespace: lambdalayerversion
+        - script:
+            content: |
+              # Verify tags are in K8s metadata labels with aws.kropath.run/ prefix
+              LABELS=$(kubectl get layerversion layer-ac5 -n lambdalayerversion -o json | jq -r '.metadata.labels')
+              echo "labels: $LABELS"
+              # mandatory tag: service=lambda -> aws.kropath.run/service: lambda
+              echo "$LABELS" | jq -e '."aws.kropath.run/service" == "lambda"' || { echo "FAIL: mandatory service tag not in labels"; exit 1; }
+              # instance tag: app=layers -> aws.kropath.run/app: layers
+              echo "$LABELS" | jq -e '."aws.kropath.run/app" == "layers"' || { echo "FAIL: instance app tag not in labels"; exit 1; }
+              # Verify no spec.tags field exists on ACK LayerVersion
+              HAS_SPEC_TAGS=$(kubectl get layerversion layer-ac5 -n lambdalayerversion -o json | jq 'has("spec") and (.spec | has("tags"))')
+              echo "has spec.tags: $HAS_SPEC_TAGS"
+              [ "$HAS_SPEC_TAGS" = "false" ] || { echo "FAIL: ACK LayerVersion should have no spec.tags"; exit 1; }
+
+    # ── AC-6: synced labels — dual location (K8s labels, no cloud tags) ───────
+    - name: ac6-layer-synced-labels-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac6-cfg
+                namespace: lambdalayerversion
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac6-cfg -n lambdalayerversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "namingTemplate": "",
+                        "tags": {},
+                        "syncedLabels": {"environment": "production"},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "namingTemplate": "{namespace}-{name}",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac6
+                namespace: lambdalayerversion
+              spec:
+                configRef: ac6-cfg
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: synced-layer.zip
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac6
+                namespace: lambdalayerversion
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            content: |
+              # No spec.tags on ACK LayerVersion
+              HAS_SPEC_TAGS=$(kubectl get layerversion layer-ac6 -n lambdalayerversion -o json | jq 'has("spec") and (.spec | has("tags"))')
+              [ "$HAS_SPEC_TAGS" = "false" ] || { echo "FAIL: ACK LayerVersion should have no spec.tags"; exit 1; }
+              echo "PASS: no spec.tags on ACK LayerVersion"
+
+    # ── AC-7: naming — standard template ─────────────────────────────────────
+    # Namespace lambdalayerversion, CR name shared-utils
+    # defaults.namingTemplate="{namespace}-{name}" → "lambdalayerversion-shared-utils"
+    - name: ac7-layer-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac7-cfg
+                namespace: lambdalayerversion
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac7-cfg -n lambdalayerversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "namingTemplate": "",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "namingTemplate": "{namespace}-{name}",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: shared-utils
+                namespace: lambdalayerversion
+              spec:
+                configRef: ac7-cfg
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: shared-utils-layer.zip
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: shared-utils
+              status:
+                resourceName: lambdalayerversion-shared-utils
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: shared-utils
+                namespace: lambdalayerversion
+              spec:
+                layerName: lambdalayerversion-shared-utils
+
+    # ── AC-8: naming — override ───────────────────────────────────────────────
+    # spec.nameOverride bypasses naming template
+    - name: ac8-layer-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac8
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                nameOverride: my-custom-layer
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: custom-layer.zip
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac8
+              status:
+                resourceName: my-custom-layer
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac8
+                namespace: lambdalayerversion
+              spec:
+                layerName: my-custom-layer
+
+    # ── AC-9: status outputs — layerArn and versionNumber ────────────────────
+    # Simulate ACK controller having reconciled: patch ACK LayerVersion status
+    # with layerARN + versionNumber, then verify LambdaLayerVersion status outputs.
+    - name: ac9-layer-status-outputs
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac9
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: status-layer.zip
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac9
+              status:
+                resourceName: lambdalayerversion-layer-ac9
+        - script:
+            content: |
+              kubectl patch layerversion layer-ac9 -n lambdalayerversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "layerARN": "arn:aws:lambda:ap-southeast-2:123456789012:layer:lambdalayerversion-layer-ac9",
+                    "versionNumber": 1
+                  }
+                }'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac9
+              status:
+                layerArn: "arn:aws:lambda:ap-southeast-2:123456789012:layer:lambdalayerversion-layer-ac9"
+                versionNumber: 1
+                resourceName: lambdalayerversion-layer-ac9
+
+    # ── AC-10: standard metadata ──────────────────────────────────────────────
+    # app.kubernetes.io/managed-by: kro, app.kubernetes.io/instance, deletion-policy: retain, ownerRef
+    - name: ac10-layer-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac10
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: meta-layer.zip
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac10
+                namespace: lambdalayerversion
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: layer-ac10
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              OWNER=$(kubectl get layerversion layer-ac10 -n lambdalayerversion \
+                -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              echo "ownerRef kind: $OWNER"
+              [ "$OWNER" = "LambdaLayerVersion" ] || { echo "FAIL: ownerRef.kind should be LambdaLayerVersion, got $OWNER"; exit 1; }
+              CTRL=$(kubectl get layerversion layer-ac10 -n lambdalayerversion \
+                -o jsonpath='{.metadata.ownerReferences[0].controller}')
+              echo "ownerRef controller: $CTRL"
+              [ "$CTRL" = "true" ] || { echo "FAIL: ownerRef.controller should be true"; exit 1; }
+
+    # ── AC-11: deletion policy — delete ──────────────────────────────────────
+    - name: ac11-layer-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaLayerVersion
+              metadata:
+                name: layer-ac11
+                namespace: lambdalayerversion
+              spec:
+                configRef: general-policy
+                deletionPolicy: delete
+                content:
+                  s3Bucket: my-layers-bucket
+                  s3Key: delete-policy-layer.zip
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: LayerVersion
+              metadata:
+                name: layer-ac11
+                namespace: lambdalayerversion
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
