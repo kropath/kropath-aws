@@ -12,129 +12,105 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ---
+# RDSSubnetGroup RGD
+#
+# Composes: rds.services.k8s.aws/DBSubnetGroup (ACK RDS Controller v1.10.2)
+# ACK CRD cache: docs/crd-cache/aws/rds-controller-v1.10.2.md §DBSubnetGroup
+#
+# Governance: Tags, syncedLabels, syncedAnnotations flow through RDSConfig
+# effectiveConfig cascade (ADR-010). No subnet-group-specific governance fields.
+#
+# Naming: effectiveName = {namespace}-{name} by default (overridable via
+# spec.nameOverride or mandatory/defaults namingTemplate).
+# Cloud resource name: ACK DBSubnetGroup.spec.name
+#
+# Predicted ARN format: arn:aws:rds:<region>:<accountId>:subgrp/<effectiveName>
+#
+# Tags: ACK DBSubnetGroup.spec.tags is array<{key, value}> (not map).
+# allCloudMetadata map converted via .transformList(k, v, {"key": k, "value": v}).
+#
+# Config lookup: selector.matchLabels (Theme 28 / KRO-221) — CEL not evaluated
+# in externalRef.metadata.name. rsrcCfg is a list; always guard with
+# rsrcCfg.size() > 0 before indexing rsrcCfg[0].
 apiVersion: kro.run/v1alpha1
 kind: ResourceGraphDefinition
 metadata:
-  name: elbtargetgroup.aws.kropath.run
+  name: rdssubnetgroup.aws.kropath.run
 spec:
   schema:
     apiVersion: v1alpha1
     group: aws.kropath.run
-    kind: ELBTargetGroup
+    kind: RDSSubnetGroup
     scope: Namespaced
     spec:
+      # Standard kropath governance fields
       configRef: string | default=general-policy
       nameOverride: string | default=""
       deletionPolicy: string | default=retain
       tags: map[string]string | default={}
       syncedLabels: map[string]string | default={}
       syncedAnnotations: map[string]string | default={}
-      # Target type — instance (default) | ip | lambda | alb; immutable after creation
-      targetType: string | default=instance
-      # Protocol — ALB: HTTP | HTTPS; NLB: TCP | TLS | UDP | TCP_UDP; GWLB: GENEVE; lambda/alb: omit
-      protocol: string | default=""
-      # Protocol version — HTTP1 (default) | HTTP2 | GRPC; HTTP/HTTPS only
-      protocolVersion: string | default=""
-      # Port targets receive traffic on (int64); 0 = not set (Lambda targets only)
-      port: integer | default=0
-      # VPC ID — required by AWS API for non-Lambda targets
-      vpcId: string | default=""
-      # IP address type — ipv4 (default) | ipv6
-      ipAddressType: string | default=ipv4
-      # Health check configuration
-      healthCheck:
-        # enabled is tri-state: declared without default so has() can distinguish unset from false.
-        # Unset → ACK uses AWS default (always true for instance/ip/alb; false for lambda).
-        # Set to false → explicitly disable (Lambda target groups only).
-        enabled: boolean
-        protocol: string | default=""
-        port: string | default=""
-        path: string | default=""
-        intervalSeconds: integer | default=0
-        timeoutSeconds: integer | default=0
-        healthyThresholdCount: integer | default=0
-        unhealthyThresholdCount: integer | default=0
-      # matcher: HTTP/gRPC success codes for health checks
-      matcher:
-        httpCode: string | default=""
-        grpcCode: string | default=""
-      # deregistrationDelay — seconds to wait before deregistering a target (0 = use AWS default 300).
-      # Range: 0-3600. Folded into ACK attributes as deregistration_delay.timeout_seconds.
-      deregistrationDelay: integer | default=0
-      # slowStartDuration — seconds of slow-start warm-up (0 = disabled). Range: 30-900.
-      # Folded into ACK attributes as slow_start.duration_seconds when non-zero.
-      slowStartDuration: integer | default=0
-      # Additional target group attributes beyond the typed fields above
-      additionalAttributes: "[]TGAttribute | default=[]"
-      # stickiness — target group stickiness config; type="" means not configured.
-      stickiness:
-        enabled: boolean | default=false
-        type: string | default=""
-        # durationSeconds is a string (e.g. "3600") because ELBv2 attributes are string key-value pairs.
-        durationSeconds: string | default=""
-      # targets — static target registrations for instance/ip targets.
-      targets: "[]TGTarget | default=[]"
-    types:
-      TGAttribute:
-        key: string | default=""
-        value: string | default=""
-      TGTarget:
-        id: string | default=""
-        port: integer | default=0
-        availabilityZone: string | default=""
+      # Subnet group fields (both required by ACK DBSubnetGroup)
+      description: string
+      subnetIDs: "[]string | required=true"
     status:
       resourceName: >-
         ${naming.data.resourceName}
       namingStatus: >-
         ${naming.data.namingStatus}
-      conditions: >-
-        ${tg.?status.?conditions.orValue([])}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{")
+          ? "arn:aws:rds:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":subgrp/" + naming.data.resourceName
+          : ""}
     additionalPrinterColumns:
-      - name: TargetType
-        type: string
-        jsonPath: .spec.targetType
       - name: ResourceName
         type: string
         jsonPath: .status.resourceName
       - name: NamingStatus
         type: string
         jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+
   resources:
     # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
     # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
-    # kro infers rsrcCfg as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
     - id: rsrcCfg
       externalRef:
         apiVersion: aws.kropath.run/v1alpha1
-        kind: ELBConfig
+        kind: RDSConfig
         metadata:
           namespace: ${schema.metadata.namespace}
           selector:
             matchLabels:
               aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
 
-    # Naming ConfigMap — materialises effectiveName and resourceName (with .lowerAscii() for ELB
-    # constraints) and namingStatus without requiring schema.* access in the status block.
+    # ConfigMap to materialise effectiveName, resourceName, and namingStatus.
+    # Computed here because schema.* is out of scope in the status block
+    # (see kropath-aws/docs/frequent-rgd-errors.md §3).
     - id: naming
       template:
         apiVersion: v1
         kind: ConfigMap
         metadata:
-          name: ${schema.metadata.name}-elbtg-naming
+          name: ${schema.metadata.name}-naming
           namespace: ${schema.metadata.namespace}
           labels:
             aws.kropath.run/resource-name: ${schema.metadata.name}
-            aws.kropath.run/kropath-type: elbtg-naming
+            aws.kropath.run/kropath-type: rdssubnetgroup-naming
           ownerReferences:
             - apiVersion: aws.kropath.run/v1alpha1
-              kind: ELBTargetGroup
+              kind: RDSSubnetGroup
               name: ${schema.metadata.name}
               uid: ${schema.metadata.uid}
               controller: true
               blockOwnerDeletion: true
         data:
-          # effectiveName: resolved via naming template with {tag.X} dynamic substitution.
-          # Template priority: mandatory → defaults → fallback "{namespace}-{name}".
+          # effectiveName: cloud resource name resolved from naming template or nameOverride.
+          # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+          # Any {tag.X} token whose key is absent in all tiers is kept verbatim so namingStatus
+          # reports "invalid-unresolved-tokens".
           effectiveName: >-
             ${(schema.spec.nameOverride != ""
               ? schema.spec.nameOverride
@@ -174,7 +150,6 @@ spec:
               .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
               .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
               .replace("{configRef}", schema.spec.configRef))}
-          # resourceName applies .lowerAscii() for ELB naming constraints (max 32 chars, alphanumeric + hyphens)
           resourceName: >-
             ${(schema.spec.nameOverride != ""
               ? schema.spec.nameOverride
@@ -213,8 +188,7 @@ spec:
               .replace("{namespace}", schema.metadata.namespace)
               .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
               .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
-              .replace("{configRef}", schema.spec.configRef))
-              .lowerAscii()}
+              .replace("{configRef}", schema.spec.configRef))}
           namingStatus: >-
             ${(schema.spec.nameOverride != ""
               ? schema.spec.nameOverride
@@ -257,13 +231,14 @@ spec:
               ? "invalid-unresolved-tokens"
               : "valid"}
 
-    # ACK ELBv2 TargetGroup CR — primary cloud resource.
-    # No status.predictedArn: ELBv2 ARNs include a hash suffix assigned by AWS at creation.
-    # Use status.ackResourceMetadata.arn at runtime.
-    - id: tg
+    # ACK DBSubnetGroup CR — primary cloud resource.
+    # Only created when resourceName has no unresolved {tag.X} tokens.
+    - id: ackDBSubnetGroup
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
       template:
-        apiVersion: elbv2.services.k8s.aws/v1alpha1
-        kind: TargetGroup
+        apiVersion: rds.services.k8s.aws/v1alpha1
+        kind: DBSubnetGroup
         metadata:
           name: ${schema.metadata.name}
           namespace: ${schema.metadata.namespace}
@@ -279,78 +254,27 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           ownerReferences:
             - apiVersion: aws.kropath.run/v1alpha1
-              kind: ELBTargetGroup
+              kind: RDSSubnetGroup
               name: ${schema.metadata.name}
               uid: ${schema.metadata.uid}
               controller: true
               blockOwnerDeletion: true
         spec:
-          # Cloud resource name — controlled by naming template / nameOverride (max 32 chars)
+          # Cloud resource name (effectiveName from naming ConfigMap)
           name: ${naming.data.resourceName}
-          targetType: ${schema.spec.targetType}
-          protocol: ${schema.spec.protocol}
-          protocolVersion: ${schema.spec.protocolVersion}
-          port: ${schema.spec.port}
-          vpcID: ${schema.spec.vpcId}
-          ipAddressType: ${schema.spec.ipAddressType}
-          # Health check fields — pass-through from spec; 0 / "" means not set (AWS uses defaults).
-          # healthCheckEnabled is tri-state in schema (bare boolean, no default=false) so has() can
-          # distinguish "not set" (use AWS default) from "explicitly false" (Lambda targets only).
-          healthCheckEnabled: >-
-            ${has(schema.spec.healthCheck) && has(schema.spec.healthCheck.enabled)
-              ? schema.spec.healthCheck.enabled
-              : true}
-          healthCheckProtocol: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.protocol : ""}
-          healthCheckPort: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.port : ""}
-          healthCheckPath: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.path : ""}
-          healthCheckIntervalSeconds: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.intervalSeconds : 0}
-          healthCheckTimeoutSeconds: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.timeoutSeconds : 0}
-          healthyThresholdCount: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.healthyThresholdCount : 0}
-          unhealthyThresholdCount: >-
-            ${has(schema.spec.healthCheck) ? schema.spec.healthCheck.unhealthyThresholdCount : 0}
-          # matcher: HTTP/gRPC success codes for health check responses
-          matcher:
-            httpCode: ${schema.spec.matcher.httpCode}
-            grpcCode: ${schema.spec.matcher.grpcCode}
-          # Additional target group attributes (e.g. deregistration_delay.timeout_seconds).
-          # Stickiness fields are folded in when stickiness.type is set.
-          attributes: >-
-            ${schema.spec.additionalAttributes.map(a, {"key": a.key, "value": a.value})
-              + (schema.spec.deregistrationDelay > 0
-                ? [{"key": "deregistration_delay.timeout_seconds", "value": string(schema.spec.deregistrationDelay)}]
-                : [])
-              + (schema.spec.slowStartDuration > 0
-                ? [{"key": "slow_start.duration_seconds", "value": string(schema.spec.slowStartDuration)}]
-                : [])
-              + (schema.spec.stickiness.type != ""
-                ? ([{"key": "stickiness.enabled", "value": schema.spec.stickiness.enabled ? "true" : "false"},
-                    {"key": "stickiness.type", "value": schema.spec.stickiness.type}]
-                   + (schema.spec.stickiness.durationSeconds != ""
-                     ? [{"key": "stickiness.lb_cookie.duration_seconds",
-                         "value": schema.spec.stickiness.durationSeconds}]
-                     : []))
-                : [])}
-          # Static target registrations.
-          targets: >-
-            ${schema.spec.targets.map(t,
-              {"id": t.id, "port": t.port, "availabilityZone": t.availabilityZone})}
-          # Cloud resource tags — ACK ELBv2 uses []Tag (key/value pairs), not map[string]string.
-          # Merge order: defaults (lowest) → spec → mandatory (highest).
-          # syncedLabels and syncedAnnotations are included in cloud tags (ADR-015 §6.1).
+          description: ${schema.spec.description}
+          subnetIDs: ${schema.spec.subnetIDs}
+          # Cloud resource tags — ACK DBSubnetGroup spec.tags is array<{key, value}> (not map).
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
           tags: >-
-            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
-              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
-              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
               .merge(schema.spec.tags)
               .merge(schema.spec.syncedLabels)
               .merge(schema.spec.syncedAnnotations)
-              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})
-              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
-              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
               .transformList(k, v, {"key": k, "value": v})}

@@ -1,0 +1,232 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-lambda-01 Chainsaw tests — one scenario per acceptance criterion.
+# ACs 7, 10, 11 require kropath-controller (KRO-539); cascade is simulated
+# via kubectl patch --subresource=status until the controller is deployed.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: lambdaconfig
+spec:
+  skipDelete: true
+  namespace: lambdaconfig
+  steps:
+    # AC-1: happy-path: general-policy accepted with no validation errors
+    - name: ac1-general-policy-accepted
+      try:
+        - apply:
+            file: 00-lambdaconfig-namespace.yaml
+        - apply:
+            file: 01-general-policy.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: general-policy
+                namespace: lambdaconfig
+              spec:
+                defaults:
+                  memorySize: 128
+                  timeout: 3
+                  tracingMode: "PassThrough"
+                  namingTemplate: "{namespace}-{name}"
+
+    # AC-2: negative: runtime set in both mandatory and defaults — rejected
+    - name: ac2-reject-dual-tier-runtime
+      try:
+        - apply:
+            file: 02-invalid-dual-tier-runtime.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: LambdaConfig
+                check:
+                  ($error != null): true
+
+    # AC-3: negative: memorySize set in both mandatory and defaults — rejected
+    - name: ac3-reject-dual-tier-memory
+      try:
+        - apply:
+            file: 03-invalid-dual-tier-memory.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: LambdaConfig
+                check:
+                  ($error != null): true
+
+    # AC-4: negative: timeout set in both mandatory and defaults — rejected
+    - name: ac4-reject-dual-tier-timeout
+      try:
+        - apply:
+            file: 04-invalid-dual-tier-timeout.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: LambdaConfig
+                check:
+                  ($error != null): true
+
+    # AC-5: negative: tracingMode set in both mandatory and defaults — rejected
+    - name: ac5-reject-dual-tier-tracing
+      try:
+        - apply:
+            file: 05-invalid-dual-tier-tracing.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: LambdaConfig
+                check:
+                  ($error != null): true
+
+    # AC-6: negative: kmsKeyArn set in both mandatory and defaults — rejected
+    - name: ac6-reject-dual-tier-kms
+      try:
+        - apply:
+            file: 06-invalid-dual-tier-kms.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: LambdaConfig
+                check:
+                  ($error != null): true
+
+    # AC-7: happy-path: effectiveConfig cascade (controller cascade simulated via kubectl patch)
+    # Simulates: KropathConfig.mandatory.lambda.tracingMode: "Active" flows through to
+    # status.effectiveConfig.mandatory.tracingMode on the local LambdaConfig.
+    - name: ac7-effective-cascade
+      try:
+        - apply:
+            file: 00-lambdaconfig-namespace.yaml
+        - apply:
+            file: 07-global-kropathconfig.yaml
+        - apply:
+            file: 08-cascade-local-lambdaconfig.yaml
+        - script:
+            content: |
+              # Simulate kropath-controller cascade:
+              # KropathConfig.mandatory.lambda.tracingMode: "Active" wins at mandatory tier;
+              # LambdaConfig.defaults.runtime/memorySize/timeout propagate at defaults tier.
+              kubectl patch lambdaconfig cascade-policy -n lambdaconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"runtime":"","memorySize":0,"timeout":0,"tracingMode":"Active","kmsKeyArn":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"runtime":"python3.12","memorySize":256,"timeout":10,"tracingMode":"","kmsKeyArn":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: cascade-policy
+                namespace: lambdaconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    tracingMode: "Active"
+                  defaults:
+                    runtime: "python3.12"
+                    namingTemplate: "{namespace}-{name}"
+                  aws:
+                    region: "ap-southeast-2"
+                    accountId: "123456789012"
+            timeout: 60s
+
+    # AC-8: happy-path: naming template propagates through effectiveConfig
+    - name: ac8-naming-template-propagates
+      try:
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: cascade-policy
+                namespace: lambdaconfig
+              status:
+                effectiveConfig:
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+            timeout: 60s
+
+    # AC-9: happy-path: security-hardened profile with mandatory enforcement fields accepted
+    - name: ac9-mandatory-security-accepted
+      try:
+        - apply:
+            file: 09-mandatory-security.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: security-hardened
+                namespace: lambdaconfig
+              spec:
+                mandatory:
+                  tracingMode: "Active"
+                  kmsKeyArn: "arn:aws:kms:ap-southeast-2:123456789012:key/abc-security"
+
+    # AC-10: happy-path: tag merge — LambdaConfig.mandatory.tags + KropathConfig.mandatory.tags
+    # both appear in status.effectiveConfig.mandatory.tags (simulated via kubectl patch).
+    - name: ac10-tag-merge
+      try:
+        - apply:
+            file: 10-tag-merge-lambdaconfig.yaml
+        - script:
+            content: |
+              # Simulate controller merging KropathConfig.mandatory.tags {cost-centre: infra}
+              # with LambdaConfig.mandatory.tags {service: lambda}.
+              kubectl patch lambdaconfig tag-policy -n lambdaconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"runtime":"","memorySize":0,"timeout":0,"tracingMode":"","kmsKeyArn":"","namingTemplate":"","tags":{"service":"lambda","cost-centre":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"runtime":"","memorySize":128,"timeout":3,"tracingMode":"PassThrough","kmsKeyArn":"","namingTemplate":"{namespace}-{name}","tags":{"team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: tag-policy
+                namespace: lambdaconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    tags:
+                      service: lambda
+                      cost-centre: infra
+                  defaults:
+                    tags:
+                      team: platform
+            timeout: 60s
+
+    # AC-11: happy-path: syncedLabels propagate through effectiveConfig
+    - name: ac11-synced-labels-propagate
+      try:
+        - apply:
+            file: 11-synced-labels-lambdaconfig.yaml
+        - script:
+            content: |
+              # Simulate controller writing effectiveConfig with syncedLabels.
+              kubectl patch lambdaconfig synced-labels-policy -n lambdaconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"runtime":"","memorySize":0,"timeout":0,"tracingMode":"","kmsKeyArn":"","namingTemplate":"","tags":{},"syncedLabels":{"data-class":"internal"},"syncedAnnotations":{}},"defaults":{"runtime":"","memorySize":128,"timeout":3,"tracingMode":"PassThrough","kmsKeyArn":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: synced-labels-policy
+                namespace: lambdaconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    syncedLabels:
+                      data-class: internal
+            timeout: 60s

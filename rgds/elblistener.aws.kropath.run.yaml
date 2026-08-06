@@ -31,9 +31,9 @@ spec:
       tags: map[string]string | default={}
       syncedLabels: map[string]string | default={}
       syncedAnnotations: map[string]string | default={}
-      # ARN of the load balancer this listener belongs to.
-      # One of loadBalancerArn or a direct reference is required by AWS.
-      loadBalancerArn: string | default=""
+      # K8s name of the ELBLoadBalancer CR this listener belongs to (ACK ref pattern).
+      # RGD maps this to ACK's loadBalancerRef.from.name.
+      loadBalancerRef: string | default=""
       # protocol — ALB: HTTP | HTTPS; NLB: TCP | TLS | UDP | TCP_UDP; GWLB: omit.
       protocol: string | default=""
       # port — listener port; 0 = not set (GWLB listeners omit port).
@@ -41,10 +41,12 @@ spec:
       # sslPolicy — TLS security policy name (HTTPS/TLS only).
       # Governance cascade: mandatory.sslPolicy > spec.sslPolicy > defaults.sslPolicy.
       sslPolicy: string | default=""
-      # certificates — default SSL certificate(s) for HTTPS/TLS listeners.
-      certificates: "[]Certificate | default=[]"
-      # alpnPolicy — ALPN policy list for NLB TLS listeners.
-      alpnPolicy: "[]string | default=[]"
+      # certificateArn — ARN of the default SSL certificate for HTTPS/TLS listeners.
+      # RGD wraps this scalar to ACK's certificates list: [{certificateARN: <value>, isDefault: false}].
+      certificateArn: string | default=""
+      # alpnPolicy — ALPN policy name for NLB TLS listeners (scalar).
+      # RGD wraps this to a single-element list for ACK.
+      alpnPolicy: string | default=""
       # defaultActions — required routing rules. Supports forward, redirect, fixed-response, and weighted-forward.
       defaultActions: "[]ListenerAction | default=[]"
       # mutualAuthentication — mTLS config for HTTPS listeners (mode=off disables; verify/passthrough enable).
@@ -53,14 +55,12 @@ spec:
         trustStoreArn: string | default=""
         ignoreClientCertificateExpiry: boolean | default=false
     types:
-      Certificate:
-        certificateArn: string | default=""
       ListenerAction:
         type: string | default=forward
         order: integer | default=0
-        # For simple forward actions: ARN of the target group.
-        targetGroupArn: string | default=""
-        # weightedTargetGroups: list of {targetGroupArn, weight} for weighted-forward actions.
+        # K8s name of the ELBTargetGroup CR for simple forward actions (ACK ref pattern).
+        targetGroupRef: string | default=""
+        # weightedTargetGroups: list of {targetGroupRef, weight} for weighted-forward actions.
         # Declared at ListenerAction top level because kro v0.9.2 does not support []CustomType
         # inside an inline nested object inside a type (only inside the type directly).
         weightedTargetGroups: "[]ForwardTargetGroup | default=[]"
@@ -83,7 +83,7 @@ spec:
           contentType: string | default=""
           messageBody: string | default=""
       ForwardTargetGroup:
-        targetGroupArn: string | default=""
+        targetGroupRef: string | default=""
         weight: integer | default=0
     status:
       conditions: >-
@@ -136,7 +136,9 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          loadBalancerARN: ${schema.spec.loadBalancerArn}
+          loadBalancerRef:
+            from:
+              name: ${schema.spec.loadBalancerRef}
           protocol: ${schema.spec.protocol}
           port: ${schema.spec.port}
           # sslPolicy governance: mandatory overrides spec, spec overrides defaults.
@@ -146,14 +148,18 @@ spec:
               : (schema.spec.sslPolicy != ""
                   ? schema.spec.sslPolicy
                   : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?sslPolicy.orValue("") : ""))}
-          # certificates — ACK uses certificateARN (uppercase ARN). dyn() forces the
-          # single-key map literal to map(string, dyn); without it kro infers a
-          # homogeneous map(string, string) that cannot coerce to the ACK Certificate
-          # struct (whose isDefault field is bool). See docs/frequent-rgd-errors.md
-          # §"Single-Key Map Literal Cannot Coerce to Multi-Type ACK Struct".
+          # certificates — RGD wraps the scalar certificateArn to ACK's []Certificate format.
+          # When empty, pass empty list (HTTP/TCP listeners need no certificate).
           certificates: >-
-            ${schema.spec.certificates.map(c, {"certificateARN": dyn(c.certificateArn)})}
-          alpnPolicy: ${schema.spec.alpnPolicy}
+            ${schema.spec.certificateArn != ""
+              ? [{"certificateARN": schema.spec.certificateArn, "isDefault": false}]
+              : []}
+          # alpnPolicy — RGD wraps the scalar to a single-element list for ACK.
+          # When empty (non-TLS listeners), pass empty list.
+          alpnPolicy: >-
+            ${schema.spec.alpnPolicy != ""
+              ? [schema.spec.alpnPolicy]
+              : []}
           # defaultActions — type-conditional mapping avoids sending empty sub-config objects
           # to ACK/AWS for action types that don't use them.
           defaultActions: >-
@@ -161,12 +167,12 @@ spec:
               a.type == "forward" && a.weightedTargetGroups.size() > 0
                 ? {"type": "forward", "order": a.order, "forwardConfig": {
                     "targetGroups": a.weightedTargetGroups.map(tg, {
-                      "targetGroupARN": tg.targetGroupArn, "weight": tg.weight}),
+                      "targetGroupRef": {"from": {"name": tg.targetGroupRef}}, "weight": tg.weight}),
                     "targetGroupStickinessConfig": {
                       "enabled": a.forwardConfig.targetGroupStickinessConfig.enabled,
                       "durationSeconds": a.forwardConfig.targetGroupStickinessConfig.durationSeconds}}}
               : a.type == "forward"
-                ? {"type": "forward", "targetGroupARN": a.targetGroupArn, "order": a.order}
+                ? {"type": "forward", "targetGroupRef": {"from": {"name": a.targetGroupRef}}, "order": a.order}
               : a.type == "redirect"
                 ? {"type": "redirect", "order": a.order, "redirectConfig": {
                     "protocol": a.redirectConfig.protocol,
@@ -182,7 +188,7 @@ spec:
                     "contentType": a.fixedResponseConfig.contentType,
                     "messageBody": a.fixedResponseConfig.messageBody
                   }}
-              : {"type": a.type, "order": a.order, "targetGroupARN": a.targetGroupArn})}
+              : {"type": a.type, "order": a.order, "targetGroupRef": {"from": {"name": a.targetGroupRef}}})}
           # mutualAuthentication — mTLS for HTTPS listeners; pass mode=off (default) to disable.
           mutualAuthentication:
             mode: ${schema.spec.mutualAuthentication.mode}

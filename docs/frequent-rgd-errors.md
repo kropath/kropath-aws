@@ -49,6 +49,45 @@ This document tracks technical friction points, syntax limitations, and runtime 
 
 ---
 
+### List Concatenation Uses the `+` Operator — kro's CEL Has No `.concat()`
+
+* **What Fails:** Appending one list to another with a `.concat()` method call. kro's CEL environment does **not** register a `concat` function, so the RGD never compiles:
+    ```yaml
+    # ❌ RGD stays Inactive — kro rejects it at validation time
+    attributes: >-
+      ${schema.spec.additionalAttributes.map(a, {"key": a.key, "value": a.value})
+        .concat(schema.spec.stickiness.type != ""
+          ? [{"key": "stickiness.enabled", "value": schema.spec.stickiness.enabled ? "true" : "false"}]
+          : [])}
+    ```
+  The RGD's `Ready`/`GraphAccepted` condition reports:
+    ```
+    failed to validate resource "tg": failed to compile template expression "...": ERROR: <input>:2:10: undeclared reference to 'concat' (in container '')
+    Reason: InvalidResourceGraph
+    State:  Inactive
+    ```
+
+* **Why it is dangerous:** An `Inactive` RGD is silent in normal use, but the CI `setup` step waits for **every** RGD to become `Ready` (`kubectl wait ... --for=condition=... resourcegraphdefinition --all`). One RGD stuck `Inactive` makes that wait **time out**, and — because the wait is over all RGDs at once — the failure log lists *every* RGD as "timed out waiting for the condition", masking which one is actually broken. The real culprit is only visible via `kubectl describe rgd <name>` → look for `Reason: InvalidResourceGraph`. Symptom seen in CI: `make: *** [Makefile:20: setup] Error 1` with a wall of unrelated-looking RGD timeouts.
+
+* **What Works Instead:** Use the CEL `+` operator, which concatenates lists (and works for the nested case too):
+    ```yaml
+    # ✅ compiles; RGD reaches Active
+    attributes: >-
+      ${schema.spec.additionalAttributes.map(a, {"key": a.key, "value": a.value})
+        + (schema.spec.stickiness.type != ""
+          ? ([{"key": "stickiness.enabled", "value": schema.spec.stickiness.enabled ? "true" : "false"},
+              {"key": "stickiness.type", "value": schema.spec.stickiness.type}]
+             + (schema.spec.stickiness.durationSeconds != ""
+               ? [{"key": "stickiness.lb_cookie.duration_seconds", "value": schema.spec.stickiness.durationSeconds}]
+               : []))
+          : [])}
+    ```
+  Note: `+` concatenates *positionally* — it does **not** deduplicate keys. For cross-tier tag/label maps where later tiers must overwrite earlier ones, do **not** use `+` on transformed lists; merge maps first and `.transformList()` last (see "Cross-Tier Tag/Label Merge — Prefer Map Merge Over List Concatenation" in §4). Use `+` only when you genuinely want to append list segments that carry no key-uniqueness contract (e.g. folding optional stickiness attributes onto a passthrough attribute list).
+
+* **First move when an RGD is `Inactive`:** `kubectl describe rgd <name>.aws.kropath.run` and read the `GraphAccepted`/`Ready` condition `Message` — it quotes the exact CEL expression and column where compilation failed. Do not trust the CI "timed out on all RGDs" wall; describe the RGDs to find the one with `InvalidResourceGraph`.
+
+---
+
 ## 3. Top-Level Status Scoping Constraints
 
 ### Scope Tracking of `schema` and `instance` Tokens
@@ -772,5 +811,62 @@ This document tracks technical friction points, syntax limitations, and runtime 
   aggregated ClusterRole in `tests/fixtures/rbac/kro-controller.yaml` so the kro
   ServiceAccount may create/get the child resources. Missing (1) → RGD stuck `Inactive`
   with `schema not found`; missing (2) → child never created, `forbidden` in instance status.
+
+---
+
+### kro Simple-Schema Has No `number` Type — Use `float` for Floating-Point Fields
+
+* **What Fails:** An RGD schema field declared `myField: number` (e.g. `serverlessV2ScalingMinCapacity: number | default=0`) makes the RGD stuck `Inactive`/`GraphAccepted=False`:
+    ```
+    failed to build OpenAPI schema for instance: field serverlessV2ScalingMinCapacity: unknown type: number
+    ```
+* **Why:** kro v0.9.2 simple-schema recognizes exactly four atomic scalar types — `string`, `integer`, `boolean`, `float` (source: `pkg/simpleschema/types/atomic.go`). `number` is **not** one of them, even though it is the OpenAPI wire type. `float` is what maps to the OpenAPI `number` type internally (`float` in → `type: number` out in the generated CRD).
+* **What Works Instead:** Declare floating-point governance fields as `float`:
+    ```yaml
+    serverlessV2ScalingMinCapacity: float | default=0
+    serverlessV2ScalingMaxCapacity: float | default=0
+    ```
+* **The cascade trap this creates in `setup.sh`:** `setup.sh` ends with `kubectl wait rgd --all --for=condition=Ready --timeout=120s`. **One** `Inactive` RGD makes that single `wait` time out, and the timeout message lists **every** RGD not yet `Ready` at the 120s mark — typically the alphabetically-last ones (`s3bucket`, `secretsmanager`, `sns`, `sqs`, …) that simply had not finished reconciling. Those are **red herrings**: the only broken RGD is the `Inactive` one. Always `kubectl get rgd` and look for `STATE=Inactive` first; do not chase the RGDs merely listed in the `wait` timeout. Confirm the real cause with `kubectl get rgd <name> -o jsonpath='{.status.conditions}'` (look for `reason: InvalidResourceGraph`).
+
+### Config-CRD Mutual-Exclusion `x-kubernetes-validations` Broken by Non-Zero `spec.defaults` CRD Defaults
+
+* **What Fails:** A governance config CRD (`<Service>Config`) has both (a) `spec.mandatory` / `spec.defaults` tiers with per-field CRD `default:` values, and (b) mutual-exclusion validation rules like *"`storageEncrypted` cannot be set in both mandatory and defaults simultaneously"*. A **minimal, legitimate** config — e.g. `spec.mandatory.storageEncrypted: true` plus any `spec.defaults` field (say `namingTemplate`) — is rejected at CREATE:
+    ```
+    RDSConfig "in2-cfg" is invalid: <nil>: Invalid value: storageEncrypted cannot be set in both mandatory and defaults simultaneously.
+    ```
+* **Why:** This is the value-guarded cousin of "[Boolean Field Presence Check (`has()`) Broken by CRD Defaults](#boolean-field-presence-check-has-broken-by-crd-defaults)". The rules are value-guarded (`&& defaults.X == true`), so a mandatory field colliding with a materialized **zero-value** default (`false`/`""`/`0`) is fine. But when the `spec.defaults` tier carries **non-zero "secure baseline" defaults** (`storageEncrypted: true`, `backupRetentionPeriod: 7`, `storageType: "gp3"`, `namingTemplate: "{namespace}-{name}"`, …), merely creating any `spec.defaults` object makes the apiserver materialize `defaults.storageEncrypted: true` — which then collides with an explicit `mandatory.storageEncrypted: true` and trips the rule. CRD-schema defaults on a tier are **fundamentally incompatible** with a cross-tier mutual-exclusion contract: you could never put a field in `mandatory` because the same field auto-materializes `true` in `defaults`.
+* **What Works Instead:** Remove **all scalar `default:` values** from `spec.mandatory` and `spec.defaults` (keep the `default: {}` on the tier objects and on `tags`/`syncedLabels`/`syncedAnnotations` maps). Then `has()`/materialization reflects true admin intent, the mutual-exclusion rules only fire when the admin **explicitly** sets both tiers, and both the negative tests (explicit dual-tier → rejected) and the positive cascade tests (single-tier → accepted) pass. The `status.effectiveConfig` tiers (consumed by the RGD, and in tests patched manually) must **never** carry defaults either.
+
+### Numeric (`float`) Instance-Spec Values Must Be Unquoted in Test Fixtures
+
+* **What Fails:** After changing an RGD schema field to `float` (OpenAPI `number`), a test fixture that passes a **quoted** value fails at CREATE of the instance/child:
+    ```
+    RDSCluster "cl7-cluster" is invalid: spec.serverlessV2ScalingMinCapacity: Invalid value: "string": ... must be of type number: "string"
+    ```
+* **Why:** `serverlessV2ScalingMinCapacity: "0.5"` is a YAML **string**, not a number. A `number`-typed field rejects it.
+* **What Works Instead:** Write numeric literals unquoted — `serverlessV2ScalingMinCapacity: 0.5`. **Do not confuse this with** the "[YAML 1.1 Boolean Coercion](#yaml-11-boolean-coercion-of-single-letterword-field-values-the-norway-problem)" / *"quote inline CEL ternary YAML values"* rules — those apply to **CEL expression strings** in the RGD YAML (where a bare `${...}` starting with a special char must be quoted), never to plain numeric literals in instance fixtures.
+
+### A `- script:` Querying a kro Child Must Be Preceded by an `- assert:` on That Child
+
+* **What Fails:** A chainsaw step does `- apply:` (the kro instance CR) immediately followed by a `- script:` that runs `kubectl get <child> ... | jq`. The script races the kro reconciler and reads the child before it exists:
+    ```
+    === STDERR
+    Error from server (NotFound): dbinstances.rds.services.k8s.aws "in16-inst" not found
+    === ERROR
+    exit status 4
+    ```
+* **Why:** `- script:` steps run **once** with no retry. `- assert:` steps, by contrast, retry until `AssertTimeout` (5m). A bare script has no wait, so it fires the instant the apply returns — before kro has generated the child.
+* **What Works Instead:** Insert a minimal `- assert:` on the child (any stable field, e.g. `spec.engine`) between the `- apply:` and the `- script:`. Chainsaw blocks on the assert until the child materializes, then the order-independent `jq` checks run against a real object:
+    ```yaml
+    - apply: { resource: { kind: RDSInstance, ... } }
+    - assert:
+        resource:
+          apiVersion: rds.services.k8s.aws/v1alpha1
+          kind: DBInstance
+          metadata: { name: in16-inst, namespace: rdsinstance }
+          spec: { engine: mysql }
+    - script: { content: "kubectl get dbinstance in16-inst ... | jq ..." }
+    ```
+  Two related fixture bugs surface in the same steps: (1) **synced labels carry the `aws.kropath.run/` prefix** — assert `.metadata.labels["aws.kropath.run/team"]`, never bare `kropath.run/team`; (2) **advisory ConfigMaps are named `${schema.metadata.name}-<suffix>`** (e.g. `in21-inst-password-exclusion-error`), not the bare instance name — assert the full generated name.
 
 ---
