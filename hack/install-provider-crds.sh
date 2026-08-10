@@ -47,7 +47,10 @@ if [ "${SKIP_ACK}" = "false" ]; then
 
   mkdir -p "tmp"
   for service in ${ACK_SERVICES}; do
-    version=$(resolve_ack_chart_version "${service}")
+    version=$(resolve_ack_chart_version "${service}") || {
+      echo "    WARNING: Could not resolve ACK chart version for ${service} (GitHub API error) — skipping."
+      continue
+    }
     echo "  -> ACK ${service}..."
 
     # Extract CRDs only from the Helm chart (no controller pod required locally).
