@@ -72,6 +72,6 @@ echo "==> Installing kropath.run RGDS definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"
 
 echo "==> Waiting for all RGDs to become Ready (kro must generate CRDs before tests run)..."
-kubectl wait rgd --all --for=condition=Ready --timeout=120s
+kubectl wait rgd --all --for=condition=Ready --timeout=300s
 
 echo "==> Test environment ready."
