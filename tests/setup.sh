@@ -72,6 +72,26 @@ echo "==> Installing kropath.run RGDS definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"
 
 echo "==> Waiting for all RGDs to become Ready (kro must generate CRDs before tests run)..."
-kubectl wait rgd --all --for=condition=Ready --timeout=300s
+if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
+  echo "==> DIAGNOSTIC: RGD states after timeout:"
+  kubectl get rgd --output=wide
+  echo "==> DIAGNOSTIC: Conditions for non-Ready RGDs:"
+  kubectl get rgd -o json | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for item in data['items']:
+    name = item['metadata']['name']
+    state = item.get('status', {}).get('state', 'unknown')
+    if state != 'Active':
+        conditions = item.get('status', {}).get('conditions', [])
+        for c in conditions:
+            if c.get('type') == 'Ready' and c.get('status') != 'True':
+                print(f'{name}: {c.get(\"reason\",\"\")} — {c.get(\"message\",\"\")}')
+                break
+        else:
+            print(f'{name}: state={state} (no Ready condition)')
+"
+  exit 1
+fi
 
 echo "==> Test environment ready."
