@@ -944,3 +944,179 @@ spec:
                 namespace: autoscalinggroup
                 annotations:
                   services.k8s.aws/deletion-policy: delete
+
+    # Spec-AC-7 (kro boolean limitation): defaults.newInstancesProtectedFromScaleIn=true +
+    # instance explicitly false → expected false per spec (instance wins), but actual true.
+    # kro v0.9.2 strips zero-value booleans on storage: has(schema.spec.newInstancesProtectedFromScaleIn)
+    # returns false even for an explicit false, so OR-logic is: false||false||true = true.
+    # This test documents the actual behaviour. The spec acknowledges this limitation:
+    # boolean governance can enforce true but cannot weaken a defaults=true flag to false.
+    # See docs/frequent-rgd-errors.md §"Boolean Cascade Cannot Disable a Default-True Flag".
+    - name: ac39-boolean-or-limitation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac39-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-sip-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                newInstancesProtectedFromScaleIn: false
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac39-asg, namespace: autoscalinggroup}
+              spec:
+                # kro v0.9.2 limitation: explicit false is stripped from storage so OR-logic
+                # cannot override a true value in defaults. Result is true regardless.
+                newInstancesProtectedFromScaleIn: true
+
+    # Spec-AC-31 (negative): unresolvable {tag.missing} token in namingTemplate →
+    # namingStatus = "invalid-unresolved-tokens"; predictedArn is empty string.
+    - name: ac40-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac40-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: unresolved-token-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac40-asg, namespace: autoscalinggroup}
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # Spec-AC-32 (happy): status.predictedArn uses wildcard form because ASG ARNs contain
+    # an opaque AWS-generated UUID segment. Assert the full wildcard ARN pattern.
+    - name: ac41-predicted-arn-wildcard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac41-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac41-asg, namespace: autoscalinggroup}
+              status:
+                namingStatus: valid
+                predictedArn: "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:*:autoScalingGroupName/autoscalinggroup-ac41-asg"
+
+    # Spec-AC-34 (happy): syncedLabels dual-write — appear in metadata.labels with
+    # aws.kropath.run/ prefix AND in ACK spec.tags as plain key (no prefix).
+    - name: ac42-synced-labels-dual-write
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac42-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                syncedLabels:
+                  team: backend
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata:
+                name: ac42-asg
+                namespace: autoscalinggroup
+                labels:
+                  aws.kropath.run/team: backend
+        - script:
+            timeout: 60s
+            content: |
+              # Also verify syncedLabels appear in spec.tags as plain key (no aws.kropath.run/ prefix).
+              for i in $(seq 1 20); do
+                COUNT=$(kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac42-asg \
+                  -n autoscalinggroup -o json 2>/dev/null \
+                  | jq '.spec.tags | length' 2>/dev/null || echo 0)
+                if [ "$COUNT" -gt 0 ]; then break; fi
+                sleep 3
+              done
+              kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac42-asg \
+                -n autoscalinggroup -o json \
+                | jq -e '
+                    (.spec.tags | map(select(.key == "team" and .value == "backend")) | length == 1)
+                  '
+
+    # Spec-AC-35 (happy): syncedAnnotations appear in metadata.annotations on ACK child CR
+    # with aws.kropath.run/ prefix.
+    - name: ac43-synced-annotations-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac43-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                syncedAnnotations:
+                  owner: platform-team
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata:
+                name: ac43-asg
+                namespace: autoscalinggroup
+                annotations:
+                  aws.kropath.run/owner: platform-team
+
+    # Spec-AC-36 (happy): standard metadata on ACK child CR — managed-by, instance label,
+    # default deletion-policy annotation, and ownerReferences back to the parent CR.
+    - name: ac44-standard-metadata-child-cr
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac44-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata:
+                name: ac44-asg
+                namespace: autoscalinggroup
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac44-asg
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: AutoScalingGroup
+                    name: ac44-asg
+                    controller: true
+                    blockOwnerDeletion: true
