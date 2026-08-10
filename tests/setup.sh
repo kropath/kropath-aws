@@ -67,6 +67,12 @@ source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 echo "==> Installing kropath CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
 kubectl apply -f "${SCRIPT_DIR}/../crds/policy/policydocument.yaml"
+# kro validates externalRef GVKs at compile time against the live API server.
+# Newly-created CRDs are not immediately queryable — the API server must complete
+# registration (Established condition) before kro can find the schema.
+# Without this wait, RGDs applied within ~1s of a new CRD creation stay permanently
+# Inactive because kro's initial compilation fails and it does not retry.
+kubectl wait crd --all --for=condition=Established --timeout=60s
 
 echo "==> Installing kropath.run RGD definitions (non-lambda)..."
 # Build arg list excluding lambda RGDs, which must be applied in dependency-ordered waves below.
