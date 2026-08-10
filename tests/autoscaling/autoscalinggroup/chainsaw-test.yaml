@@ -1,0 +1,1122 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-autoscaling-02 Chainsaw tests — one scenario per acceptance criterion (ACs 1-38).
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: autoscalinggroup
+spec:
+  skipDelete: true
+  namespace: autoscalinggroup
+  steps:
+    # Setup: create namespace + all AutoScalingConfig fixtures, then seed effectiveConfig
+    # via kubectl patch (no kropath-controller running in kind — same approach as IAM/RDS tests).
+    - name: setup
+      try:
+        - apply:
+            file: 00-autoscalinggroup-namespace.yaml
+        - apply:
+            file: 01-configs.yaml
+        - script:
+            timeout: 60s
+            content: |
+              set -e
+              # Seed effectiveConfig for every AutoScalingConfig in the namespace by reading
+              # spec.mandatory and spec.defaults and reflecting them into status.effectiveConfig.
+              # The RGD's CEL cascade reads mandatory/defaults/aws tiers independently.
+              for cfg in $(kubectl get autoscalingconfig -n autoscalinggroup -o name 2>/dev/null | sed 's|.*/||'); do
+                mandatory=$(kubectl get autoscalingconfig "$cfg" -n autoscalinggroup \
+                  -o jsonpath='{.spec.mandatory}' 2>/dev/null)
+                defaults=$(kubectl get autoscalingconfig "$cfg" -n autoscalinggroup \
+                  -o jsonpath='{.spec.defaults}' 2>/dev/null)
+                kubectl patch autoscalingconfig "$cfg" -n autoscalinggroup \
+                  --subresource=status --type=merge \
+                  -p "{\"status\":{\"effectiveConfig\":{\"mandatory\":${mandatory},\"defaults\":${defaults},\"aws\":{\"accountId\":\"123456789012\",\"region\":\"us-east-1\"}}}}"
+                echo "patched effectiveConfig for $cfg"
+              done
+              echo "all configs seeded"
+
+    # AC-1: happy: minimal create — minSize, maxSize, launchTemplate.name propagated.
+    - name: ac1-minimal-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac1-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 3
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac1-asg, namespace: autoscalinggroup}
+              spec:
+                minSize: 1
+                maxSize: 3
+                launchTemplate:
+                  launchTemplateName: test-lt
+
+    # AC-2: happy: default effectiveName = "{namespace}-{name}" from defaults.namingTemplate.
+    - name: ac2-effective-name-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac2-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac2-asg, namespace: autoscalinggroup}
+              status:
+                resourceName: autoscalinggroup-ac2-asg
+                namingStatus: valid
+
+    # AC-3: happy: nameOverride overrides effectiveName.
+    - name: ac3-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac3-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                nameOverride: my-custom-asg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac3-asg, namespace: autoscalinggroup}
+              status:
+                resourceName: my-custom-asg
+                namingStatus: valid
+
+    # AC-4: happy: mandatory.namingTemplate wins over defaults.namingTemplate.
+    - name: ac4-naming-template-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac4-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: mandatory-naming-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac4-asg, namespace: autoscalinggroup}
+              status:
+                resourceName: ac4-asg-mgd
+                namingStatus: valid
+
+    # AC-5: happy: defaults.namingTemplate used when mandatory.namingTemplate is "".
+    - name: ac5-naming-template-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac5-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-naming-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac5-asg, namespace: autoscalinggroup}
+              status:
+                resourceName: ac5-asg-dflt
+                namingStatus: valid
+
+    # AC-6: happy: {tag.env} token in namingTemplate resolved from mandatory.tags.
+    - name: ac6-naming-tag-interpolation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac6-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: tag-naming-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac6-asg, namespace: autoscalinggroup}
+              status:
+                resourceName: prod-ac6-asg
+                namingStatus: valid
+
+    # AC-7: happy: desiredCapacity propagated to ACK CR.
+    - name: ac7-desired-capacity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac7-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 5
+                desiredCapacity: 3
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac7-asg, namespace: autoscalinggroup}
+              spec:
+                desiredCapacity: 3
+
+    # AC-8: happy: launchTemplate.version propagated.
+    - name: ac8-launch-template-version
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac8-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate:
+                  name: test-lt
+                  version: "$Default"
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac8-asg, namespace: autoscalinggroup}
+              spec:
+                launchTemplate:
+                  launchTemplateName: test-lt
+                  version: "$Default"
+
+    # AC-9: happy: mixedInstancesPolicy onDemandPercentageAboveBaseCapacity propagated.
+    - name: ac9-mixed-instances-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac9-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 4
+                launchTemplate: {name: test-lt}
+                mixedInstancesPolicy:
+                  onDemandPercentageAboveBaseCapacity: 50
+                  spotAllocationStrategy: lowest-price
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac9-asg, namespace: autoscalinggroup}
+              spec:
+                mixedInstancesPolicy:
+                  instancesDistribution:
+                    onDemandPercentageAboveBaseCapacity: 50
+                    spotAllocationStrategy: lowest-price
+
+    # AC-10: happy: availabilityZones propagated.
+    - name: ac10-availability-zones
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac10-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                availabilityZones: [us-east-1a, us-east-1b]
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac10-asg, namespace: autoscalinggroup}
+              spec:
+                availabilityZones: [us-east-1a, us-east-1b]
+
+    # AC-11: happy: vpcZoneIdentifier propagated.
+    - name: ac11-vpc-zone-identifier
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac11-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                vpcZoneIdentifier: "subnet-abc123,subnet-def456"
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac11-asg, namespace: autoscalinggroup}
+              spec:
+                vpcZoneIdentifier: "subnet-abc123,subnet-def456"
+
+    # AC-12: happy: instance spec.healthCheckType wins over defaults.healthCheckType.
+    # general-cfg: mandatory.hct="", defaults.hct="EC2". Instance sets "ELB" → result = "ELB".
+    - name: ac12-health-check-type-instance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac12-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                healthCheckType: "ELB"
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac12-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckType: "ELB"
+
+    # AC-13: happy: mandatory.healthCheckType wins over instance healthCheckType.
+    # mandatory-hct-cfg: mandatory.hct="EC2". Instance sets "ELB" → mandatory wins → "EC2".
+    - name: ac13-health-check-type-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac13-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: mandatory-hct-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                healthCheckType: "ELB"
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac13-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckType: "EC2"
+
+    # AC-14: happy: defaults.healthCheckType used when mandatory="" and instance="".
+    # defaults-hct-cfg: mandatory.hct="", defaults.hct="ELB". Instance hct="" → result = "ELB".
+    - name: ac14-health-check-type-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac14-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-hct-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac14-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckType: "ELB"
+
+    # AC-15: happy: hardcoded "EC2" fallback when all tiers are "".
+    # no-hct-cfg: mandatory.hct="", defaults.hct="". Instance hct="" → hardcoded "EC2".
+    - name: ac15-health-check-type-hardcoded
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac15-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: no-hct-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac15-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckType: "EC2"
+
+    # AC-16: happy: instance healthCheckGracePeriod wins over defaults.
+    # general-cfg: mandatory.hcgp=0, defaults.hcgp=300. Instance sets 600 → result = 600.
+    - name: ac16-grace-period-instance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac16-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                healthCheckGracePeriod: 600
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac16-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckGracePeriod: 600
+
+    # AC-17: happy: mandatory.healthCheckGracePeriod wins over instance.
+    # mandatory-hcgp-cfg: mandatory.hcgp=120. Instance sets 600 → mandatory wins → 120.
+    - name: ac17-grace-period-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac17-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: mandatory-hcgp-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                healthCheckGracePeriod: 600
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac17-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckGracePeriod: 120
+
+    # AC-18: happy: defaults.healthCheckGracePeriod used when mandatory=0 and instance=0.
+    # defaults-hcgp-cfg: mandatory.hcgp=0, defaults.hcgp=450. Instance hcgp=0 → result = 450.
+    - name: ac18-grace-period-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac18-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-hcgp-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac18-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckGracePeriod: 450
+
+    # AC-19: happy: hardcoded 300 fallback when all tiers=0.
+    # no-hcgp-cfg: mandatory.hcgp=0, defaults.hcgp=0. Instance hcgp=0 → hardcoded 300.
+    - name: ac19-grace-period-hardcoded
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac19-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: no-hcgp-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac19-asg, namespace: autoscalinggroup}
+              spec:
+                healthCheckGracePeriod: 300
+
+    # AC-20: happy: defaultCooldown propagated.
+    - name: ac20-default-cooldown
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac20-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                defaultCooldown: 180
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac20-asg, namespace: autoscalinggroup}
+              spec:
+                defaultCooldown: 180
+
+    # AC-21: happy: defaultInstanceWarmup propagated.
+    - name: ac21-default-instance-warmup
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac21-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                defaultInstanceWarmup: 120
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac21-asg, namespace: autoscalinggroup}
+              spec:
+                defaultInstanceWarmup: 120
+
+    # AC-22: happy: terminationPolicies propagated.
+    - name: ac22-termination-policies
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac22-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                terminationPolicies: [OldestInstance, Default]
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac22-asg, namespace: autoscalinggroup}
+              spec:
+                terminationPolicies: [OldestInstance, Default]
+
+    # AC-23: happy: instance newInstancesProtectedFromScaleIn=true propagated.
+    - name: ac23-scale-in-protection-instance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac23-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                newInstancesProtectedFromScaleIn: true
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac23-asg, namespace: autoscalinggroup}
+              spec:
+                newInstancesProtectedFromScaleIn: true
+
+    # AC-24: happy: mandatory.newInstancesProtectedFromScaleIn=true applied.
+    # mandatory-sip-cfg: mandatory.sip=true. Instance does not set field → mandatory applies.
+    - name: ac24-scale-in-protection-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac24-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: mandatory-sip-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac24-asg, namespace: autoscalinggroup}
+              spec:
+                newInstancesProtectedFromScaleIn: true
+
+    # AC-25: happy: defaults.newInstancesProtectedFromScaleIn=true applied when mandatory=false.
+    - name: ac25-scale-in-protection-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac25-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-sip-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac25-asg, namespace: autoscalinggroup}
+              spec:
+                newInstancesProtectedFromScaleIn: true
+
+    # AC-26: happy: instance capacityRebalance=true propagated.
+    - name: ac26-capacity-rebalance-instance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac26-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                capacityRebalance: true
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac26-asg, namespace: autoscalinggroup}
+              spec:
+                capacityRebalance: true
+
+    # AC-27: happy: mandatory.capacityRebalance=true applied.
+    - name: ac27-capacity-rebalance-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac27-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: mandatory-cr-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac27-asg, namespace: autoscalinggroup}
+              spec:
+                capacityRebalance: true
+
+    # AC-28: happy: defaults.capacityRebalance=true applied when mandatory=false.
+    - name: ac28-capacity-rebalance-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac28-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-cr-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac28-asg, namespace: autoscalinggroup}
+              spec:
+                capacityRebalance: true
+
+    # AC-29: happy: instance maxInstanceLifetime wins over defaults (0 → 86400).
+    - name: ac29-max-instance-lifetime-instance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac29-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                maxInstanceLifetime: 86400
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac29-asg, namespace: autoscalinggroup}
+              spec:
+                maxInstanceLifetime: 86400
+
+    # AC-30: happy: mandatory.maxInstanceLifetime wins over instance.
+    # mandatory-mil-cfg: mandatory.mil=604800. Instance sets 86400 → mandatory wins.
+    - name: ac30-max-instance-lifetime-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac30-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: mandatory-mil-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                maxInstanceLifetime: 86400
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac30-asg, namespace: autoscalinggroup}
+              spec:
+                maxInstanceLifetime: 604800
+
+    # AC-31: happy: defaults.maxInstanceLifetime used when mandatory=0 and instance=0.
+    - name: ac31-max-instance-lifetime-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac31-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-mil-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac31-asg, namespace: autoscalinggroup}
+              spec:
+                maxInstanceLifetime: 259200
+
+    # AC-32: happy: targetGroupARNs propagated.
+    - name: ac32-target-group-arns
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac32-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                targetGroupARNs:
+                  - "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-tg/abc123"
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac32-asg, namespace: autoscalinggroup}
+              spec:
+                targetGroupARNs:
+                  - "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-tg/abc123"
+
+    # AC-33: happy: lifecycleHooks mapped to ACK lifecycleHookSpecificationList.
+    - name: ac33-lifecycle-hooks
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac33-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                lifecycleHooks:
+                  - name: my-hook
+                    transition: autoscaling:EC2_INSTANCE_LAUNCHING
+                    defaultResult: CONTINUE
+                    heartbeatTimeout: 120
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac33-asg, namespace: autoscalinggroup}
+              spec:
+                lifecycleHookSpecificationList:
+                  - lifecycleHookName: my-hook
+                    lifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+                    defaultResult: CONTINUE
+                    heartbeatTimeout: 120
+
+    # AC-34: happy: schema accepts warmPool fields (ACK autoscaling-chart v1.1.0 exposes
+    # warmPoolConfiguration only in status; forwarding to ACK deferred until spec support lands).
+    - name: ac34-warm-pool-schema-accepted
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac34-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 2
+                maxSize: 6
+                launchTemplate: {name: test-lt}
+                warmPool:
+                  poolState: Running
+                  minSize: 1
+                  maxGroupPreparedCapacity: 4
+                  reuseOnScaleIn: true
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac34-asg, namespace: autoscalinggroup}
+              spec:
+                name: autoscalinggroup-ac34-asg
+
+    # AC-35: happy: instanceMaintenancePolicy propagated.
+    - name: ac35-instance-maintenance-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac35-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 4
+                launchTemplate: {name: test-lt}
+                instanceMaintenancePolicy:
+                  minHealthyPercentage: 95
+                  maxHealthyPercentage: 110
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac35-asg, namespace: autoscalinggroup}
+              spec:
+                instanceMaintenancePolicy:
+                  minHealthyPercentage: 95
+                  maxHealthyPercentage: 110
+
+    # AC-36: happy: instance spec.tags appear in ACK spec.tags as {key, value} pairs.
+    # Tag list order is map-derived and unstable; assert via jq script.
+    - name: ac36-instance-tags
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac36-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                tags:
+                  app: myapp
+                  env: dev
+        - script:
+            timeout: 60s
+            content: |
+              # Wait for ACK child CR to appear and assert tag values order-independently.
+              for i in $(seq 1 20); do
+                COUNT=$(kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac36-asg \
+                  -n autoscalinggroup -o json 2>/dev/null \
+                  | jq '.spec.tags | length' 2>/dev/null || echo 0)
+                if [ "$COUNT" -gt 0 ]; then break; fi
+                sleep 3
+              done
+              kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac36-asg \
+                -n autoscalinggroup -o json \
+                | jq -e '
+                    (.spec.tags | map(select(.key == "app" and .value == "myapp")) | length == 1) and
+                    (.spec.tags | map(select(.key == "env" and .value == "dev")) | length == 1)
+                  '
+
+    # AC-37: happy: mandatory.tags win over instance tags on the same key.
+    # mandatory-tags-cfg: mandatory.tags={env: prod}. Instance sets env=dev → mandatory wins.
+    - name: ac37-mandatory-tags-win
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac37-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: mandatory-tags-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                tags:
+                  env: dev
+                  app: myapp
+        - script:
+            timeout: 60s
+            content: |
+              # Wait for ACK child CR to appear, then assert mandatory tag wins.
+              for i in $(seq 1 20); do
+                COUNT=$(kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac37-asg \
+                  -n autoscalinggroup -o json 2>/dev/null \
+                  | jq '.spec.tags | length' 2>/dev/null || echo 0)
+                if [ "$COUNT" -gt 0 ]; then break; fi
+                sleep 3
+              done
+              kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac37-asg \
+                -n autoscalinggroup -o json \
+                | jq -e '
+                    (.spec.tags | map(select(.key == "env" and .value == "prod")) | length == 1) and
+                    (.spec.tags | map(select(.key == "env" and .value == "dev")) | length == 0) and
+                    (.spec.tags | map(select(.key == "app" and .value == "myapp")) | length == 1)
+                  '
+
+    # AC-38: happy: deletionPolicy propagated as ACK deletion annotation on child CR.
+    - name: ac38-deletion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac38-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                deletionPolicy: delete
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata:
+                name: ac38-asg
+                namespace: autoscalinggroup
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # Spec-AC-7 (kro boolean limitation): defaults.newInstancesProtectedFromScaleIn=true +
+    # instance explicitly false → expected false per spec (instance wins), but actual true.
+    # kro v0.9.2 strips zero-value booleans on storage: has(schema.spec.newInstancesProtectedFromScaleIn)
+    # returns false even for an explicit false, so OR-logic is: false||false||true = true.
+    # This test documents the actual behaviour. The spec acknowledges this limitation:
+    # boolean governance can enforce true but cannot weaken a defaults=true flag to false.
+    # See docs/frequent-rgd-errors.md §"Boolean Cascade Cannot Disable a Default-True Flag".
+    - name: ac39-boolean-or-limitation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac39-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: defaults-sip-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                newInstancesProtectedFromScaleIn: false
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac39-asg, namespace: autoscalinggroup}
+              spec:
+                # kro v0.9.2 limitation: explicit false is stripped from storage so OR-logic
+                # cannot override a true value in defaults. Result is true regardless.
+                newInstancesProtectedFromScaleIn: true
+
+    # Spec-AC-31 (negative): unresolvable {tag.missing} token in namingTemplate →
+    # namingStatus = "invalid-unresolved-tokens"; predictedArn is empty string.
+    - name: ac40-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac40-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: unresolved-token-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac40-asg, namespace: autoscalinggroup}
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # Spec-AC-32 (happy): status.predictedArn uses wildcard form because ASG ARNs contain
+    # an opaque AWS-generated UUID segment. Assert the full wildcard ARN pattern.
+    - name: ac41-predicted-arn-wildcard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac41-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac41-asg, namespace: autoscalinggroup}
+              status:
+                namingStatus: valid
+                predictedArn: "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:*:autoScalingGroupName/autoscalinggroup-ac41-asg"
+
+    # Spec-AC-34 (happy): syncedLabels dual-write — appear in metadata.labels with
+    # aws.kropath.run/ prefix AND in ACK spec.tags as plain key (no prefix).
+    - name: ac42-synced-labels-dual-write
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac42-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                syncedLabels:
+                  team: backend
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata:
+                name: ac42-asg
+                namespace: autoscalinggroup
+                labels:
+                  aws.kropath.run/team: backend
+        - script:
+            timeout: 60s
+            content: |
+              # Also verify syncedLabels appear in spec.tags as plain key (no aws.kropath.run/ prefix).
+              for i in $(seq 1 20); do
+                COUNT=$(kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac42-asg \
+                  -n autoscalinggroup -o json 2>/dev/null \
+                  | jq '.spec.tags | length' 2>/dev/null || echo 0)
+                if [ "$COUNT" -gt 0 ]; then break; fi
+                sleep 3
+              done
+              kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac42-asg \
+                -n autoscalinggroup -o json \
+                | jq -e '
+                    (.spec.tags | map(select(.key == "team" and .value == "backend")) | length == 1)
+                  '
+
+    # Spec-AC-35 (happy): syncedAnnotations appear in metadata.annotations on ACK child CR
+    # with aws.kropath.run/ prefix.
+    - name: ac43-synced-annotations-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac43-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                syncedAnnotations:
+                  owner: platform-team
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata:
+                name: ac43-asg
+                namespace: autoscalinggroup
+                annotations:
+                  aws.kropath.run/owner: platform-team
+
+    # Spec-AC-36 (happy): standard metadata on ACK child CR — managed-by, instance label,
+    # default deletion-policy annotation, and ownerReferences back to the parent CR.
+    - name: ac44-standard-metadata-child-cr
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac44-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata:
+                name: ac44-asg
+                namespace: autoscalinggroup
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac44-asg
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: AutoScalingGroup
+                    name: ac44-asg
+                    controller: true
+                    blockOwnerDeletion: true
