@@ -47,12 +47,18 @@ if [ "${SKIP_ACK}" = "false" ]; then
 
   mkdir -p "tmp"
   for service in ${ACK_SERVICES}; do
-    version=$(resolve_ack_chart_version "${service}")
+    version=$(resolve_ack_chart_version "${service}") || {
+      echo "    WARNING: Could not resolve ACK chart version for ${service} (GitHub API error) — skipping."
+      continue
+    }
     echo "  -> ACK ${service}..."
 
     # Extract CRDs only from the Helm chart (no controller pod required locally).
     helm pull "oci://${ACK_REGISTRY}/${service}-chart" \
-      --version "${version}" --untar --untardir tmp/
+      --version "${version}" --untar --untardir tmp/ || {
+      echo "    WARNING: Could not pull ACK chart for ${service}:${version} — skipping."
+      continue
+    }
     kubectl apply --server-side -f "tmp/${service}-chart/crds" || echo "    WARNING: Could not install ACK CRDs for ${service} — chart may not exist at this version."
   done
   rm -rf tmp
