@@ -1,0 +1,609 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ecs-03 Chainsaw tests — all 29 acceptance criteria for ECSService RGD.
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ecsservice
+spec:
+  namespace: ecsservice
+  steps:
+    # AC-1: Basic service accepted with general-policy.
+    # Naming: ecsservice-svc-basic. desiredCount defaults to 1.
+    - name: ac1-basic-service-accepted
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 01-general-policy.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig general-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 02-svc-basic.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: svc-basic-ecsservice-naming
+                namespace: ecsservice
+              data:
+                resourceName: ecsservice-svc-basic
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-basic
+                namespace: ecsservice
+              spec:
+                name: ecsservice-svc-basic
+                desiredCount: 1
+
+    # AC-2: launchType set in instance spec passes through to ACK Service.
+    - name: ac2-launch-type-instance
+      try:
+        - apply:
+            file: 03-svc-fargate.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-fargate
+                namespace: ecsservice
+              spec:
+                launchType: FARGATE
+
+    # AC-3: mandatory.defaultLaunchType overrides instance spec.
+    - name: ac3-launch-type-mandatory-governance
+      try:
+        - apply:
+            file: 04-fargate-mandatory-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig fargate-mandatory-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"FARGATE","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 05-svc-lt-mandatory.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-lt-mandatory
+                namespace: ecsservice
+              spec:
+                launchType: FARGATE
+
+    # AC-4: launchType + capacityProviderStrategy both set → advisory ConfigMap created.
+    # This is an in-graph advisory — NOT a CRD-level rejection.
+    - name: ac4-launch-type-capacity-strategy-conflict
+      try:
+        - apply:
+            file: 06-svc-lt-cps-conflict.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: svc-lt-cps-conflict-ecsservice-launch-conflict
+                namespace: ecsservice
+              data:
+                error: "launchType and capacityProviderStrategy are mutually exclusive — unset one"
+
+    # AC-5: status.validationError surfaced when launchType + capacityProviderStrategy conflict.
+    - name: ac5-validation-error-status
+      try:
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECSService
+              metadata:
+                name: svc-lt-cps-conflict
+                namespace: ecsservice
+              status:
+                validationError: "launchType and capacityProviderStrategy are mutually exclusive; unset one before this service will reconcile"
+
+    # AC-6: platformVersion set in instance spec passes through.
+    - name: ac6-platform-version-instance
+      try:
+        - apply:
+            file: 07-svc-platform-version.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-platform-version
+                namespace: ecsservice
+              spec:
+                platformVersion: "1.4.0"
+
+    # AC-7: mandatory.defaultPlatformVersion overrides instance spec.
+    - name: ac7-platform-version-mandatory-governance
+      try:
+        - apply:
+            file: 08-pv-mandatory-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig pv-mandatory-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"1.4.0","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 09-svc-pv-mandatory.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-pv-mandatory
+                namespace: ecsservice
+              spec:
+                platformVersion: "1.4.0"
+
+    # AC-8: defaults.defaultLaunchType applied when instance does not set launchType.
+    - name: ac8-launch-type-defaults-governance
+      try:
+        - apply:
+            file: 10-lt-defaults-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig lt-defaults-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"EC2","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 11-svc-lt-defaults.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-lt-defaults
+                namespace: ecsservice
+              spec:
+                launchType: EC2
+
+    # AC-9: desiredCount: 0 is passed explicitly (scale-to-zero, not omitted).
+    - name: ac9-desired-count-zero
+      try:
+        - apply:
+            file: 12-svc-desired-zero.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-desired-zero
+                namespace: ecsservice
+              spec:
+                desiredCount: 0
+
+    # AC-10: networkConfiguration passthrough (subnets, securityGroups, assignPublicIP).
+    - name: ac10-network-configuration-passthrough
+      try:
+        - apply:
+            file: 13-svc-network-config.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-network-config
+                namespace: ecsservice
+              spec:
+                networkConfiguration:
+                  awsvpcConfiguration:
+                    subnets:
+                      - subnet-abc123
+                      - subnet-def456
+                    securityGroups:
+                      - sg-abc123
+                    assignPublicIP: DISABLED
+
+    # AC-11: loadBalancers passthrough.
+    - name: ac11-load-balancers-passthrough
+      try:
+        - apply:
+            file: 14-svc-load-balancers.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-load-balancers
+                namespace: ecsservice
+              spec:
+                loadBalancers:
+                  - targetGroupARN: arn:aws:elasticloadbalancing:ap-southeast-2:123456789012:targetgroup/my-tg/abc123
+                    containerName: app
+                    containerPort: 8080
+
+    # AC-12: deploymentConfiguration passthrough (maximumPercent, minimumHealthyPercent, circuit breaker).
+    - name: ac12-deployment-config-passthrough
+      try:
+        - apply:
+            file: 15-svc-deployment-config.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-deployment-config
+                namespace: ecsservice
+              spec:
+                deploymentConfiguration:
+                  maximumPercent: 200
+                  minimumHealthyPercent: 100
+                  deploymentCircuitBreaker:
+                    enable: true
+                    rollback: true
+
+    # AC-13: enableExecuteCommand passthrough.
+    - name: ac13-enable-execute-command
+      try:
+        - apply:
+            file: 16-svc-exec-cmd.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-exec-cmd
+                namespace: ecsservice
+              spec:
+                enableExecuteCommand: true
+
+    # AC-14: healthCheckGracePeriodSeconds passthrough.
+    - name: ac14-health-check-grace-period
+      try:
+        - apply:
+            file: 17-svc-health-check.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-health-check
+                namespace: ecsservice
+              spec:
+                healthCheckGracePeriodSeconds: 30
+
+    # AC-15: serviceConnectConfiguration passthrough.
+    - name: ac15-service-connect-config
+      try:
+        - apply:
+            file: 18-svc-svc-connect.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-svc-connect
+                namespace: ecsservice
+              spec:
+                serviceConnectConfiguration:
+                  enabled: true
+                  namespace: my-connect-ns
+
+    # AC-16: schedulingStrategy=DAEMON passthrough.
+    - name: ac16-scheduling-strategy-daemon
+      try:
+        - apply:
+            file: 19-svc-daemon.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-daemon
+                namespace: ecsservice
+              spec:
+                schedulingStrategy: DAEMON
+
+    # AC-17: nameOverride takes precedence over naming template.
+    - name: ac17-name-override
+      try:
+        - apply:
+            file: 20-svc-name-override.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: svc-name-override-ecsservice-naming
+                namespace: ecsservice
+              data:
+                resourceName: my-custom-service
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-name-override
+                namespace: ecsservice
+              spec:
+                name: my-custom-service
+
+    # AC-18: Tag merge — mandatory wins over instance wins over defaults.
+    - name: ac18-tag-merge
+      try:
+        - apply:
+            file: 21-tag-merge-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig svc-tag-merge-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{"env":"prod","owner":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{"env":"dev","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 22-svc-tag-merge.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-tag-merge
+                namespace: ecsservice
+        - script:
+            content: |
+              TAGS=$(kubectl get service svc-tag-merge -n ecsservice -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="env")) | .[0].value == "prod"'
+              echo "$TAGS" | jq -e 'map(select(.key=="owner")) | .[0].value == "platform"'
+              echo "$TAGS" | jq -e 'map(select(.key=="team")) | .[0].value == "platform"'
+              echo "$TAGS" | jq -e 'map(select(.key=="cost-centre")) | .[0].value == "engineering"'
+
+    # AC-19: syncedLabels appear as aws.kropath.run/<key> in K8s labels AND plain key in cloud tags.
+    - name: ac19-synced-labels
+      try:
+        - apply:
+            file: 23-synced-labels-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig svc-synced-labels-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{"workload":"ecs"},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 24-svc-synced-labels.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-synced-labels
+                namespace: ecsservice
+                labels:
+                  aws.kropath.run/workload: ecs
+        - script:
+            content: |
+              TAGS=$(kubectl get service svc-synced-labels -n ecsservice -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="workload")) | .[0].value == "ecs"'
+
+    # AC-20: syncedAnnotations appear as aws.kropath.run/<key> in K8s annotations + plain key in cloud tags.
+    - name: ac20-synced-annotations
+      try:
+        - apply:
+            file: 25-synced-annotations-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig svc-synced-annotations-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-centre":"platform"}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 26-svc-synced-annotations.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-synced-annotations
+                namespace: ecsservice
+                annotations:
+                  aws.kropath.run/cost-centre: platform
+        - script:
+            content: |
+              TAGS=$(kubectl get service svc-synced-annotations -n ecsservice -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="cost-centre")) | .[0].value == "platform"'
+
+    # AC-21: deletionPolicy=retain → annotation services.k8s.aws/deletion-policy=retain.
+    - name: ac21-deletion-policy-retain
+      try:
+        - apply:
+            file: 27-svc-retain.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-retain
+                namespace: ecsservice
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-22: deletionPolicy=delete → annotation services.k8s.aws/deletion-policy=delete.
+    - name: ac22-deletion-policy-delete
+      try:
+        - apply:
+            file: 28-svc-delete.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-delete
+                namespace: ecsservice
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-23: namingStatus=invalid-unresolved-tokens when template has unresolvable {account_id}.
+    - name: ac23-naming-status-invalid
+      try:
+        - apply:
+            file: 29-unresolved-naming-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig svc-unresolved-naming-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 30-svc-unresolved-naming.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: svc-unresolved-naming-ecsservice-naming
+                namespace: ecsservice
+              data:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-24: capacityProviderStrategy passthrough (single item).
+    - name: ac24-capacity-provider-strategy
+      try:
+        - apply:
+            file: 31-svc-cap-strategy.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-cap-strategy
+                namespace: ecsservice
+              spec:
+                capacityProviderStrategy:
+                  - capacityProvider: FARGATE_SPOT
+                    weight: 1
+                    base: 0
+
+    # AC-25: clusterName passthrough to ACK Service spec.cluster.
+    - name: ac25-cluster-name-passthrough
+      try:
+        - apply:
+            file: 32-svc-cluster-name.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-cluster-name
+                namespace: ecsservice
+              spec:
+                cluster: my-ecs-cluster
+
+    # AC-26: naming template from defaults.namingTemplate (custom template).
+    - name: ac26-naming-defaults-template
+      try:
+        - apply:
+            file: 33-custom-naming-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig svc-custom-naming-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"svc-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 34-svc-custom-naming.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: svc-custom-naming-ecsservice-naming
+                namespace: ecsservice
+              data:
+                resourceName: svc-svc-custom-naming
+                namingStatus: valid
+
+    # AC-27: mandatory.namingTemplate overrides defaults.namingTemplate.
+    - name: ac27-naming-mandatory-template
+      try:
+        - apply:
+            file: 35-mandatory-naming-config.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig svc-mandatory-naming-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"mand-svc-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"svc-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 36-svc-mandatory-naming.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: svc-mandatory-naming-ecsservice-naming
+                namespace: ecsservice
+              data:
+                resourceName: mand-svc-svc-mandatory-naming
+                namingStatus: valid
+
+    # AC-28: configRef to named (non-general-policy) ECSConfig is used.
+    - name: ac28-custom-configref
+      try:
+        - apply:
+            file: 37-fargate-policy.yaml
+        - script:
+            content: |
+              kubectl patch ecsconfig svc-fargate-policy -n ecsservice \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"containerInsights":false,"defaultLaunchType":"FARGATE","defaultPlatformVersion":"","defaultNetworkMode":"","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"containerInsights":false,"defaultLaunchType":"","defaultPlatformVersion":"LATEST","defaultNetworkMode":"awsvpc","defaultTaskCPU":"","defaultTaskMemory":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            file: 38-svc-fargate-configref.yaml
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-fargate-configref
+                namespace: ecsservice
+              spec:
+                launchType: FARGATE
+
+    # AC-29: ownerReferences wired correctly on naming ConfigMap and ACK Service.
+    - name: ac29-owner-references
+      try:
+        - apply:
+            file: 39-svc-owner-ref.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: svc-owner-ref-ecsservice-naming
+                namespace: ecsservice
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: ECSService
+                    name: svc-owner-ref
+                    controller: true
+                    blockOwnerDeletion: true
+        - assert:
+            resource:
+              apiVersion: ecs.services.k8s.aws/v1alpha1
+              kind: Service
+              metadata:
+                name: svc-owner-ref
+                namespace: ecsservice
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: ECSService
+                    name: svc-owner-ref
+                    controller: true
+                    blockOwnerDeletion: true
