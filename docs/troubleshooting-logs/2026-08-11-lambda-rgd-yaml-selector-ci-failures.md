@@ -110,8 +110,42 @@ Updated `tests/setup.sh` to apply lambda RGDs in three dependency-ordered waves 
 
 All 7 lambda RGDs are CREATED by the API server (no BadRequest), but ALL stay Inactive. Non-lambda RGDs become Active normally. This pattern means the RGDs themselves are structurally valid but kro cannot compile them due to missing referenced CRDs — check for cross-graph kind dependencies.
 
+## Error Type 4: `lambdalayerversion` stays Inactive after wave ordering fix (2026-08-12)
+
+```
+error: timed out waiting for the condition on resourcegraphdefinitions/lambdalayerversion.aws.kropath.run
+```
+
+`lambdacodesigningconfig` (applied in same wave 1) goes Active in 28s; `lambdalayerversion` never goes Active in 120s.
+
+### Root Cause
+
+`lambdalayerversion` had an `integer`-typed status field:
+
+```yaml
+status:
+  versionNumber: >-
+    ${layer.?status.?versionNumber.orValue(0)}
+```
+
+`orValue(0)` with integer literal `0` causes kro v0.9.2 to infer the status field type as `integer`. kro cannot build the OpenAPI status schema for an RGD that has an integer status field derived from a CEL expression — **all status CEL expressions must produce `string` or `list` types**. No other RGD in the codebase has an integer status field.
+
+Diagnostic indicator: `lambdalayerversion` IS created by the API server (no BadRequest), but stays Inactive. Both `lambdacodesigningconfig` and `lambdalayerversion` reference the same `LambdaConfig` externalRef and the same lambda ACK CRDs. The `layerversions.lambda.services.k8s.aws` CRD reaches Established. The only difference is the integer status field.
+
+### Fix
+
+Wrap the integer expression in `string()` to produce a string status field:
+
+```yaml
+versionNumber: >-
+  ${string(layer.?status.?versionNumber.orValue(0))}
+```
+
+Also update the Chainsaw AC-9 assert from `versionNumber: 1` (integer) to `versionNumber: "1"` (string). The kubectl patch that sets the ACK LayerVersion status stays as `"versionNumber": 1` (integer JSON) — that patches the ACK CRD field, which is correctly typed as integer.
+
 ## Prevention
 
 1. **Always single-quote inline CEL ternary expressions** — if the expression contains `? A : B`, it must be quoted in YAML.
 2. **`selector` belongs under `metadata` in `externalRef`** — confirmed by working examples in `sqsqueue.aws.kropath.run.yaml`, `docs/frequent-rgd-errors.md`, and `docs/STANDARDS.md`.
 3. **Apply cross-referencing RGD families in dependency order** — when a new RGD family has members that reference each other's generated kinds via `externalRef`, apply base kinds first (wait for Active), then dependent kinds. Update `tests/setup.sh` with explicit waves when adding any family where RGDs reference sibling kinds.
+4. **Status CEL expressions must produce `string` or `list` — never `integer` or `boolean`.** Use `string()` to convert numeric ACK status fields before exposing them in RGD status. See Error Type 4 above.
