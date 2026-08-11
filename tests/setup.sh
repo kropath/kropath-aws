@@ -63,8 +63,10 @@ kubectl rollout status deployment/kro -n kro-system --timeout=120s
 
 echo "==> Installing ACK CRD definitions..."
 # hack/install-provider-crds.sh installs ACK CRDs for all services referenced by
-# kropath-aws RGDs. When adding a new provider service family (e.g. lambda), add
-# its service name to ACK_SERVICES in that script so kro can compile the RGDs.
+# kropath-aws RGDs. When adding a new provider service family, add its service
+# name to ACK_SERVICES in that script so kro can compile the RGDs.
+# Installed services: s3 iam kms ec2 dynamodb rds sns sqs secretsmanager
+#                     eks ecr cloudwatch elbv2 eventbridge autoscaling lambda
 source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 
 echo "==> Installing kropath CRD definitions..."
