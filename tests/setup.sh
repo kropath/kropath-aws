@@ -101,10 +101,15 @@ echo "==> Lambda RGD wave 1 (no cross-lambda deps: LambdaCodeSigningConfig, Lamb
 kubectl apply \
   -f "${SCRIPT_DIR}/../rgds/lambdacodesigningconfig.aws.kropath.run.yaml" \
   -f "${SCRIPT_DIR}/../rgds/lambdalayerversion.aws.kropath.run.yaml"
-kubectl wait rgd \
+if ! kubectl wait rgd \
   lambdacodesigningconfig.aws.kropath.run \
   lambdalayerversion.aws.kropath.run \
-  --for=condition=Ready --timeout=120s
+  --for=condition=Ready --timeout=120s; then
+  echo "==> RGD condition dump (for diagnosis):"
+  kubectl get rgd lambdacodesigningconfig.aws.kropath.run lambdalayerversion.aws.kropath.run \
+    -o jsonpath='{range .items[*]}{"--- "}{.metadata.name}{"\n"}{.status.conditions}{"\n"}{end}' || true
+  exit 1
+fi
 
 echo "==> Lambda RGD wave 2 (LambdaFunction, needs LambdaCodeSigningConfig CRD from wave 1)..."
 kubectl apply -f "${SCRIPT_DIR}/../rgds/lambdafunction.aws.kropath.run.yaml"
