@@ -1,0 +1,318 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+# aws-ecs-03: ECSService RGD — wraps ACK ecs.services.k8s.aws/Service.
+# Spec: kropath-core/docs/specs/aws/aws-ecs-03-ecsservice.md
+# CRD cache: kropath-core/docs/crd-cache/aws/ecs-controller-v1.5.0.md
+#
+# Mutual exclusivity: launchType and capacityProviderStrategy cannot both be set.
+# kro v0.9.2 silently discards x-kubernetes-validations on RGDs; enforced via
+# advisory ConfigMap (in-graph ConfigMap pattern) with status.validationError.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: ecsservice.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ECSService
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Cluster reference (name or ref)
+      clusterName: string | default=""
+      clusterRef:
+        name: string | default=""
+        namespace: string | default=""
+
+      # Task definition (name)
+      taskDefinition: string | default=""
+
+      # Launch type governance: mandatory.defaultLaunchType wins; then instance; then defaults.
+      # Mutually exclusive with capacityProviderStrategy — see advisory ConfigMap below.
+      launchType: string | default=""
+
+      # Capacity provider strategy — mutually exclusive with launchType.
+      capacityProviderStrategy: "[]CapacityProviderStrategyItem | default=[]"
+
+      # Platform version governance: mandatory.defaultPlatformVersion wins; then instance; then defaults.
+      platformVersion: string | default=""
+
+      # Scheduling strategy: REPLICA (default) or DAEMON.
+      schedulingStrategy: string | default=""
+
+      # Desired count. Must be explicit; 0 means scale-to-zero. Never omit.
+      desiredCount: integer | default=1
+
+      # Network configuration (required for awsvpc network mode)
+      networkConfiguration:
+        awsVPCConfiguration:
+          subnets: "[]string | default=[]"
+          securityGroups: "[]string | default=[]"
+          assignPublicIP: string | default=""
+
+      # Load balancers (optional)
+      loadBalancers: "[]LoadBalancerItem | default=[]"
+
+      # Deployment configuration (optional)
+      deploymentConfiguration:
+        maximumPercent: integer | default=0
+        minimumHealthyPercent: integer | default=0
+        deploymentCircuitBreaker:
+          enable: boolean | default=false
+          rollback: boolean | default=false
+
+      # Enable ECS Exec (execute command)
+      enableExecuteCommand: boolean | default=false
+
+      # Health check grace period seconds
+      healthCheckGracePeriodSeconds: integer | default=0
+
+      # Service connect configuration (optional)
+      serviceConnectConfiguration:
+        enabled: boolean | default=false
+        namespace: string | default=""
+
+    types:
+      CapacityProviderStrategyItem:
+        capacityProvider: string | default=""
+        weight: integer | default=0
+        base: integer | default=0
+      LoadBalancerItem:
+        targetGroupARN: string | default=""
+        loadBalancerName: string | default=""
+        containerName: string | default=""
+        containerPort: integer | default=0
+
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      conditions: >-
+        ${service.?status.?conditions.orValue([])}
+
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ECSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Advisory ConfigMap — only materializes when launchType + capacityProviderStrategy conflict.
+    # kro silently discards x-kubernetes-validations on RGDs; this is the enforcement mechanism.
+    - id: launchTypeConflict
+      includeWhen:
+        - ${schema.spec.launchType != "" && schema.spec.capacityProviderStrategy.size() > 0}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-ecsservice-launch-conflict
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: ecsservice-validation-error
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECSService
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "launchType and capacityProviderStrategy are mutually exclusive — unset one"
+
+    # Naming ConfigMap (same pattern as other ECS RGDs)
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-ecsservice-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: ecsservice-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECSService
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{") ? "invalid-unresolved-tokens" : "valid"}
+
+    # ACK Service CR
+    - id: service
+      template:
+        apiVersion: ecs.services.k8s.aws/v1alpha1
+        kind: Service
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECSService
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource name
+          name: ${naming.data.effectiveName}
+          # Cluster reference: prefer name; fall back to ref if clusterName is empty.
+          cluster: ${schema.spec.clusterName}
+          clusterRef:
+            from:
+              name: ${schema.spec.clusterRef.name}
+              namespace: ${schema.spec.clusterRef.namespace}
+          # Task definition
+          taskDefinition: ${schema.spec.taskDefinition}
+          # Desired count — always explicit. 0 is scale-to-zero; nil means unmanaged.
+          desiredCount: ${schema.spec.desiredCount}
+          # Launch type governance: mandatory wins, then instance, then defaults.
+          launchType: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultLaunchType.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultLaunchType
+              : (schema.spec.launchType != ""
+                  ? schema.spec.launchType
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?defaultLaunchType.orValue("") : ""))}
+          # Capacity provider strategy (pass-through)
+          capacityProviderStrategy: >-
+            ${schema.spec.capacityProviderStrategy.map(s, {
+              "capacityProvider": s.capacityProvider,
+              "weight": s.weight,
+              "base": s.base
+            })}
+          # Platform version governance: mandatory wins, then instance, then defaults.
+          platformVersion: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultPlatformVersion.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultPlatformVersion
+              : (schema.spec.platformVersion != ""
+                  ? schema.spec.platformVersion
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?defaultPlatformVersion.orValue("") : ""))}
+          # Scheduling strategy
+          schedulingStrategy: ${schema.spec.schedulingStrategy}
+          # Network configuration (pass-through)
+          networkConfiguration:
+            awsVPCConfiguration:
+              subnets: ${schema.spec.networkConfiguration.awsVPCConfiguration.subnets}
+              securityGroups: ${schema.spec.networkConfiguration.awsVPCConfiguration.securityGroups}
+              assignPublicIP: ${schema.spec.networkConfiguration.awsVPCConfiguration.assignPublicIP}
+          # Load balancers (pass-through)
+          loadBalancers: >-
+            ${schema.spec.loadBalancers.map(lb, {
+              "targetGroupARN": lb.targetGroupARN,
+              "loadBalancerName": lb.loadBalancerName,
+              "containerName": lb.containerName,
+              "containerPort": lb.containerPort
+            })}
+          # Deployment configuration
+          deploymentConfiguration:
+            maximumPercent: ${schema.spec.deploymentConfiguration.maximumPercent}
+            minimumHealthyPercent: ${schema.spec.deploymentConfiguration.minimumHealthyPercent}
+            deploymentCircuitBreaker:
+              enable: ${schema.spec.deploymentConfiguration.deploymentCircuitBreaker.enable}
+              rollback: ${schema.spec.deploymentConfiguration.deploymentCircuitBreaker.rollback}
+          # Execute command
+          enableExecuteCommand: ${schema.spec.enableExecuteCommand}
+          # Health check grace period
+          healthCheckGracePeriodSeconds: ${schema.spec.healthCheckGracePeriodSeconds}
+          # Service Connect
+          serviceConnectConfiguration:
+            enabled: ${schema.spec.serviceConnectConfiguration.enabled}
+            namespace: ${schema.spec.serviceConnectConfiguration.namespace}
+          # Cloud tags
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})}

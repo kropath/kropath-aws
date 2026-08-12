@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb rds sns sqs secretsmanager eks ecr cloudwatch elbv2 eventbridge autoscaling cloudfront}"
+ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb rds sns sqs secretsmanager eks ecr cloudwatch elbv2 eventbridge autoscaling cloudfront ecs}"
 SKIP_ACK="${SKIP_ACK:-false}"
 SKIP_KCC="${SKIP_KCC:-true}"
 SKIP_ASO="${SKIP_ASO:-true}"
@@ -47,7 +47,10 @@ if [ "${SKIP_ACK}" = "false" ]; then
 
   mkdir -p "tmp"
   for service in ${ACK_SERVICES}; do
-    version=$(resolve_ack_chart_version "${service}")
+    version=$(resolve_ack_chart_version "${service}") || {
+      echo "    WARNING: Could not resolve ACK chart version for ${service} (GitHub API error) — skipping."
+      continue
+    }
     echo "  -> ACK ${service}..."
 
     # Extract CRDs only from the Helm chart (no controller pod required locally).

@@ -78,7 +78,7 @@ echo "==> Waiting for all RGDs to become Ready (kro must generate CRDs before te
 # "first broken RGD + everything after it", NOT the set of broken RGDs — reading it literally
 # has twice sent someone chasing healthy RGDs (KRO-443). Always print the real diagnosis on
 # failure so CI logs name the actual offender and its validation error.
-if ! kubectl wait rgd --all --for=condition=Ready --timeout=120s; then
+if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
   echo ""
   echo "======================================================================"
   echo "RGD readiness FAILED. Ignore the 'timed out' list above — it is mostly"

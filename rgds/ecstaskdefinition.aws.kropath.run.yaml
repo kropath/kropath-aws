@@ -1,0 +1,311 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+# aws-ecs-04: ECSTaskDefinition RGD — wraps ACK ecs.services.k8s.aws/TaskDefinition.
+# Spec: kropath-core/docs/specs/aws/aws-ecs-04-ecstaskdefinition.md
+# CRD cache: kropath-core/docs/crd-cache/aws/ecs-controller-v1.5.0.md
+#
+# Naming: effectiveName maps to spec.family (ACK primary key), NOT spec.name.
+# Revision: append-only model; status.revision tracks the active revision number.
+# ACK TaskDefinition has no spec.name field — family IS the resource identifier.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: ecstaskdefinition.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ECSTaskDefinition
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Container definitions — required by ACK.
+      # essential: must be explicitly true; AWS default is true but Go zero-value is false.
+      containerDefinitions: "[]ContainerDefinition | default=[]"
+
+      # CPU and memory as strings (e.g. "256", "512") — required for Fargate.
+      cpu: string | default=""
+      memory: string | default=""
+
+      # Network mode governance: mandatory.defaultNetworkMode wins; then instance; then defaults.
+      networkMode: string | default=""
+
+      # Requires Compatibilities (e.g. ["FARGATE", "EC2"])
+      requiresCompatibilities: "[]string | default=[]"
+
+      # IAM roles
+      executionRoleARN: string | default=""
+      taskRoleARN: string | default=""
+
+      # Volumes (optional)
+      volumes: "[]VolumeItem | default=[]"
+
+      # Ephemeral storage (optional)
+      ephemeralStorage:
+        sizeInGiB: integer | default=0
+
+      # PID mode (optional)
+      pidMode: string | default=""
+
+      # IPC mode (optional)
+      ipcMode: string | default=""
+
+    types:
+      ContainerDefinition:
+        name: string | default=""
+        image: string | default=""
+        # essential must be explicit — AWS default true but Go zero-value is false
+        essential: boolean | default=true
+        cpu: integer | default=0
+        memory: integer | default=0
+        memoryReservation: integer | default=0
+        portMappings: "[]PortMapping | default=[]"
+        environment: "[]EnvironmentEntry | default=[]"
+        command: "[]string | default=[]"
+        entryPoint: "[]string | default=[]"
+        logConfiguration:
+          logDriver: string | default=""
+          options: map[string]string | default={}
+        readonlyRootFilesystem: boolean | default=false
+        privileged: boolean | default=false
+        user: string | default=""
+        workingDirectory: string | default=""
+        mountPoints: "[]MountPoint | default=[]"
+        dependsOn: "[]ContainerDependency | default=[]"
+      PortMapping:
+        containerPort: integer | default=0
+        hostPort: integer | default=0
+        protocol: string | default=""
+      EnvironmentEntry:
+        name: string | default=""
+        value: string | default=""
+      MountPoint:
+        containerPath: string | default=""
+        sourceVolume: string | default=""
+        readOnly: boolean | default=false
+      ContainerDependency:
+        containerName: string | default=""
+        condition: string | default=""
+      VolumeItem:
+        name: string | default=""
+        host:
+          sourcePath: string | default=""
+        efsVolumeConfiguration:
+          fileSystemID: string | default=""
+          rootDirectory: string | default=""
+          transitEncryption: string | default=""
+
+    status:
+      # resourceName = the family name (effectiveName)
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      # Revision number from ACK after registration
+      revision: >-
+        ${taskdefinition.?status.?revision.orValue(0)}
+      conditions: >-
+        ${taskdefinition.?status.?conditions.orValue([])}
+
+    additionalPrinterColumns:
+      - name: Family
+        type: string
+        jsonPath: .status.resourceName
+      - name: Revision
+        type: string
+        jsonPath: .status.revision
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ECSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — effectiveName maps to spec.family (not spec.name)
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-ecstaskdefinition-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: ecstaskdefinition-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECSTaskDefinition
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{") ? "invalid-unresolved-tokens" : "valid"}
+
+    # ACK TaskDefinition CR
+    - id: taskdefinition
+      template:
+        apiVersion: ecs.services.k8s.aws/v1alpha1
+        kind: TaskDefinition
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECSTaskDefinition
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # effectiveName goes to spec.family (not spec.name — TaskDefinition has no name field)
+          family: ${naming.data.effectiveName}
+          # Container definitions — essential defaults to true per type definition
+          containerDefinitions: >-
+            ${schema.spec.containerDefinitions.map(c, {
+              "name": c.name,
+              "image": c.image,
+              "essential": c.essential,
+              "cpu": c.cpu,
+              "memory": c.memory,
+              "memoryReservation": c.memoryReservation,
+              "portMappings": c.portMappings.map(p, {"containerPort": p.containerPort, "hostPort": p.hostPort, "protocol": p.protocol}),
+              "environment": c.environment.map(e, {"name": e.name, "value": e.value}),
+              "command": c.command,
+              "entryPoint": c.entryPoint,
+              "logConfiguration": {
+                "logDriver": c.logConfiguration.logDriver,
+                "options": c.logConfiguration.options
+              },
+              "readonlyRootFilesystem": c.readonlyRootFilesystem,
+              "privileged": c.privileged,
+              "user": c.user,
+              "workingDirectory": c.workingDirectory,
+              "mountPoints": c.mountPoints.map(m, {"containerPath": m.containerPath, "sourceVolume": m.sourceVolume, "readOnly": m.readOnly}),
+              "dependsOn": c.dependsOn.map(d, {"containerName": d.containerName, "condition": d.condition})
+            })}
+          # CPU/memory strings — governance cascade: mandatory wins, instance, defaults.
+          cpu: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultTaskCPU.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultTaskCPU
+              : (schema.spec.cpu != ""
+                  ? schema.spec.cpu
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?defaultTaskCPU.orValue("") : ""))}
+          memory: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultTaskMemory.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultTaskMemory
+              : (schema.spec.memory != ""
+                  ? schema.spec.memory
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?defaultTaskMemory.orValue("") : ""))}
+          # Network mode governance: mandatory wins, instance, defaults.
+          networkMode: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultNetworkMode.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultNetworkMode
+              : (schema.spec.networkMode != ""
+                  ? schema.spec.networkMode
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?defaultNetworkMode.orValue("") : ""))}
+          requiresCompatibilities: ${schema.spec.requiresCompatibilities}
+          executionRoleARN: ${schema.spec.executionRoleARN}
+          taskRoleARN: ${schema.spec.taskRoleARN}
+          volumes: >-
+            ${schema.spec.volumes.map(v, {
+              "name": v.name,
+              "host": {"sourcePath": v.host.sourcePath},
+              "efsVolumeConfiguration": {
+                "fileSystemID": v.efsVolumeConfiguration.fileSystemID,
+                "rootDirectory": v.efsVolumeConfiguration.rootDirectory,
+                "transitEncryption": v.efsVolumeConfiguration.transitEncryption
+              }
+            })}
+          ephemeralStorage:
+            sizeInGiB: ${schema.spec.ephemeralStorage.sizeInGiB}
+          pidMode: ${schema.spec.pidMode}
+          ipcMode: ${schema.spec.ipcMode}
+          # Cloud tags
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})}
