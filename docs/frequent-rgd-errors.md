@@ -870,3 +870,223 @@ This document tracks technical friction points, syntax limitations, and runtime 
   Two related fixture bugs surface in the same steps: (1) **synced labels carry the `aws.kropath.run/` prefix** — assert `.metadata.labels["aws.kropath.run/team"]`, never bare `kropath.run/team`; (2) **advisory ConfigMaps are named `${schema.metadata.name}-<suffix>`** (e.g. `in21-inst-password-exclusion-error`), not the bare instance name — assert the full generated name.
 
 ---
+
+## 7. ACK Target-Schema Fidelity — Verify Every Field Against the Live CRD
+
+The RGD's user-facing `types:` block and the ACK CRD it feeds are **two independent schemas**.
+kro type-checks every template expression against the ACK CRD's OpenAPI schema at RGD-validation
+time, so any drift between what the RGD *declares* and what ACK *accepts* turns the RGD `Inactive`
+before a single instance is created. Intuition about field names and types is not a substitute for
+reading the CRD.
+
+**Always dump the target shape first:**
+
+```bash
+kubectl get crd distributions.cloudfront.services.k8s.aws -o json \
+  | jq -r '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties
+           .distributionConfig.properties.origins.properties.items.items.properties
+           | map_values(if .type=="object" then (.properties|map_values(.type)) else .type end)'
+```
+
+Real drift found in the CloudFront family (KRO-443), every instance of which blocked the RGD:
+
+| RGD declared | ACK actually wants | Error text |
+|---|---|---|
+| `responseCode: integer` | `string` (AWS returns the HTTP status as a string) | `field "responseCode" has incompatible type: got "int", expected "string"` |
+| `httpsPort` | `httpSPort` (capital S) | silently wrong / unknown field |
+| flat `cachedMethods: []string` | nested `allowedMethods.cachedMethods.items` | `field "cachedMethods" exists in output but not in expected type` |
+| `originType` (invented) | no such field on an origin | `strict decoding error: unknown field "spec.origins[0].originType"` |
+
+### ACK `format: byte` Fields Need CEL `bytes()`
+
+* **What Fails:** Assigning a string expression to an ACK field typed `string` with `format: byte`
+  (e.g. `cloudfront Function.spec.functionCode`):
+    ```yaml
+    functionCode: ${schema.spec.functionCode}
+    ```
+    ```log
+    failed to validate resource "ackFunction": type mismatch at path "spec.functionCode":
+    expression "schema.spec.functionCode" returns type "string" but expected "bytes":
+    type kind mismatch: got "string", expected "bytes"
+    ```
+* **Why:** kro maps OpenAPI `type: string, format: byte` to the CEL `bytes` type. A kro RGD schema
+  has no `bytes` primitive, so the user-facing field must stay `string` and be converted in the
+  template. There is **no pass-through option** — the type checker rejects it.
+* **What Works Instead:** The CEL *standard* conversion `bytes(string)` is available (kro v0.9.2
+  does **not** ship the cel-go `base64` extension, but does not need it here). The caller supplies
+  **plain** content and the API server base64-encodes the bytes on write:
+    ```yaml
+    functionCode: ${bytes(schema.spec.functionCode)}
+    ```
+  Caller passes `"hello"` → the ACK CR stores `"aGVsbG8="`. Do **not** ask callers to pre-encode:
+  `bytes()` would treat the base64 text as literal characters and double-encode it.
+
+### `.orValue()` Cannot Take a Map Literal for a Named-Struct Field
+
+* **What Fails:** Guarding an optional nested object by supplying a map-literal fallback — the
+  shape that looks like the obvious replacement for a rejected `has()`:
+    ```yaml
+    "s3OriginConfig": o.?s3OriginConfig.orValue({"originAccessIdentity":""}).?originAccessIdentity.orValue("") != "" ? ... : {}
+    "customOriginConfig": o.?customOriginConfig.orValue({"originProtocolPolicy":""}) ... ? o.customOriginConfig : {}
+    ```
+    ```log
+    found no matching overload for 'orValue' applied to
+      'optional_type(__type_schema.spec.origins.@idx.s3OriginConfig).(map(string, string))'
+    found no matching overload for '_?_:_' applied to
+      '(bool, __type_schema.spec.origins.@idx.customOriginConfig, map(dyn, dyn))'
+    ```
+* **Why:** Inside a macro, a nested object of a named RGD type is a **named struct type**
+  (`__type_schema.spec.origins.@idx.s3OriginConfig`), not a map. `optional(T).orValue(x)` requires
+  `x` to be exactly `T`, and a map literal never unifies with a named struct. The same rule breaks
+  the ternary: returning the struct itself on one branch and `{}` on the other cannot unify either.
+* **What Works Instead:** Chain the safe-navigation operator all the way down to a **scalar leaf**,
+  and `orValue()` only that scalar. Build every branch as an explicit map literal so both branches
+  are maps:
+    ```yaml
+    "s3OriginConfig": o.?s3OriginConfig.?originAccessIdentity.orValue("") != ""
+      ? {"originAccessIdentity": o.s3OriginConfig.originAccessIdentity}
+      : {},
+    "customOriginConfig": o.?customOriginConfig.?originProtocolPolicy.orValue("") != ""
+      ? {
+          "httpPort": o.?customOriginConfig.?httpPort.orValue(80),
+          "httpSPort": o.?customOriginConfig.?httpsPort.orValue(443),
+          "originProtocolPolicy": o.customOriginConfig.originProtocolPolicy,
+          "originSSLProtocols": {"items": o.?customOriginConfig.?originSSLProtocols.?items.orValue([])}
+        }
+      : {}
+    ```
+  `map(string, …)` vs the empty literal `{}` (`map(dyn, dyn)`) **does** unify — only struct-vs-map
+  fails. Never return `o.someNestedObject` directly from a ternary branch.
+
+### kro's Dependency Extractor Only Understands the 3-Argument `transformList`
+
+* **What Fails:** The two-argument CEL form `list.transformList(v, expr)`:
+    ```log
+    failed to build dependency graph: failed to extract dependencies:
+    references unknown identifiers: [b]
+    ```
+* **Why:** kro parses each expression to discover which graph resources it depends on. Its
+  identifier walker recognises the loop variables of the **three-argument** form
+  `transformList(indexVar, valueVar, expr)` only; with the two-argument form the value variable
+  looks like an unresolved top-level resource reference and the whole graph is rejected.
+* **What Works Instead:** Always use the 3-arg form, even when the index is unused:
+    ```yaml
+    ${schema.spec.cacheBehaviors.transformList(i, b, { "pathPattern": b.pathPattern, ... })}
+    ```
+
+---
+
+## 8. Diagnosing RGD Failures — Two Traps in the Tooling Itself
+
+### `kubectl wait rgd --all --timeout=120s` Shares ONE Budget Across All RGDs
+
+* **What You See:** CI's `make setup` reports a *list* of RGDs that "timed out", which reads as
+  though every one of them is broken:
+    ```log
+    resourcegraphdefinition.kro.run/cloudfrontcachepolicy.aws.kropath.run condition met
+    timed out waiting for the condition on resourcegraphdefinitions/cloudfrontdistribution...
+    timed out waiting for the condition on resourcegraphdefinitions/cloudfrontfunction...
+    timed out waiting for the condition on resourcegraphdefinitions/cloudfrontoriginaccesscontrol...
+    ```
+* **Why:** `kubectl wait --all` walks resources in **name order** against a single shared deadline.
+  The first genuinely-broken RGD consumes the entire 120s; every RGD alphabetically after it is
+  reported as timed out without ever being given time. The failure list is therefore
+  "first broken RGD + everything after it alphabetically", **not** the set of broken RGDs.
+* **How to Diagnose:** Ignore the list. Reproduce locally and read the actual state:
+    ```bash
+    kubectl get rgd --no-headers | awk '$5!="True"{print $1, $4, $5}'
+    kubectl get rgd <name> -o jsonpath='{range .status.conditions[*]}{.type}={.status} :: {.message}{"\n"}{end}'
+    ```
+  In KRO-443 five RGDs were reported; only **two** (`cloudfrontdistribution`,
+  `cloudfrontfunction`) were actually broken.
+
+### kro Re-Validates the Graph Only on Re-CREATE, Not on Re-Apply
+
+* **What Fails:** Editing an RGD, running `kubectl apply`, and concluding the fix did not work
+  because the `GraphAccepted` message is unchanged. Adding an annotation to force a resync does not
+  help either.
+* **Why:** An unchanged/annotation-only update does not bump `metadata.generation`, and a
+  long-failing RGD has its controller-runtime workqueue backoff already saturated at the default
+  1000s cap — so the stale message can persist for ~16 minutes. (The
+  `KRO_DYNAMIC_CONTROLLER_RATE_LIMITER_*` tuning in `tests/setup.sh` applies to the *dynamic*
+  controller, not the RGD controller.)
+* **What Works Instead:** Delete and re-create on every iteration; it re-validates in ~2s. This
+  also surfaces errors **one layer at a time** — each fix reveals the next validation failure, so
+  budget several rounds:
+    ```bash
+    kubectl delete rgd <kind>.aws.kropath.run --timeout=60s
+    kubectl apply -f rgds/<kind>.aws.kropath.run.yaml
+    kubectl get rgd <kind>.aws.kropath.run -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].message}'
+    ```
+  **A fix to an RGD template is not verified until the RGD reaches `Active` in a cluster.**
+  Reasoning about CEL types on paper is not verification — every CloudFront fix in this cycle
+  looked correct on paper and was rejected by the type checker.
+
+### Local-Cluster-Only Failure Modes to Rule Out Before Blaming the Code
+
+A long-lived local kind cluster diverges from CI's fresh cluster. Two artifacts that look like real
+bugs:
+
+1. **`KindReady=False: breaking changes detected: Property X was removed`** — a stale kro-generated
+   CRD from an earlier branch. Fix: `kubectl delete crd <plural>.aws.kropath.run`. CI never hits it.
+2. **Child ACK resources never created, asserts fail with `actual resource not found`** — the kro
+   ClusterRole in the local cluster predates the new service. Fix:
+   `kubectl apply -f tests/fixtures/rbac/kro-controller.yaml && kubectl rollout restart deployment/kro -n kro-system`.
+   Check with `kubectl get clusterrole kro -o yaml | grep -c <service>`.
+
+---
+
+### Simulating ACK Status: Patch the ACK CHILD, Never the kro-Computed Parent Field
+
+* **What Fails:** Seeding a sibling resource's id for a cross-RGD `externalRef` test by patching the
+  kropath CR's status directly:
+    ```bash
+    kubectl patch cloudfrontcachepolicy ac10-cache-policy -n ns --subresource=status \
+      --type=merge -p '{"status":{"id":"cache-policy-id-abc"}}'
+    ```
+  The patch appears to succeed, but the consuming resource still reads `""`:
+    ```log
+    * spec.distributionConfig.defaultCacheBehavior.cachePolicyID:
+        Invalid value: "": Expected value: "cache-policy-id-abc"
+    ```
+* **Why:** `status.id` on the kropath CR is **kro-computed** — the RGD declares
+  `id: ${ackCachePolicy.?status.?id.orValue("")}`. kro's instance controller owns that field and
+  overwrites the manual patch on its next reconcile, silently reverting it to `""`. Every field in
+  an RGD's `status:` block behaves this way; only the ACK child's status is externally writable.
+* **What Works Instead:** Patch the **ACK child**, then let kro propagate the value upward:
+    ```yaml
+    - assert:            # required — `- script:` never retries, so it races kro's child creation
+        resource: {apiVersion: cloudfront.services.k8s.aws/v1alpha1, kind: CachePolicy,
+                   metadata: {name: ac10-cache-policy, namespace: ns}}
+    - script:
+        content: |
+          kubectl patch cachepolicies.cloudfront.services.k8s.aws ac10-cache-policy -n ns \
+            --subresource=status --type=merge -p '{"status":{"id":"cache-policy-id-abc"}}'
+    - assert:            # required — wait for kro to propagate before the consumer reads it
+        resource: {apiVersion: aws.kropath.run/v1alpha1, kind: CloudFrontCachePolicy,
+                   metadata: {name: ac10-cache-policy, namespace: ns},
+                   status: {id: cache-policy-id-abc}}
+    ```
+  Note the **two** asserts: one before the patch (the child must exist) and one after (the parent
+  must have propagated) — without the second, the consuming resource reconciles against the
+  pre-propagation `""`.
+
+### Config CRs Must Not Set the Same Governance Field in BOTH `mandatory` and `defaults`
+
+* **What Fails:** A `<Service>Config` fixture that sets a field non-empty in both tiers to express
+  "mandatory overrides defaults":
+    ```log
+    CloudFrontConfig.aws.kropath.run "ac1m-cfg" is invalid: <nil>: Invalid value:
+      viewerProtocolPolicy must be set in either mandatory or defaults, not both.
+    ```
+* **Why:** The governance CRDs carry `x-kubernetes-validations` mutual-exclusion rules of the form
+  `!(has(self.spec.mandatory.X) && self.spec.mandatory.X != "" && has(self.spec.defaults.X) && self.spec.defaults.X != "")`.
+  The rule fires on **non-empty in both**, so the "override" fixture is rejected at admission and
+  every step depending on that config fails.
+* **What Works Instead:** In the CR **spec**, set the field in one tier only and leave the other
+  `""`/`false`. The override behaviour is exercised through the `status.effectiveConfig` patch that
+  these suites already perform — that subresource has no mutual-exclusion rule, and it is what the
+  RGD actually reads. Deliberate negative tests that assert the rejection are the one exception and
+  belong in the `<service>config` suite.
+
+---
