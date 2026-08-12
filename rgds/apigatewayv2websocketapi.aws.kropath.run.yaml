@@ -1,0 +1,530 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: apigatewayv2websocketapi.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ApiGatewayV2WebSocketApi
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      description: string | default=""
+      version: string | default=""
+      # routeSelectionExpression is required for WebSocket APIs — e.g. "$request.body.action"
+      routeSelectionExpression: string | default=""
+      apiKeySelectionExpression: string | default=""
+      # Tri-state boolean — do NOT add | default=false (frequent-rgd-errors.md §booleans)
+      disableExecuteApiEndpoint: boolean
+      authorizers: "[]WebSocketAuthorizer | default=[]"
+      routes: "[]WebSocketRoute | required=true"
+    types:
+      WebSocketAuthorizer:
+        name: string | required=true
+        identitySource: "[]string | required=true"
+        authorizerUri: string | required=true
+        authorizerCredentials: string | default=""
+        identityValidationExpression: string | default=""
+        resultTtlInSeconds: integer | default=0
+      WebSocketRouteIntegration:
+        type: string | required=true
+        integrationUri: string | default=""
+        integrationMethod: string | default=""
+        connectionType: string | default=INTERNET
+        connectionRef: string | default=""
+        credentialsArn: string | default=""
+        contentHandlingStrategy: string | default=""
+        passthroughBehavior: string | default=WHEN_NO_MATCH
+        requestParameters: map[string]string | default={}
+        requestTemplates: map[string]string | default={}
+        templateSelectionExpression: string | default=""
+        timeoutInMillis: integer | default=29000
+      WebSocketRoute:
+        routeKey: string | required=true
+        name: string | default=""
+        authorizationType: string | default=NONE
+        authorizerRef: string | default=""
+        apiKeyRequired: boolean | default=false
+        operationName: string | default=""
+        modelSelectionExpression: string | default=""
+        routeResponseSelectionExpression: string | default=""
+        requestModels: map[string]string | default={}
+        integration: WebSocketRouteIntegration
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      conditions: >-
+        ${webSocketApi.?status.?conditions.orValue([])}
+      validationError: >-
+        ${has(emptyRoutesError.data) && emptyRoutesError.data.error != "" ? emptyRoutesError.data.error : (has(routeSelectionExpressionError.data) && routeSelectionExpressionError.data.error != "" ? routeSelectionExpressionError.data.error : (has(duplicateRouteKeyError.data) && duplicateRouteKeyError.data.error != "" ? duplicateRouteKeyError.data.error : (has(duplicateAuthorizerNameError.data) && duplicateAuthorizerNameError.data.error != "" ? duplicateAuthorizerNameError.data.error : (has(invalidAuthorizerRefError.data) && invalidAuthorizerRefError.data.error != "" ? invalidAuthorizerRefError.data.error : (has(doubleHyphenRouteKeyError.data) && doubleHyphenRouteKeyError.data.error != "" ? doubleHyphenRouteKeyError.data.error : "")))))}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
+
+  resources:
+    # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ApiGatewayV2Config
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── Naming ConfigMap (status block cannot access schema.*) ────────────────
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # ── Advisory ConfigMaps — ALWAYS created (no includeWhen).                ─
+    # ── data.error is non-empty only when the condition fires.                ─
+    # ── ACK resource includeWhen mirrors the schema conditions directly        ─
+    # ── (kro cannot reference an excluded resource in includeWhen).           ─
+
+    - id: emptyRoutesError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-empty-routes-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: '${schema.spec.routes.size() == 0 ? "spec.routes must contain at least one route" : ""}'
+
+    - id: routeSelectionExpressionError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-route-selection-expression-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: '${schema.spec.routeSelectionExpression == "" ? "spec.routeSelectionExpression is required for WebSocket APIs" : ""}'
+
+    - id: duplicateRouteKeyError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-duplicate-route-key-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.routes.exists(r, schema.spec.routes.filter(r2, r2.routeKey == r.routeKey).size() > 1)
+              ? "spec.routes contains duplicate routeKey values — each routeKey must be unique"
+              : ""}
+
+    - id: duplicateAuthorizerNameError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-duplicate-authorizer-name-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.authorizers.exists(a, schema.spec.authorizers.filter(a2, a2.name == a.name).size() > 1)
+              ? "spec.authorizers contains duplicate name values — each authorizer name must be unique"
+              : ""}
+
+    - id: invalidAuthorizerRefError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-invalid-authorizer-ref-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.routes.exists(r, r.authorizerRef != "" && !schema.spec.authorizers.exists(a, a.name == r.authorizerRef))
+              ? "spec.routes contains an authorizerRef that does not match any entry in spec.authorizers"
+              : ""}
+
+    - id: doubleHyphenRouteKeyError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-double-hyphen-route-key-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.routes.exists(r, r.routeKey.contains("--"))
+              ? "spec.routes contains a routeKey with '--'; reserved for slug delimiters — use a different separator"
+              : ""}
+
+    # ── Combined gate condition (mirrors all advisory ConfigMap conditions) ────
+    # ── Used identically on webSocketApi, apiAuthorizers, apiIntegrations, apiRoutes.
+
+    # ACK API (protocolType=WEBSOCKET, static single instance)
+    - id: webSocketApi
+      includeWhen:
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+           && schema.spec.routes.size() > 0
+           && schema.spec.routeSelectionExpression != ""
+           && !schema.spec.routes.exists(r, schema.spec.routes.filter(r2, r2.routeKey == r.routeKey).size() > 1)
+           && !schema.spec.authorizers.exists(a, schema.spec.authorizers.filter(a2, a2.name == a.name).size() > 1)
+           && !schema.spec.routes.exists(r, r.authorizerRef != "" && !schema.spec.authorizers.exists(a, a.name == r.authorizerRef))
+           && !schema.spec.routes.exists(r, r.routeKey.contains("--"))}
+      template:
+        apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+        kind: API
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          protocolType: WEBSOCKET
+          description: ${schema.spec.description}
+          version: ${schema.spec.version}
+          routeSelectionExpression: ${schema.spec.routeSelectionExpression}
+          apiKeySelectionExpression: ${schema.spec.apiKeySelectionExpression}
+          # ACK field: disableExecuteAPIEndpoint (capital A and P — confirmed in crd-cache)
+          disableExecuteAPIEndpoint: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?disableExecuteApiEndpoint.orValue(false))
+              ? true
+              : (has(schema.spec.disableExecuteApiEndpoint)
+                  ? schema.spec.disableExecuteApiEndpoint
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?disableExecuteApiEndpoint.orValue(false)))}
+          # ACK API tags is map[string]string (not {key,value} array).
+          # Cascade: defaults syncedAnnotations/syncedLabels/tags → spec → mandatory (last-writer-wins).
+          # Tag support note (G-7): Only the API CR receives cloud tags.
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags) ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})}
+
+    # ── ACK Authorizers (forEach over spec.authorizers, REQUEST type only) ────
+    - id: apiAuthorizers
+      includeWhen:
+        - >-
+          ${schema.spec.authorizers.size() > 0
+           && !naming.data.effectiveName.contains("{")
+           && schema.spec.routes.size() > 0
+           && schema.spec.routeSelectionExpression != ""
+           && !schema.spec.routes.exists(r, schema.spec.routes.filter(r2, r2.routeKey == r.routeKey).size() > 1)
+           && !schema.spec.authorizers.exists(a, schema.spec.authorizers.filter(a2, a2.name == a.name).size() > 1)
+           && !schema.spec.routes.exists(r, r.authorizerRef != "" && !schema.spec.authorizers.exists(a, a.name == r.authorizerRef))
+           && !schema.spec.routes.exists(r, r.routeKey.contains("--"))}
+      forEach:
+        - auth: "${schema.spec.authorizers}"
+      template:
+        apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+        kind: Authorizer
+        metadata:
+          name: ${schema.metadata.name}-auth-${auth.name.lowerAscii().replace(" ", "-")}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # ACK field: name (required by ACK Authorizer CRD)
+          name: ${auth.name}
+          # apiRef links to the parent ACK API CR
+          apiRef:
+            from:
+              name: ${schema.metadata.name}
+          # WebSocket authorizers are REQUEST type only (JWT is HTTP-API-only per spec OD-3)
+          authorizerType: REQUEST
+          identitySource: ${auth.identitySource}
+          # ACK field: authorizerURI (capital URI)
+          authorizerURI: ${auth.authorizerUri}
+          # ACK field: authorizerCredentialsARN (capital ARN)
+          authorizerCredentialsARN: ${auth.authorizerCredentials}
+          identityValidationExpression: ${auth.identityValidationExpression}
+          # ACK field: authorizerResultTTLInSeconds
+          authorizerResultTTLInSeconds: ${auth.resultTtlInSeconds}
+
+    # ── ACK Integrations (forEach over routes that have an integration) ────────
+    - id: apiIntegrations
+      includeWhen:
+        - >-
+          ${schema.spec.routes.filter(r, r.?integration.?type.orValue("") != "").size() > 0
+           && !naming.data.effectiveName.contains("{")
+           && schema.spec.routes.size() > 0
+           && schema.spec.routeSelectionExpression != ""
+           && !schema.spec.routes.exists(r, schema.spec.routes.filter(r2, r2.routeKey == r.routeKey).size() > 1)
+           && !schema.spec.authorizers.exists(a, schema.spec.authorizers.filter(a2, a2.name == a.name).size() > 1)
+           && !schema.spec.routes.exists(r, r.authorizerRef != "" && !schema.spec.authorizers.exists(a, a.name == r.authorizerRef))
+           && !schema.spec.routes.exists(r, r.routeKey.contains("--"))}
+      forEach:
+        - route: "${schema.spec.routes.filter(r, r.?integration.?type.orValue('') != '')}"
+      template:
+        apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+        kind: Integration
+        metadata:
+          name: ${schema.metadata.name}-int-${route.routeKey.lowerAscii().replace("$","").replace("{","").replace("}","").replace("/","--").replace(" ","-")}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          apiRef:
+            from:
+              name: ${schema.metadata.name}
+          # ACK field: integrationType (not "type")
+          integrationType: ${route.integration.type}
+          # ACK field: integrationURI (capital URI)
+          integrationURI: ${route.integration.integrationUri}
+          integrationMethod: ${route.integration.integrationMethod}
+          connectionType: ${route.integration.connectionType}
+          # connectionRef links to a VPC Link CR only when connectionType == VPC_LINK
+          connectionRef:
+            from:
+              name: '${route.integration.connectionType == "VPC_LINK" ? route.integration.connectionRef : ""}'
+          # ACK field: credentialsARN (capital ARN)
+          credentialsARN: ${route.integration.credentialsArn}
+          # WebSocket-specific: content handling and passthrough behavior
+          contentHandlingStrategy: ${route.integration.contentHandlingStrategy}
+          passthroughBehavior: ${route.integration.passthroughBehavior}
+          requestParameters: ${route.integration.requestParameters}
+          requestTemplates: ${route.integration.requestTemplates}
+          templateSelectionExpression: ${route.integration.templateSelectionExpression}
+          timeoutInMillis: ${route.integration.timeoutInMillis}
+
+    # ── ACK Routes (forEach over all spec.routes) ─────────────────────────────
+    - id: apiRoutes
+      includeWhen:
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+           && schema.spec.routes.size() > 0
+           && schema.spec.routeSelectionExpression != ""
+           && !schema.spec.routes.exists(r, schema.spec.routes.filter(r2, r2.routeKey == r.routeKey).size() > 1)
+           && !schema.spec.authorizers.exists(a, schema.spec.authorizers.filter(a2, a2.name == a.name).size() > 1)
+           && !schema.spec.routes.exists(r, r.authorizerRef != "" && !schema.spec.authorizers.exists(a, a.name == r.authorizerRef))
+           && !schema.spec.routes.exists(r, r.routeKey.contains("--"))}
+      forEach:
+        - route: "${schema.spec.routes}"
+      template:
+        apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+        kind: Route
+        metadata:
+          name: ${schema.metadata.name}-route-${route.routeKey.lowerAscii().replace("$","").replace("{","").replace("}","").replace("/","--").replace(" ","-")}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2WebSocketApi
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          apiRef:
+            from:
+              name: ${schema.metadata.name}
+          routeKey: ${route.routeKey}
+          authorizationType: ${route.authorizationType}
+          apiKeyRequired: ${route.apiKeyRequired}
+          operationName: ${route.operationName}
+          modelSelectionExpression: ${route.modelSelectionExpression}
+          routeResponseSelectionExpression: ${route.routeResponseSelectionExpression}
+          requestModels: ${route.requestModels}
+          # authorizerRef links to the ACK Authorizer CR by K8s name (computed from user's authorizerRef name)
+          authorizerRef:
+            from:
+              name: '${route.authorizerRef != "" ? schema.metadata.name + "-auth-" + route.authorizerRef.lowerAscii().replace(" ", "-") : ""}'
+          # targetRef links to the ACK Integration CR for this route (empty when no integration)
+          targetRef:
+            from:
+              name: '${route.?integration.?type.orValue("") != "" ? schema.metadata.name + "-int-" + route.routeKey.lowerAscii().replace("$","").replace("{","").replace("}","").replace("/","--").replace(" ","-") : ""}'
