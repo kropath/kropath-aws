@@ -1071,6 +1071,42 @@ bugs:
   must have propagated) — without the second, the consuming resource reconciles against the
   pre-propagation `""`.
 
+### `forEach` Template Missing `spec.name` on ACK Resources That Require It
+
+* **What Fails:** A `forEach`-based kro resource (e.g. `apiAuthorizers`) creates ACK child CRs
+  without `spec.name`. The Kubernetes API server rejects every CR creation because `spec.name` is
+  in the CRD's `required:` list. kro logs the error but no CR ever appears. Chainsaw's `assert:`
+  times out after 5 minutes with `actual resource not found`.
+  ```
+  ac4-jwt-authorizer | ASSERT | ERROR | apigatewayv2.services.k8s.aws/v1alpha1/Authorizer ...
+  actual resource not found
+  ```
+* **Why:** Not all ACK CRDs use `metadata.name` as the cloud resource identity. Some — ACK
+  `Authorizer`, `API`, `VPCLink` — have a dedicated `spec.name` field that is `required` in the
+  CRD OpenAPI schema. The RGD template sets `metadata.name` (the K8s identity) but omits
+  `spec.name` (the cloud resource name). The API server validates `spec.name` as required and
+  rejects the creation request at admission. The failure is **silent to Chainsaw** — the RGD stays
+  `Active`, no error appears on the parent CR status, and the only symptom is the child CR never
+  materializing.
+* **What Works Instead:** Add `spec.name` to the ACK child template. For `forEach` loops, bind it
+  to the loop variable's name field:
+    ```yaml
+    spec:
+      name: ${auth.name}    # required by ACK Authorizer CRD
+      apiRef:
+        from:
+          name: ${schema.metadata.name}
+    ```
+* **How to catch this before CI:** Check `kropath-core/docs/crd-cache/aws/<controller>.md` for
+  every ACK CRD the template targets. Fields marked `required` (without the "(required by AWS API)"
+  qualifier that only means "AWS needs it but Kubernetes doesn't enforce it") must appear in the
+  template. Cross-reference: the CRD cache note "No `name` field on most CRDs: `API`, `Authorizer`,
+  `VPCLink` have explicit `name` fields" — these three are the high-risk cases.
+* **Root cause (KRO-564):** `apiAuthorizers` forEach template omitted `spec.name` on the ACK
+  `Authorizer` CR. Fixed by adding `name: ${auth.name}` to the spec block.
+
+---
+
 ### Config CRs Must Not Set the Same Governance Field in BOTH `mandatory` and `defaults`
 
 * **What Fails:** A `<Service>Config` fixture that sets a field non-empty in both tiers to express
