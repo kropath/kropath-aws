@@ -134,18 +134,28 @@ Diagnostic indicator: `lambdalayerversion` IS created by the API server (no BadR
 
 ### Fix
 
-Wrap the integer expression in `string()` to produce a string status field:
+**`string()` wrapping does NOT work in kro v0.9.2 status CEL expressions.** Wrapping the integer in `string()` was attempted (commit `be5883d`) but reverted (commit `bf460f3`) because kro still infers the status field type as `integer` from the inner expression — the `string()` wrapper is evaluated at runtime but kro's type inference runs at graph-registration time on the unevaluated AST, and it sees the underlying integer sub-expression regardless of the outer `string()` call.
+
+The actual fix is to **remove the `versionNumber` field entirely from the RGD status block**. Do not expose integer ACK status fields in RGD status at all — there is no safe way to bridge the type mismatch in kro v0.9.2:
 
 ```yaml
+# WRONG — causes kro Inactive (type inference failure):
+versionNumber: >-
+  ${layer.?status.?versionNumber.orValue(0)}
+
+# ALSO WRONG — string() wrapping does NOT fix the inference failure:
 versionNumber: >-
   ${string(layer.?status.?versionNumber.orValue(0))}
+
+# CORRECT — omit the field entirely from the RGD status block.
+# (No versionNumber entry in status:)
 ```
 
-Also update the Chainsaw AC-9 assert from `versionNumber: 1` (integer) to `versionNumber: "1"` (string). The kubectl patch that sets the ACK LayerVersion status stays as `"versionNumber": 1` (integer JSON) — that patches the ACK CRD field, which is correctly typed as integer.
+This is a confirmed kro platform limitation (documented in `docs/frequent-rgd-errors.md` §"Integer Status Fields Cause kro Inactive"). The `versionNumber` field is omitted from `lambdalayerversion` status; consumers that need it must read the ACK LayerVersion CR directly.
 
 ## Prevention
 
 1. **Always single-quote inline CEL ternary expressions** — if the expression contains `? A : B`, it must be quoted in YAML.
 2. **`selector` belongs under `metadata` in `externalRef`** — confirmed by working examples in `sqsqueue.aws.kropath.run.yaml`, `docs/frequent-rgd-errors.md`, and `docs/STANDARDS.md`.
 3. **Apply cross-referencing RGD families in dependency order** — when a new RGD family has members that reference each other's generated kinds via `externalRef`, apply base kinds first (wait for Active), then dependent kinds. Update `tests/setup.sh` with explicit waves when adding any family where RGDs reference sibling kinds.
-4. **Status CEL expressions must produce `string` or `list` — never `integer` or `boolean`.** Use `string()` to convert numeric ACK status fields before exposing them in RGD status. See Error Type 4 above.
+4. **Integer ACK status fields cannot be exposed in RGD status in kro v0.9.2 — omit them entirely.** `string()` wrapping does NOT fix the type inference failure (kro inspects the AST at registration time and sees the underlying integer regardless of the outer `string()` call). If an ACK status field is typed `integer` (e.g. `versionNumber`, `timeout`), do not add it to the RGD `status:` block. See Error Type 4 above.
