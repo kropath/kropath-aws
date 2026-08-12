@@ -1,0 +1,404 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# CloudFrontDistribution RGD — wraps ACK cloudfront.services.k8s.aws/Distribution.
+# This resource has NO provider name field (KRO-236). Naming convention does not apply.
+# Distributions are identified by CloudFront-assigned id (e.g. E1U5RQF7T870K0).
+# Tag support: distribution supports cloud tags via allCloudMetadata (ADR-015 §6.1).
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cloudfrontdistribution.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: CloudFrontDistribution
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      comment: string | default=""
+      enabled: boolean | default=true
+      httpVersion: string | default=""
+      isIPV6Enabled: boolean | default=true
+      priceClass: string | default=""
+      defaultRootObject: string | default=""
+      webACLID: string | default=""
+      aliases: "[]string | default=[]"
+      # Origins — at least one required.
+      # originAccessControlRef (per-origin): name of CloudFrontOriginAccessControl CR for origins[0].
+      # For origins[1+], use originAccessControlID directly.
+      origins: "[]CloudFrontOrigin | default=[]"
+      # Default cache behavior (required in practice)
+      defaultCacheBehavior:
+        viewerProtocolPolicy: string | default=""
+        cachePolicyID: string | default=""
+        cachePolicyRef: string | default=""
+        originRequestPolicyID: string | default=""
+        originRequestPolicyRef: string | default=""
+        responseHeadersPolicyID: string | default=""
+        responseHeadersPolicyRef: string | default=""
+        compress: boolean | default=true
+        allowedMethods: "[]string | default=[]"
+        cachedMethods: "[]string | default=[]"
+        functionAssociations: "[]CloudFrontFunctionAssociation | default=[]"
+        targetOriginID: string | default=""
+      # Additional path-pattern cache behaviors
+      cacheBehaviors: "[]CloudFrontCacheBehavior | default=[]"
+      # Custom error responses
+      customErrorResponses: "[]CloudFrontCustomErrorResponse | default=[]"
+      # Access logging
+      logging:
+        enabled: boolean | default=false
+        bucket: string | default=""
+        prefix: string | default=""
+        includeCookies: boolean | default=false
+      # Geographic restrictions
+      restrictions:
+        geoRestriction:
+          restrictionType: string | default=""
+          items: "[]string | default=[]"
+      # TLS/SSL configuration
+      viewerCertificate:
+        acmCertificateArn: string | default=""
+        sslSupportMethod: string | default=""
+        minimumProtocolVersion: string | default=""
+        cloudFrontDefaultCertificate: boolean | default=false
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      CloudFrontCustomHeader:
+        headerName: string | required=true
+        headerValue: string | required=true
+      CloudFrontOrigin:
+        id: string | required=true
+        domainName: string | required=true
+        originType: string | default=""
+        originPath: string | default=""
+        connectionAttempts: integer | default=3
+        connectionTimeout: integer | default=10
+        originAccessControlRef: string | default=""
+        originAccessControlID: string | default=""
+        customHeaders:
+          items: "[]CloudFrontCustomHeader | default=[]"
+        s3OriginConfig:
+          originAccessIdentity: string | default=""
+        customOriginConfig:
+          httpPort: integer | default=80
+          httpsPort: integer | default=443
+          originProtocolPolicy: string | default=""
+          originSSLProtocols:
+            items: "[]string | default=[]"
+        originShield:
+          enabled: boolean | default=false
+          originShieldRegion: string | default=""
+      CloudFrontFunctionAssociation:
+        functionARN: string | required=true
+        eventType: string | required=true
+      CloudFrontCacheBehavior:
+        pathPattern: string | required=true
+        targetOriginID: string | required=true
+        viewerProtocolPolicy: string | default=""
+        cachePolicyID: string | default=""
+        originRequestPolicyID: string | default=""
+        responseHeadersPolicyID: string | default=""
+        compress: boolean | default=true
+        allowedMethods: "[]string | default=[]"
+        cachedMethods: "[]string | default=[]"
+        functionAssociations: "[]CloudFrontFunctionAssociation | default=[]"
+      CloudFrontCustomErrorResponse:
+        errorCode: integer | required=true
+        responseCode: string | default=""
+        responsePagePath: string | default=""
+        errorCachingMinTTL: integer | default=0
+    status:
+      conditions: >-
+        ${ackDistribution.?status.?conditions.orValue([])}
+      distributionId: >-
+        ${ackDistribution.?status.?id.orValue("")}
+      domainName: >-
+        ${ackDistribution.?status.?domainName.orValue("")}
+      webACLError: >-
+        ${has(webACLError.data) ? webACLError.data.error : ""}
+    additionalPrinterColumns:
+      - name: DistributionId
+        type: string
+        jsonPath: .status.distributionId
+      - name: DomainName
+        type: string
+        jsonPath: .status.domainName
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — rsrcCfg is a list; always use rsrcCfg[0] with size() guard.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Sibling CachePolicy ref resolution (OD-3).
+    # Sentinel: when cachePolicyRef is "", selector matches kro-empty-fallback-sentinel → cachePolicyCr is [].
+    - id: cachePolicyCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontCachePolicy
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.defaultCacheBehavior.cachePolicyRef != "" ? schema.spec.defaultCacheBehavior.cachePolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # Sibling OriginRequestPolicy ref resolution (OD-3).
+    - id: originRequestPolicyCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontOriginRequestPolicy
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.defaultCacheBehavior.originRequestPolicyRef != "" ? schema.spec.defaultCacheBehavior.originRequestPolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # Sibling ResponseHeadersPolicy ref resolution (OD-3).
+    - id: responseHeadersPolicyCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontResponseHeadersPolicy
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.defaultCacheBehavior.responseHeadersPolicyRef != "" ? schema.spec.defaultCacheBehavior.responseHeadersPolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # Sibling OriginAccessControl ref resolution (OD-3).
+    # Resolves origins[0].originAccessControlRef → CloudFrontOriginAccessControl status.id.
+    - id: oacCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontOriginAccessControl
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.origins.size() > 0 && schema.spec.origins[0].?originAccessControlRef.orValue("") != "" ? schema.spec.origins[0].originAccessControlRef : "kro-empty-fallback-sentinel"}'
+
+    # webACLRequired gate (advisory ConfigMap).
+    # Created when mandatory.webACLRequired is true and spec.webACLID is empty.
+    # x-kubernetes-validations cannot be used (kro discards them — see frequent-rgd-errors.md).
+    - id: webACLError
+      includeWhen:
+        - >-
+          ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?webACLRequired.orValue(false) && schema.spec.webACLID == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-waf-required-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistribution
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "webACLRequired is true but spec.webACLID is empty — a WAF WebACL ARN must be provided"
+
+    # ACK Distribution CR — primary cloud resource.
+    # Not created when webACLRequired gate fires (spec.webACLID empty and mandatory.webACLRequired=true).
+    # Not created when origins list is empty (required field).
+    - id: ackDistribution
+      includeWhen:
+        - >-
+          ${schema.spec.origins.size() > 0 && !(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?webACLRequired.orValue(false) && schema.spec.webACLID == "")}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: Distribution
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistribution
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          distributionConfig:
+            comment: "${schema.spec.comment}"
+            enabled: ${schema.spec.enabled}
+            httpVersion: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?httpVersion.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.httpVersion
+                : (schema.spec.httpVersion != ""
+                    ? schema.spec.httpVersion
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?httpVersion.orValue("") : ""))}
+            isIPV6Enabled: ${schema.spec.isIPV6Enabled}
+            priceClass: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?priceClass.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.priceClass
+                : (schema.spec.priceClass != ""
+                    ? schema.spec.priceClass
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?priceClass.orValue("") : ""))}
+            defaultRootObject: "${schema.spec.defaultRootObject}"
+            webACLID: "${schema.spec.webACLID}"
+            aliases:
+              items: ${schema.spec.aliases}
+            # Origins — transform list to wire OAC ref resolution for origins[0] and pass through other fields.
+            origins:
+              items: >-
+                ${schema.spec.origins.transformList(i, o, {
+                  "id": o.id,
+                  "domainName": o.domainName,
+                  "originPath": o.?originPath.orValue(""),
+                  "connectionAttempts": o.?connectionAttempts.orValue(3),
+                  "connectionTimeout": o.?connectionTimeout.orValue(10),
+                  "originAccessControlID": (i == 0 && o.?originAccessControlRef.orValue("") != "" && oacCr.size() > 0)
+                    ? oacCr[0].status.id
+                    : o.?originAccessControlID.orValue(""),
+                  "customHeaders": o.customHeaders.items.size() > 0
+                    ? {"items": o.customHeaders.items}
+                    : {},
+                  "s3OriginConfig": o.s3OriginConfig.originAccessIdentity != ""
+                    ? {"originAccessIdentity": o.s3OriginConfig.originAccessIdentity}
+                    : {},
+                  "customOriginConfig": o.customOriginConfig.originProtocolPolicy != ""
+                    ? {
+                        "httpPort": o.customOriginConfig.httpPort,
+                        "httpSPort": o.customOriginConfig.httpsPort,
+                        "originProtocolPolicy": o.customOriginConfig.originProtocolPolicy,
+                        "originSSLProtocols": {"items": o.customOriginConfig.originSSLProtocols.items}
+                      }
+                    : {},
+                  "originShield": o.originShield.enabled
+                    ? {"enabled": true, "originShieldRegion": o.originShield.originShieldRegion}
+                    : {}
+                })}
+            defaultCacheBehavior:
+              targetOriginID: "${schema.spec.defaultCacheBehavior.targetOriginID}"
+              viewerProtocolPolicy: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?viewerProtocolPolicy.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.viewerProtocolPolicy
+                  : (schema.spec.defaultCacheBehavior.viewerProtocolPolicy != ""
+                      ? schema.spec.defaultCacheBehavior.viewerProtocolPolicy
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?viewerProtocolPolicy.orValue("") : ""))}
+              cachePolicyID: >-
+                ${schema.spec.defaultCacheBehavior.cachePolicyRef != "" && cachePolicyCr.size() > 0
+                  ? cachePolicyCr[0].status.id
+                  : schema.spec.defaultCacheBehavior.cachePolicyID}
+              originRequestPolicyID: >-
+                ${schema.spec.defaultCacheBehavior.originRequestPolicyRef != "" && originRequestPolicyCr.size() > 0
+                  ? originRequestPolicyCr[0].status.id
+                  : schema.spec.defaultCacheBehavior.originRequestPolicyID}
+              responseHeadersPolicyID: >-
+                ${schema.spec.defaultCacheBehavior.responseHeadersPolicyRef != "" && responseHeadersPolicyCr.size() > 0
+                  ? responseHeadersPolicyCr[0].status.id
+                  : schema.spec.defaultCacheBehavior.responseHeadersPolicyID}
+              compress: ${schema.spec.defaultCacheBehavior.compress}
+              allowedMethods:
+                items: ${schema.spec.defaultCacheBehavior.allowedMethods}
+                cachedMethods:
+                  items: ${schema.spec.defaultCacheBehavior.cachedMethods}
+              functionAssociations:
+                items: ${schema.spec.defaultCacheBehavior.functionAssociations}
+            cacheBehaviors:
+              items: >-
+                ${schema.spec.cacheBehaviors.transformList(i, cb, {
+                  "pathPattern": cb.pathPattern,
+                  "targetOriginID": cb.targetOriginID,
+                  "viewerProtocolPolicy": cb.viewerProtocolPolicy,
+                  "cachePolicyID": cb.cachePolicyID,
+                  "originRequestPolicyID": cb.originRequestPolicyID,
+                  "responseHeadersPolicyID": cb.responseHeadersPolicyID,
+                  "compress": cb.compress,
+                  "allowedMethods": {
+                    "items": cb.allowedMethods,
+                    "cachedMethods": {"items": cb.cachedMethods}
+                  },
+                  "functionAssociations": {"items": cb.functionAssociations}
+                })}
+            customErrorResponses:
+              items: ${schema.spec.customErrorResponses}
+            logging:
+              enabled: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingEnabled.orValue(false)
+                  ? true
+                  : (schema.spec.logging.enabled
+                      ? true
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false)))}
+              bucket: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingBucket.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingBucket
+                  : (schema.spec.logging.bucket != ""
+                      ? schema.spec.logging.bucket
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?loggingBucket.orValue("") : ""))}
+              prefix: "${schema.spec.logging.prefix}"
+              includeCookies: ${schema.spec.logging.includeCookies}
+            restrictions:
+              geoRestriction:
+                restrictionType: >-
+                  ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?geoRestrictionType.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.geoRestrictionType
+                    : (schema.spec.restrictions.geoRestriction.restrictionType != ""
+                        ? schema.spec.restrictions.geoRestriction.restrictionType
+                        : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?geoRestrictionType.orValue("") : ""))}
+                items: ${schema.spec.restrictions.geoRestriction.items}
+            viewerCertificate:
+              acmCertificateARN: "${schema.spec.viewerCertificate.acmCertificateArn}"
+              sslSupportMethod: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?sslSupportMethod.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.sslSupportMethod
+                  : (schema.spec.viewerCertificate.sslSupportMethod != ""
+                      ? schema.spec.viewerCertificate.sslSupportMethod
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?sslSupportMethod.orValue("") : ""))}
+              minimumProtocolVersion: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?minimumProtocolVersion.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.minimumProtocolVersion
+                  : (schema.spec.viewerCertificate.minimumProtocolVersion != ""
+                      ? schema.spec.viewerCertificate.minimumProtocolVersion
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?minimumProtocolVersion.orValue("") : ""))}
+              cloudFrontDefaultCertificate: ${schema.spec.viewerCertificate.cloudFrontDefaultCertificate}
+          # Cloud resource tags — ACK Distribution spec.tags is []Tag {key, value}.
+          # allCloudMetadata merges tags + syncedLabels + syncedAnnotations for cloud tags (ADR-015 §6.1).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
