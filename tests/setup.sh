@@ -72,6 +72,38 @@ echo "==> Installing kropath.run RGDS definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"
 
 echo "==> Waiting for all RGDs to become Ready (kro must generate CRDs before tests run)..."
-kubectl wait rgd --all --for=condition=Ready --timeout=120s
+# NOTE: `kubectl wait --all` walks resources in NAME ORDER against ONE shared deadline, so the
+# first broken RGD burns the whole budget and every RGD alphabetically after it is reported as
+# "timed out" without ever being given time. That list is therefore
+# "first broken RGD + everything after it", NOT the set of broken RGDs — reading it literally
+# has twice sent someone chasing healthy RGDs (KRO-443). Always print the real diagnosis on
+# failure so CI logs name the actual offender and its validation error.
+if ! kubectl wait rgd --all --for=condition=Ready --timeout=120s; then
+  echo ""
+  echo "======================================================================"
+  echo "RGD readiness FAILED. Ignore the 'timed out' list above — it is mostly"
+  echo "collateral from kubectl wait's shared timeout budget."
+  echo "The RGDs below are the ones actually broken:"
+  echo "======================================================================"
+  not_ready=$(kubectl get rgd -o jsonpath='{range .items[?(@.status.state!="Active")]}{.metadata.name}{"\n"}{end}')
+  if [ -z "${not_ready}" ]; then
+    echo "  (none are Inactive — all RGDs reached Active after the deadline;"
+    echo "   this is a slow-cluster timeout, not a broken graph.)"
+  else
+    for rgd in ${not_ready}; do
+      echo ""
+      echo "--- ${rgd} ---"
+      kubectl get rgd "${rgd}" -o jsonpath='{range .status.conditions[*]}  {.type}={.status} :: {.message}{"\n"}{end}'
+    done
+    echo ""
+    echo "To reproduce and iterate locally (kro re-validates only on re-CREATE, never on re-apply):"
+    echo "  kubectl delete rgd <name> && kubectl apply -f rgds/<name>.yaml"
+    echo "  kubectl get rgd <name> -o jsonpath='{.status.conditions[?(@.type==\"GraphAccepted\")].message}'"
+    echo "Errors surface ONE LAYER AT A TIME — repeat until the RGD reports Active."
+    echo "See docs/frequent-rgd-errors.md §7 and §8."
+  fi
+  echo "======================================================================"
+  exit 1
+fi
 
 echo "==> Test environment ready."
