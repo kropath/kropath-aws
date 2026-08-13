@@ -1,0 +1,179 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-lambda-03: LambdaEventSourceMapping RGD
+# Composes: lambda.services.k8s.aws/EventSourceMapping
+# Naming exemption (KRO-236): EventSourceMapping has no user-supplied cloud name.
+# AWS assigns a UUID at creation; no effectiveName/predictedArn/namingStatus.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: lambdaeventsourcemapping.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: LambdaEventSourceMapping
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Target function (required) — local LambdaFunction CR name
+      functionRef: string | default=""
+
+      # Event source (required) — SQS queue, Kinesis stream, or DynamoDB stream ARN
+      eventSourceArn: string | default=""
+
+      # Batching
+      batchSize: integer | default=0
+      maximumBatchingWindowInSeconds: integer | default=0
+
+      # Error handling (Kinesis/DynamoDB Streams only)
+      bisectBatchOnFunctionError: boolean | default=false
+      maximumRetryAttempts: integer | default=-1
+      maximumRecordAgeInSeconds: integer | default=-1
+      destinationConfig:
+        onFailure:
+          destination: string | default=""
+
+      # Filtering
+      filterCriteria:
+        filters: "[]Filter | default=[]"
+
+      # Control
+      enabled: boolean | default=true
+
+      # Stream-specific (Kinesis/DynamoDB Streams only)
+      startingPosition: string | default=""
+      # startingPositionTimestamp omitted — ACK expects google.protobuf.Timestamp, not string; kro has no Timestamp type
+
+      # Concurrency
+      parallelizationFactor: integer | default=1
+      scalingConfig:
+        maximumConcurrency: integer | default=0
+
+      # Reporting
+      functionResponseTypes: "[]string | default=[]"
+      tumblingWindowInSeconds: integer | default=0
+
+    types:
+      Filter:
+        pattern: string | required=true
+
+    status:
+      uuid: >-
+        ${esm.?status.?uuid.orValue("")}
+      state: >-
+        ${esm.?status.?state.orValue("")}
+      conditions: >-
+        ${esm.?status.?conditions.orValue([])}
+
+  resources:
+    # ── governance config lookup ──────────────────────────────────────────────
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: LambdaConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── target function reference ─────────────────────────────────────────────
+    - id: fnCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: LambdaFunction
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.functionRef != "" ? schema.spec.functionRef : "kro-empty-fallback-sentinel"}'
+
+    # ── ACK EventSourceMapping ─────────────────────────────────────────────────
+    - id: esm
+      template:
+        apiVersion: lambda.services.k8s.aws/v1alpha1
+        kind: EventSourceMapping
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro",
+               "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels))
+                     ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels))
+                     ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations))
+                     ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations))
+                     ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaEventSourceMapping
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Function resolution — fnCr[0].status.resourceName is the cloud function name
+          functionName: >-
+            ${fnCr.size() > 0 && has(fnCr[0].status.resourceName) ? fnCr[0].status.resourceName : ""}
+          eventSourceARN: ${schema.spec.eventSourceArn}
+          batchSize: ${schema.spec.batchSize}
+          maximumBatchingWindowInSeconds: ${schema.spec.maximumBatchingWindowInSeconds}
+          bisectBatchOnFunctionError: ${schema.spec.bisectBatchOnFunctionError}
+          # -1 = infinite; ACK accepts -1 for both fields as "no limit"
+          maximumRetryAttempts: ${schema.spec.maximumRetryAttempts}
+          maximumRecordAgeInSeconds: ${schema.spec.maximumRecordAgeInSeconds}
+          destinationConfig:
+            onFailure:
+              destination: ${schema.spec.destinationConfig.onFailure.destination}
+          filterCriteria:
+            filters: ${schema.spec.filterCriteria.filters}
+          enabled: ${schema.spec.enabled}
+          startingPosition: ${schema.spec.startingPosition}
+          parallelizationFactor: ${schema.spec.parallelizationFactor}
+          scalingConfig:
+            maximumConcurrency: ${schema.spec.scalingConfig.maximumConcurrency}
+          functionResponseTypes: ${schema.spec.functionResponseTypes}
+          tumblingWindowInSeconds: ${schema.spec.tumblingWindowInSeconds}
+          # allCloudMetadata: defaults → spec → mandatory (last-writer wins per .merge())
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations))
+               ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels))
+                     ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags))
+                     ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations))
+                     ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels))
+                     ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags))
+                     ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})}

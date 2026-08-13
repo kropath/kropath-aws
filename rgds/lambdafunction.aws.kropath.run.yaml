@@ -1,0 +1,362 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: lambdafunction.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: LambdaFunction
+    scope: Namespaced
+    spec:
+      # Standard governance fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Governance-overridable Lambda fields (zero-value = not set, defer to cascade)
+      runtime: string | default=""
+      handler: string | default=""
+      description: string | default=""
+      memorySize: integer | default=0
+      timeout: integer | default=0
+      tracingMode: string | default=""
+      kmsKeyArn: string | default=""
+      # Execution role — provide either a direct ARN or a CR reference
+      role: string | default=""
+      roleRef: string | default=""
+      # Deployment package
+      packageType: string | default=""
+      code:
+        s3Bucket: string | default=""
+        s3Key: string | default=""
+        s3ObjectVersion: string | default=""
+        imageUri: string | default=""
+      # Container image configuration (only used when packageType: Image)
+      imageConfig:
+        command: "[]string | default=[]"
+        entryPoint: "[]string | default=[]"
+        workingDirectory: string | default=""
+      # VPC networking
+      vpcConfig:
+        subnetIds: "[]string | default=[]"
+        securityGroupIds: "[]string | default=[]"
+      # Async invocation
+      deadLetterTargetArn: string | default=""
+      functionEventInvokeConfig:
+        maximumRetryAttempts: integer | default=-1
+        maximumEventAgeInSeconds: integer | default=0
+        destinationConfig:
+          onFailure:
+            destination: string | default=""
+      # SnapStart
+      snapStartApplyOn: string | default=""
+      # Concurrency — -1 = not configured (unlimited)
+      reservedConcurrentExecutions: integer | default=-1
+      # Ephemeral storage (MB) — 0 = not set (Lambda default: 512)
+      ephemeralStorageSize: integer | default=0
+      # Structured logging
+      loggingConfig:
+        logFormat: string | default=""
+        applicationLogLevel: string | default=""
+        systemLogLevel: string | default=""
+        logGroup: string | default=""
+      # Lambda layers (ARNs)
+      layers: "[]string | default=[]"
+      # EFS mounts
+      fileSystemConfigs: "[]FileSystemConfig | default=[]"
+      # Code signing — provide either a direct ARN or a CR reference
+      codeSigningConfigArn: string | default=""
+      codeSigningConfigRef: string | default=""
+      # KMS via CR reference (resolved to ARN)
+      kmsKeyRef: string | default=""
+    types:
+      FileSystemConfig:
+        arn: string | required=true
+        localMountPath: string | required=true
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && has(rsrcCfg[0].status.effectiveConfig.aws.accountId) && naming.data.effectiveName != "" && !naming.data.effectiveName.contains("{")
+          ? "arn:aws:lambda:" + rsrcCfg[0].status.effectiveConfig.aws.region + ":" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":function:" + naming.data.effectiveName
+          : ""}
+      functionArn: >-
+        ${fn.?status.?ackResourceMetadata.?arn.orValue("")}
+      conditions: >-
+        ${fn.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: FunctionArn
+        type: string
+        jsonPath: .status.functionArn
+  resources:
+    # Config lookup — single externalRef for the merged governance config (ADR-010 D-4)
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: LambdaConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # IAM role CR reference (sentinel selector → always bound as [])
+    - id: iamRoleCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMRole
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.roleRef != "" ? schema.spec.roleRef : "kro-empty-fallback-sentinel"}'
+
+    # KMS key CR reference (sentinel selector → always bound as [])
+    - id: kmsKeyCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KMSKey
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.kmsKeyRef != "" ? schema.spec.kmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # Code-signing config CR reference (sentinel selector → always bound as [])
+    - id: cscCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: LambdaCodeSigningConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.codeSigningConfigRef != "" ? schema.spec.codeSigningConfigRef : "kro-empty-fallback-sentinel"}'
+
+    # Naming ConfigMap — materialises effectiveName with full {tag.X} dynamic token support.
+    # Cascade order: defaults → instance spec → mandatory (mandatory wins on conflict).
+    # Any {tag.X} token whose key is absent from merged tags is kept verbatim so
+    # namingStatus reports "invalid-unresolved-tokens" and the name is clearly invalid.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+                ? schema.spec.nameOverride
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                    : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                        : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{kind}", "lambdafunction"))}
+
+    # ACK Function child resource
+    - id: fn
+      template:
+        apiVersion: lambda.services.k8s.aws/v1alpha1
+        kind: Function
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          description: "${schema.spec.description}"
+          # Runtime — mandatory wins (override), then instance, then defaults
+          runtime: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?runtime.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.runtime
+              : (schema.spec.runtime != ""
+                  ? schema.spec.runtime
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?runtime.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.runtime
+                      : ""))}
+          handler: ${schema.spec.handler}
+          packageType: '${schema.spec.packageType != "" ? schema.spec.packageType : "Zip"}'
+          # Memory — mandatory is a hard ceiling; instance wins over defaults when below ceiling
+          memorySize: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?memorySize.orValue(0) > 0 && schema.spec.memorySize > rsrcCfg[0].status.effectiveConfig.mandatory.memorySize
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.memorySize
+              : (schema.spec.memorySize > 0
+                  ? schema.spec.memorySize
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?memorySize.orValue(0) > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.memorySize
+                      : 128))}
+          # Timeout — mandatory is a hard ceiling; instance wins over defaults when below ceiling
+          timeout: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?timeout.orValue(0) > 0 && schema.spec.timeout > rsrcCfg[0].status.effectiveConfig.mandatory.timeout
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.timeout
+              : (schema.spec.timeout > 0
+                  ? schema.spec.timeout
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?timeout.orValue(0) > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.timeout
+                      : 3))}
+          tracingConfig:
+            # Tracing — mandatory wins (override), then instance, then defaults
+            mode: >-
+              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?tracingMode.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.tracingMode
+                : (schema.spec.tracingMode != ""
+                    ? schema.spec.tracingMode
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?tracingMode.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.tracingMode
+                        : "PassThrough"))}
+          # KMS — mandatory wins, then direct ARN, then kmsKeyRef CR, then defaults
+          kmsKeyARN: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsKeyArn
+              : (schema.spec.kmsKeyArn != ""
+                  ? schema.spec.kmsKeyArn
+                  : (kmsKeyCr.size() > 0 && schema.spec.kmsKeyRef != ""
+                      ? kmsKeyCr[0].status.predictedArn
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("") != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.kmsKeyArn
+                          : "")))}
+          # Execution role — direct ARN takes precedence, then roleRef CR
+          role: >-
+            ${schema.spec.role != ""
+              ? schema.spec.role
+              : (iamRoleCr.size() > 0 && schema.spec.roleRef != ""
+                  ? iamRoleCr[0].status.predictedArn
+                  : "")}
+          # Deployment code
+          code:
+            s3Bucket: ${schema.spec.code.s3Bucket}
+            s3Key: ${schema.spec.code.s3Key}
+            s3ObjectVersion: ${schema.spec.code.s3ObjectVersion}
+            imageURI: ${schema.spec.code.imageUri}
+          imageConfig:
+            command: ${schema.spec.imageConfig.command}
+            entryPoint: ${schema.spec.imageConfig.entryPoint}
+            workingDirectory: ${schema.spec.imageConfig.workingDirectory}
+          # VPC networking
+          vpcConfig:
+            subnetIDs: ${schema.spec.vpcConfig.subnetIds}
+            securityGroupIDs: ${schema.spec.vpcConfig.securityGroupIds}
+          # Async invocation
+          deadLetterConfig:
+            targetARN: ${schema.spec.deadLetterTargetArn}
+          functionEventInvokeConfig:
+            maximumRetryAttempts: ${schema.spec.functionEventInvokeConfig.maximumRetryAttempts}
+            maximumEventAgeInSeconds: ${schema.spec.functionEventInvokeConfig.maximumEventAgeInSeconds}
+            destinationConfig:
+              onFailure:
+                destination: ${schema.spec.functionEventInvokeConfig.destinationConfig.onFailure.destination}
+          # SnapStart
+          snapStart:
+            applyOn: ${schema.spec.snapStartApplyOn}
+          reservedConcurrentExecutions: ${schema.spec.reservedConcurrentExecutions}
+          # Ephemeral storage (0 = not set)
+          ephemeralStorage:
+            size: '${schema.spec.ephemeralStorageSize > 0 ? schema.spec.ephemeralStorageSize : 512}'
+          # Structured logging
+          loggingConfig:
+            logFormat: ${schema.spec.loggingConfig.logFormat}
+            applicationLogLevel: ${schema.spec.loggingConfig.applicationLogLevel}
+            systemLogLevel: ${schema.spec.loggingConfig.systemLogLevel}
+            logGroup: ${schema.spec.loggingConfig.logGroup}
+          # Lambda layers (ARNs passed through verbatim)
+          layers: ${schema.spec.layers}
+          # EFS mounts
+          fileSystemConfigs: ${schema.spec.fileSystemConfigs}
+          # Code signing — direct ARN takes precedence, then codeSigningConfigRef CR
+          codeSigningConfigARN: >-
+            ${schema.spec.codeSigningConfigArn != ""
+              ? schema.spec.codeSigningConfigArn
+              : (cscCr.size() > 0 && schema.spec.codeSigningConfigRef != ""
+                  ? cscCr[0].status.codeSigningConfigArn
+                  : "")}
+          # Cloud tags — allCloudMetadata: defaults → instance → mandatory (mandatory wins on key conflict)
+          # ADR-015 §6.1: syncedLabels appear in both K8s metadata labels and cloud tags
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)) ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})}

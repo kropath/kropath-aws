@@ -1,0 +1,735 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-lambda-04: LambdaAlias Chainsaw tests — 13 ACs
+# Pattern: unique resource name per step, skipDelete: true, no inter-step ACK deletes.
+# Mock LambdaFunction CRs use fn-general LambdaConfig (defaults.namingTemplate="{namespace}-{name}")
+# so fn-acN in namespace lambdaalias naturally gets status.resourceName = "lambdaalias-fn-acN".
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: lambdaalias
+spec:
+  namespace: lambdaalias
+  skipDelete: true
+  steps:
+    # ── purge stale leftovers from prior failed runs ──────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              kubectl delete lambdaalias --all -n lambdaalias --ignore-not-found=true
+              kubectl delete aliases.lambda.services.k8s.aws --all -n lambdaalias --ignore-not-found=true
+              kubectl delete lambdafunction --all -n lambdaalias --ignore-not-found=true
+              kubectl delete lambdaconfig --all -n lambdaalias --ignore-not-found=true
+              kubectl delete configmap --selector=app.kubernetes.io/managed-by=kro -n lambdaalias --ignore-not-found=true
+
+    # ── setup: shared function governance config ──────────────────────────────
+    # fn-general produces status.resourceName = "{namespace}-{name}" for all mock functions.
+    - name: fn-setup
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: fn-general
+                labels:
+                  aws.kropath.run/resource-name: fn-general
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig fn-general -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","runtime":"","memorySize":0,"timeout":0,"tracingMode":"","kmsKeyArn":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","runtime":"python3.12","memorySize":128,"timeout":30,"tracingMode":"PassThrough","kmsKeyArn":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ── AC-1 + AC-12: basic alias creation + standard metadata ───────────────
+    - name: ac1-ac12-alias-basic-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac1
+                labels:
+                  aws.kropath.run/resource-name: fn-ac1
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac1
+              status:
+                resourceName: lambdaalias-fn-ac1
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac1-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac1-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac1
+              spec:
+                configRef: ac1-cfg
+                functionRef: fn-ac1
+                functionVersion: "1"
+                description: "Production alias"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac1
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: alias-ac1
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - kind: LambdaAlias
+                    name: alias-ac1
+                    controller: true
+                    blockOwnerDeletion: true
+              spec:
+                functionName: lambdaalias-fn-ac1
+                functionVersion: "1"
+                description: Production alias
+
+    # ── AC-2: weighted routing (canary) ──────────────────────────────────────
+    - name: ac2-alias-weighted-routing
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac2
+                labels:
+                  aws.kropath.run/resource-name: fn-ac2
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac2
+              status:
+                resourceName: lambdaalias-fn-ac2
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac2-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac2-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac2
+              spec:
+                configRef: ac2-cfg
+                functionRef: fn-ac2
+                functionVersion: "1"
+                routingConfig:
+                  additionalVersionWeights:
+                    "2": 0.1
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac2
+                namespace: lambdaalias
+        - script:
+            content: |
+              kubectl get aliases.lambda.services.k8s.aws alias-ac2 -n lambdaalias -o json | python3 -c "
+              import json, sys
+              a = json.load(sys.stdin)
+              w = a['spec']['routingConfig']['additionalVersionWeights']
+              assert '2' in w, f'Missing version 2 in additionalVersionWeights, got: {w}'
+              print('OK: routingConfig.additionalVersionWeights contains version 2')
+              "
+
+    # ── AC-3: provisioned concurrency ─────────────────────────────────────────
+    - name: ac3-alias-provisioned-concurrency
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac3
+                labels:
+                  aws.kropath.run/resource-name: fn-ac3
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac3
+              status:
+                resourceName: lambdaalias-fn-ac3
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac3-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac3-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac3
+              spec:
+                configRef: ac3-cfg
+                functionRef: fn-ac3
+                functionVersion: "2"
+                provisionedConcurrentExecutions: 50
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac3
+              spec:
+                functionVersion: "2"
+                provisionedConcurrencyConfig:
+                  provisionedConcurrentExecutions: 50
+
+    # ── AC-4: async invoke config ─────────────────────────────────────────────
+    - name: ac4-alias-async-invoke-config
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac4
+                labels:
+                  aws.kropath.run/resource-name: fn-ac4
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac4
+              status:
+                resourceName: lambdaalias-fn-ac4
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac4-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac4-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac4
+              spec:
+                configRef: ac4-cfg
+                functionRef: fn-ac4
+                functionVersion: "1"
+                functionEventInvokeConfig:
+                  maximumRetryAttempts: 0
+                  maximumEventAgeInSeconds: 3600
+                  destinationConfig:
+                    onFailure:
+                      destination: "arn:aws:sqs:ap-southeast-2:123456789012:alias-dlq"
+                    onSuccess:
+                      destination: "arn:aws:sns:ap-southeast-2:123456789012:alias-success"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac4
+              spec:
+                functionEventInvokeConfig:
+                  maximumRetryAttempts: 0
+                  maximumEventAgeInSeconds: 3600
+                  destinationConfig:
+                    onFailure:
+                      destination: arn:aws:sqs:ap-southeast-2:123456789012:alias-dlq
+                    onSuccess:
+                      destination: arn:aws:sns:ap-southeast-2:123456789012:alias-success
+
+    # ── AC-5: permissions (resource-based policy grants) ─────────────────────
+    - name: ac5-alias-permission-grant
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac5
+                labels:
+                  aws.kropath.run/resource-name: fn-ac5
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac5
+              status:
+                resourceName: lambdaalias-fn-ac5
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac5-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac5-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac5
+              spec:
+                configRef: ac5-cfg
+                functionRef: fn-ac5
+                functionVersion: "1"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac5
+              spec:
+                functionVersion: "1"
+
+    # ── AC-6: tags merged to K8s labels only (no cloud tags on ACK Alias) ────
+    - name: ac6-alias-tags-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac6
+                labels:
+                  aws.kropath.run/resource-name: fn-ac6
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac6
+              status:
+                resourceName: lambdaalias-fn-ac6
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac6-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac6-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"service":"lambda"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac6
+              spec:
+                configRef: ac6-cfg
+                functionRef: fn-ac6
+                functionVersion: "1"
+                tags:
+                  app: orders
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac6
+                labels:
+                  aws.kropath.run/service: lambda
+                  aws.kropath.run/app: orders
+        - script:
+            content: |
+              kubectl get aliases.lambda.services.k8s.aws alias-ac6 -n lambdaalias -o json | python3 -c "
+              import json, sys
+              a = json.load(sys.stdin)
+              assert 'tags' not in a.get('spec', {}), \
+                f'spec.tags must be absent on ACK Alias (no cloud tags), found: {a[\"spec\"]}'
+              print('OK: ACK Alias has no spec.tags — tags forwarded to K8s labels only')
+              "
+
+    # ── AC-7: synced labels forwarded to K8s metadata labels ─────────────────
+    - name: ac7-alias-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac7
+                labels:
+                  aws.kropath.run/resource-name: fn-ac7
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac7
+              status:
+                resourceName: lambdaalias-fn-ac7
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac7-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac7-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac7
+              spec:
+                configRef: ac7-cfg
+                functionRef: fn-ac7
+                functionVersion: "1"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac7
+                labels:
+                  aws.kropath.run/environment: production
+
+    # ── AC-8 + AC-11: naming standard template + predictedArn ────────────────
+    # Namespace=lambdaalias, fn=fn-ac8 → fnResourceName="lambdaalias-fn-ac8"
+    # Alias=alias-ac8, template={namespace}-{name} → effectiveName="lambdaalias-alias-ac8"
+    # predictedArn = arn:aws:lambda:ap-southeast-2:123456789012:function:lambdaalias-fn-ac8:lambdaalias-alias-ac8
+    - name: ac8-ac11-alias-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac8
+                labels:
+                  aws.kropath.run/resource-name: fn-ac8
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac8
+              status:
+                resourceName: lambdaalias-fn-ac8
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac8-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac8-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac8
+              spec:
+                configRef: ac8-cfg
+                functionRef: fn-ac8
+                functionVersion: "1"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac8
+              status:
+                resourceName: lambdaalias-alias-ac8
+                namingStatus: valid
+                predictedArn: "arn:aws:lambda:ap-southeast-2:123456789012:function:lambdaalias-fn-ac8:lambdaalias-alias-ac8"
+
+    # ── AC-9: naming override bypasses template ───────────────────────────────
+    - name: ac9-alias-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac9
+                labels:
+                  aws.kropath.run/resource-name: fn-ac9
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac9
+              status:
+                resourceName: lambdaalias-fn-ac9
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac9-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac9-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac9
+              spec:
+                configRef: ac9-cfg
+                functionRef: fn-ac9
+                functionVersion: "1"
+                nameOverride: production
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac9
+              status:
+                resourceName: production
+                namingStatus: valid
+
+    # ── AC-10: naming unresolved token → invalid-unresolved-tokens ───────────
+    - name: ac10-alias-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac10
+                labels:
+                  aws.kropath.run/resource-name: fn-ac10
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac10
+              status:
+                resourceName: lambdaalias-fn-ac10
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac10-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac10-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac10
+              spec:
+                configRef: ac10-cfg
+                functionRef: fn-ac10
+                functionVersion: "1"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac10
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ── AC-13: deletion policy delete ─────────────────────────────────────────
+    - name: ac13-alias-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac13
+                labels:
+                  aws.kropath.run/resource-name: fn-ac13
+              spec:
+                configRef: fn-general
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: fn-ac13
+              status:
+                resourceName: lambdaalias-fn-ac13
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac13-cfg
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac13-cfg -n lambdaalias --subresource=status --type=merge -p \
+                '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaAlias
+              metadata:
+                name: alias-ac13
+              spec:
+                configRef: ac13-cfg
+                functionRef: fn-ac13
+                functionVersion: "1"
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Alias
+              metadata:
+                name: alias-ac13
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+

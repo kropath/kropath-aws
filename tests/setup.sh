@@ -62,14 +62,70 @@ kubectl set env deployment/kro -n kro-system \
 kubectl rollout status deployment/kro -n kro-system --timeout=120s
 
 echo "==> Installing ACK CRD definitions..."
+# hack/install-provider-crds.sh installs ACK CRDs for all services referenced by
+# kropath-aws RGDs. When adding a new provider service family, add its service
+# name to ACK_SERVICES in that script so kro can compile the RGDs.
+# Installed services: s3 iam kms ec2 dynamodb rds sns sqs secretsmanager
+#                     eks ecr cloudwatch elbv2 eventbridge autoscaling lambda
 source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 
 echo "==> Installing kropath CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
 kubectl apply -f "${SCRIPT_DIR}/../crds/policy/policydocument.yaml"
+# kro validates externalRef GVKs at compile time against the live API server.
+# Newly-created CRDs are not immediately queryable — the API server must complete
+# registration (Established condition) before kro can find the schema.
+# Without this wait, RGDs applied within ~1s of a new CRD creation stay permanently
+# Inactive because kro's initial compilation fails and it does not retry.
+kubectl wait crd --all --for=condition=Established --timeout=60s
 
-echo "==> Installing kropath.run RGDS definitions..."
-kubectl apply -f "${SCRIPT_DIR}/../rgds/*.yaml"
+echo "==> Installing kropath.run RGD definitions (non-lambda)..."
+# Build arg list excluding lambda RGDs, which must be applied in dependency-ordered waves below.
+non_lambda_args=()
+for rgd in "${SCRIPT_DIR}/../rgds/"*.yaml; do
+  case "$(basename "$rgd")" in
+    lambda*.yaml) ;; # applied below in waves
+    *) non_lambda_args+=("-f" "$rgd") ;;
+  esac
+done
+kubectl apply "${non_lambda_args[@]}"
+
+# Lambda RGDs reference each other's kro-generated kinds via externalRef.
+# kro validates every referenced GVK against the live API server at compile time.
+# Applying all 7 simultaneously causes permanent Inactive state for those that
+# reference a kind whose generator RGD has not yet become Active (CRD not yet created).
+# Fix: apply in three waves, waiting for each wave to become Active so the generated
+# CRDs are registered before the next wave's RGDs are compiled.
+# See: docs/troubleshooting-logs/2026-08-11-lambda-rgd-yaml-selector-ci-failures.md
+echo "==> Lambda RGD wave 1 (no cross-lambda deps: LambdaCodeSigningConfig, LambdaLayerVersion)..."
+kubectl apply \
+  -f "${SCRIPT_DIR}/../rgds/lambdacodesigningconfig.aws.kropath.run.yaml" \
+  -f "${SCRIPT_DIR}/../rgds/lambdalayerversion.aws.kropath.run.yaml"
+if ! kubectl wait rgd \
+  lambdacodesigningconfig.aws.kropath.run \
+  lambdalayerversion.aws.kropath.run \
+  --for=condition=Ready --timeout=120s; then
+  echo "==> RGD condition dump (for diagnosis):"
+  kubectl get rgd lambdacodesigningconfig.aws.kropath.run lambdalayerversion.aws.kropath.run \
+    -o jsonpath='{range .items[*]}{"--- "}{.metadata.name}{"\n"}{.status.conditions}{"\n"}{end}' || true
+  exit 1
+fi
+
+echo "==> Lambda RGD wave 2 (LambdaFunction, needs LambdaCodeSigningConfig CRD from wave 1)..."
+kubectl apply -f "${SCRIPT_DIR}/../rgds/lambdafunction.aws.kropath.run.yaml"
+if ! kubectl wait rgd lambdafunction.aws.kropath.run --for=condition=Ready --timeout=120s; then
+  echo "==> RGD condition dump (for diagnosis):"
+  kubectl get rgd lambdafunction.aws.kropath.run \
+    -o jsonpath='{"--- "}{.metadata.name}{"\n"}{.status.conditions}{"\n"}' || true
+  exit 1
+fi
+
+echo "==> Lambda RGD wave 3 (need LambdaFunction CRD from wave 2)..."
+kubectl apply \
+  -f "${SCRIPT_DIR}/../rgds/lambdaalias.aws.kropath.run.yaml" \
+  -f "${SCRIPT_DIR}/../rgds/lambdaeventsourcemapping.aws.kropath.run.yaml" \
+  -f "${SCRIPT_DIR}/../rgds/lambdafunctionurlconfig.aws.kropath.run.yaml" \
+  -f "${SCRIPT_DIR}/../rgds/lambdaversion.aws.kropath.run.yaml"
 
 echo "==> Waiting for all RGDs to become Ready (kro must generate CRDs before tests run)..."
 # NOTE: `kubectl wait --all` walks resources in NAME ORDER against ONE shared deadline, so the

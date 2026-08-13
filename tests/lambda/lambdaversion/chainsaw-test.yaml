@@ -1,0 +1,742 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-lambda-08: LambdaVersion Chainsaw tests — 14 ACs (10 + 2 a-variants + 2 negative/info)
+#
+# Key constraints (from spec + RGD):
+#   - Naming EXEMPT (KRO-236): no effectiveName, nameOverride, resourceName, predictedArn
+#   - No cloud tags: ACK Version has no spec.tags — K8s metadata labels only
+#   - functionRef resolves parent LambdaFunction status.resourceName via externalRef
+#   - provisionedConcurrentExecutions=0 → not set (no provisioning)
+#   - functionEventInvokeConfig default -1 → AWS default applies
+#   - Canonical pattern: unique resource name per step, skipDelete: true
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: lambdaversion
+spec:
+  namespace: lambdaversion
+  skipDelete: true
+  steps:
+
+    # ── purge stale leftovers from previous runs ──────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              NS=lambdaversion
+              kubectl delete lambdaversion --all -n $NS --ignore-not-found --wait=false
+              kubectl delete versions.lambda.services.k8s.aws --all -n $NS --ignore-not-found --wait=false
+              kubectl delete lambdafunction --all -n $NS --ignore-not-found --wait=false
+              kubectl delete lambdaconfig --all -n $NS --ignore-not-found --wait=false
+              sleep 2
+            timeout: 30s
+
+    # ── shared governance config: general-policy ─────────────────────────────
+    # Provides tags/syncedLabels governance; LambdaVersion has no additional cascades.
+    - name: setup-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: general-policy
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig general-policy -n lambdaversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+
+    # ── shared function setup: my-function ────────────────────────────────────
+    # LambdaVersion needs a parent LambdaFunction with status.resourceName set.
+    - name: setup-shared-function
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: fn-general
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/resource-name: fn-general
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig fn-general -n lambdaversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "namingTemplate": "",
+                        "runtime": "",
+                        "memorySize": 0,
+                        "timeout": 0,
+                        "tracingMode": "",
+                        "kmsKeyArn": "",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "namingTemplate": "{namespace}-{name}",
+                        "runtime": "python3.12",
+                        "memorySize": 128,
+                        "timeout": 30,
+                        "tracingMode": "PassThrough",
+                        "kmsKeyArn": "",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: my-function
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/resource-name: my-function
+              spec:
+                configRef: fn-general
+                code:
+                  s3Bucket: test-bucket
+                  s3Key: function.zip
+                runtime: python3.12
+                handler: index.handler
+                role: "arn:aws:iam::123456789012:role/test-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: my-function
+              status:
+                resourceName: lambdaversion-my-function
+
+    # ── AC-1: basic version publish ───────────────────────────────────────────
+    # functionRef=my-function → resolves status.resourceName "lambdaversion-my-function"
+    - name: ac1-version-basic-publish
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac1
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+                description: "Release v1.0"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac1
+                namespace: lambdaversion
+              spec:
+                functionName: lambdaversion-my-function
+                description: "Release v1.0"
+
+    # ── AC-2: codeSHA256 check ────────────────────────────────────────────────
+    - name: ac2-version-code-sha256
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac2
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+                codeSHA256: "abc123def456789abcdef0123456789abcdef0123456789abcdef012345678"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac2
+                namespace: lambdaversion
+              spec:
+                codeSHA256: "abc123def456789abcdef0123456789abcdef0123456789abcdef012345678"
+
+    # ── AC-3: provisioned concurrency ─────────────────────────────────────────
+    - name: ac3-version-provisioned-concurrency
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac3
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+                provisionedConcurrentExecutions: 50
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac3
+                namespace: lambdaversion
+              spec:
+                provisionedConcurrencyConfig:
+                  provisionedConcurrentExecutions: 50
+
+    # ── AC-3a: no provisioned concurrency (default 0 = not set) ──────────────
+    - name: ac3a-version-no-provisioned-concurrency
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac3a
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac3a
+                namespace: lambdaversion
+        - script:
+            content: |
+              # When provisionedConcurrentExecutions=0 (default), the field is 0 or omitted
+              PROVISIONED=$(kubectl get version ver-ac3a -n lambdaversion \
+                -o jsonpath='{.spec.provisionedConcurrencyConfig.provisionedConcurrentExecutions}')
+              echo "provisionedConcurrentExecutions: '$PROVISIONED'"
+              # Accept either 0 or empty (not set) — both mean no provisioned concurrency
+              if [ -n "$PROVISIONED" ] && [ "$PROVISIONED" != "0" ]; then
+                echo "FAIL: expected 0 or empty for no provisioned concurrency, got $PROVISIONED"
+                exit 1
+              fi
+              echo "PASS: no provisioned concurrency configured"
+
+    # ── AC-4: async invoke config ─────────────────────────────────────────────
+    - name: ac4-version-async-invoke-config
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac4
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+                functionEventInvokeConfig:
+                  maximumRetryAttempts: 0
+                  maximumEventAgeInSeconds: 3600
+                  destinationConfig:
+                    onFailure:
+                      destination: "arn:aws:sns:ap-southeast-2:123456789012:fail-topic"
+                    onSuccess:
+                      destination: "arn:aws:sqs:ap-southeast-2:123456789012:success-queue"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac4
+                namespace: lambdaversion
+              spec:
+                functionEventInvokeConfig:
+                  maximumRetryAttempts: 0
+                  maximumEventAgeInSeconds: 3600
+                  destinationConfig:
+                    onFailure:
+                      destination: "arn:aws:sns:ap-southeast-2:123456789012:fail-topic"
+                    onSuccess:
+                      destination: "arn:aws:sqs:ap-southeast-2:123456789012:success-queue"
+
+    # ── AC-4a: no async invoke config (all defaults) ──────────────────────────
+    - name: ac4a-version-no-async-config
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac4a
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac4a
+                namespace: lambdaversion
+        - script:
+            content: |
+              RETRIES=$(kubectl get version ver-ac4a -n lambdaversion \
+                -o jsonpath='{.spec.functionEventInvokeConfig.maximumRetryAttempts}')
+              echo "maximumRetryAttempts: '$RETRIES'"
+              # Accept -1 (sentinel for not set) or empty
+              if [ -n "$RETRIES" ] && [ "$RETRIES" != "-1" ]; then
+                echo "FAIL: expected -1 or empty for no async config, got $RETRIES"
+                exit 1
+              fi
+              echo "PASS: no async invoke config (defaults)"
+
+    # ── AC-5: tags — K8s metadata only (no cloud spec.tags) ──────────────────
+    - name: ac5-version-tags-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac5-cfg
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac5-cfg -n lambdaversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {"service": "lambda"},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac5
+                namespace: lambdaversion
+              spec:
+                configRef: ac5-cfg
+                functionRef: my-function
+                tags:
+                  app: orders
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac5
+                namespace: lambdaversion
+        - script:
+            content: |
+              LABELS=$(kubectl get version ver-ac5 -n lambdaversion -o json | jq -r '.metadata.labels')
+              echo "labels: $LABELS"
+              # mandatory tag → aws.kropath.run/service: lambda
+              echo "$LABELS" | jq -e '."aws.kropath.run/service" == "lambda"' \
+                || { echo "FAIL: mandatory service tag not in K8s labels"; exit 1; }
+              # instance tag → aws.kropath.run/app: orders
+              echo "$LABELS" | jq -e '."aws.kropath.run/app" == "orders"' \
+                || { echo "FAIL: instance app tag not in K8s labels"; exit 1; }
+              # Verify no spec.tags on ACK Version
+              HAS_SPEC_TAGS=$(kubectl get version ver-ac5 -n lambdaversion \
+                -o json | jq 'has("spec") and (.spec | has("tags"))')
+              [ "$HAS_SPEC_TAGS" = "false" ] \
+                || { echo "FAIL: ACK Version should have no spec.tags"; exit 1; }
+              echo "PASS: tags in K8s labels only, no spec.tags"
+
+    # ── AC-6: synced labels — K8s labels only ────────────────────────────────
+    - name: ac6-version-synced-labels-k8s
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: ac6-cfg
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig ac6-cfg -n lambdaversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "tags": {},
+                        "syncedLabels": {"environment": "production"},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac6
+                namespace: lambdaversion
+              spec:
+                configRef: ac6-cfg
+                functionRef: my-function
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac6
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            content: |
+              HAS_SPEC_TAGS=$(kubectl get version ver-ac6 -n lambdaversion \
+                -o json | jq 'has("spec") and (.spec | has("tags"))')
+              [ "$HAS_SPEC_TAGS" = "false" ] \
+                || { echo "FAIL: ACK Version should have no spec.tags"; exit 1; }
+              echo "PASS: syncedLabels in K8s labels only (no cloud tags)"
+
+    # ── AC-7: standard metadata ───────────────────────────────────────────────
+    - name: ac7-version-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac7
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac7
+                namespace: lambdaversion
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ver-ac7
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              OWNER=$(kubectl get version ver-ac7 -n lambdaversion \
+                -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              [ "$OWNER" = "LambdaVersion" ] \
+                || { echo "FAIL: ownerRef.kind should be LambdaVersion, got $OWNER"; exit 1; }
+              CTRL=$(kubectl get version ver-ac7 -n lambdaversion \
+                -o jsonpath='{.metadata.ownerReferences[0].controller}')
+              [ "$CTRL" = "true" ] || { echo "FAIL: ownerRef.controller should be true"; exit 1; }
+              echo "PASS: standard metadata verified"
+
+    # ── AC-8: deletion policy delete ─────────────────────────────────────────
+    - name: ac8-version-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac8
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac8
+                namespace: lambdaversion
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ── AC-8a: deletion policy retain (default) ───────────────────────────────
+    - name: ac8a-version-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac8a
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac8a
+                namespace: lambdaversion
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ── AC-9: naming exemption — versionNumber and functionArn from ACK status ─
+    - name: ac9-version-naming-exemption-status
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac9
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: my-function
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac9
+                namespace: lambdaversion
+        - script:
+            content: |
+              kubectl patch version ver-ac9 -n lambdaversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "version": "1",
+                    "ackResourceMetadata": {
+                      "arn": "arn:aws:lambda:ap-southeast-2:123456789012:function:lambdaversion-my-function:1",
+                      "ownerAccountID": "123456789012",
+                      "region": "ap-southeast-2"
+                    }
+                  }
+                }'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac9
+              status:
+                versionNumber: "1"
+                functionArn: "arn:aws:lambda:ap-southeast-2:123456789012:function:lambdaversion-my-function:1"
+        - script:
+            content: |
+              STATUS=$(kubectl get lambdaversion ver-ac9 -n lambdaversion -o json | jq '.status')
+              echo "status: $STATUS"
+              echo "$STATUS" | jq -e 'has("resourceName") | not' \
+                || { echo "FAIL: status.resourceName should not exist (naming exempt)"; exit 1; }
+              echo "$STATUS" | jq -e 'has("predictedArn") | not' \
+                || { echo "FAIL: status.predictedArn should not exist (naming exempt)"; exit 1; }
+              echo "$STATUS" | jq -e 'has("namingStatus") | not' \
+                || { echo "FAIL: status.namingStatus should not exist (naming exempt)"; exit 1; }
+              echo "PASS: naming exemption verified"
+
+    # ── AC-9a: no naming fields in RGD schema ─────────────────────────────────
+    # Negative: verify the RGD schema has no spec.nameOverride or effectiveName variables
+    - name: ac9a-version-no-naming-fields
+      try:
+        - script:
+            content: |
+              RGD_YAML=$(kubectl get rgd lambdaversion.aws.kropath.run -o yaml)
+              echo "$RGD_YAML" | grep -v "nameOverride" | wc -l > /dev/null
+              if echo "$RGD_YAML" | grep -q "nameOverride"; then
+                echo "FAIL: RGD schema contains nameOverride (naming should be exempt)"
+                exit 1
+              fi
+              if echo "$RGD_YAML" | grep -q "effectiveName"; then
+                echo "FAIL: RGD contains effectiveName (naming should be exempt)"
+                exit 1
+              fi
+              if echo "$RGD_YAML" | grep -q "_namingTemplate"; then
+                echo "FAIL: RGD contains _namingTemplate (naming should be exempt)"
+                exit 1
+              fi
+              echo "PASS: no naming fields in LambdaVersion RGD schema"
+
+    # ── AC-10: function resolution via externalRef ────────────────────────────
+    # A different LambdaFunction (payment-handler) with a custom effectiveName.
+    - name: ac10-version-function-ref-resolution
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaConfig
+              metadata:
+                name: fn-prod-cfg
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/resource-name: fn-prod-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch lambdaconfig fn-prod-cfg -n lambdaversion \
+                --type=merge --subresource=status \
+                -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "namingTemplate": "",
+                        "runtime": "",
+                        "memorySize": 0,
+                        "timeout": 0,
+                        "tracingMode": "",
+                        "kmsKeyArn": "",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "namingTemplate": "prod-{name}",
+                        "runtime": "python3.12",
+                        "memorySize": 256,
+                        "timeout": 60,
+                        "tracingMode": "Active",
+                        "kmsKeyArn": "",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "ap-southeast-2"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: payment-handler
+                namespace: lambdaversion
+                labels:
+                  aws.kropath.run/resource-name: payment-handler
+              spec:
+                configRef: fn-prod-cfg
+                code:
+                  s3Bucket: prod-bucket
+                  s3Key: payment.zip
+                runtime: python3.12
+                handler: handler.main
+                role: "arn:aws:iam::123456789012:role/prod-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaFunction
+              metadata:
+                name: payment-handler
+              status:
+                resourceName: prod-payment-handler
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: LambdaVersion
+              metadata:
+                name: ver-ac10
+                namespace: lambdaversion
+              spec:
+                configRef: general-policy
+                functionRef: payment-handler
+                description: "Production payment handler v2"
+        - assert:
+            resource:
+              apiVersion: lambda.services.k8s.aws/v1alpha1
+              kind: Version
+              metadata:
+                name: ver-ac10
+                namespace: lambdaversion
+              spec:
+                functionName: prod-payment-handler
+                description: "Production payment handler v2"
