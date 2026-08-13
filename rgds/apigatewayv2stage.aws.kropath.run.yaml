@@ -1,0 +1,189 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: apigatewayv2stage.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ApiGatewayV2Stage
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # apiRef: local CR name of the parent ApiGatewayV2HttpApi or ApiGatewayV2WebSocketApi
+      apiRef: string | required=true
+      # stageName: stage name; "$default" for the default stage; immutable after creation
+      stageName: string | required=true
+      description: string | default=""
+      # autoDeploy: auto-deploy API changes to this stage (HTTP APIs only)
+      autoDeploy: boolean | default=false
+      stageVariables: map[string]string | default={}
+      # accessLogSettings: governed via ApiGatewayV2Config (OD-4)
+      accessLogSettings:
+        destinationArn: string | default=""
+        format: string | default=""
+      # defaultRouteSettings: route-level defaults for the stage
+      defaultRouteSettings:
+        dataTraceEnabled: boolean | default=false
+        detailedMetricsEnabled: boolean | default=false
+        # loggingLevel: OFF | ERROR | INFO (WebSocket only; AWS ignores for HTTP)
+        loggingLevel: string | default=OFF
+        # throttlingBurstLimit/RateLimit governed via ApiGatewayV2Config; 0 = account default
+        throttlingBurstLimit: integer | default=0
+        throttlingRateLimit: float | default=0.0
+      # routeSettings: per-route overrides (route key → settings map)
+      routeSettings: "map[string]PerRouteSettings | default={}"
+    types:
+      PerRouteSettings:
+        dataTraceEnabled: boolean | default=false
+        detailedMetricsEnabled: boolean | default=false
+        loggingLevel: string | default=OFF
+        throttlingBurstLimit: integer | default=0
+        throttlingRateLimit: float | default=0.0
+    status:
+      conditions: >-
+        ${stage.?status.?conditions.orValue([])}
+
+  resources:
+    # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ApiGatewayV2Config
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── Access log governance ConfigMap (OD-4) ───────────────────────────────
+    # Resolves destinationARN and format from mandatory → instance → defaults cascade.
+    # When destination is set but format is empty from all tiers, emits the
+    # AWS-recommended JSON format as fallback.
+    - id: resolvedAccessLog
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-access-log
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2Stage
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          destinationARN: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?accessLogDestinationArn.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.accessLogDestinationArn
+              : (schema.spec.accessLogSettings.destinationArn != ""
+                  ? schema.spec.accessLogSettings.destinationArn
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?accessLogDestinationArn.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.accessLogDestinationArn
+                      : ""))}
+          format: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?accessLogFormat.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.accessLogFormat
+              : (schema.spec.accessLogSettings.format != ""
+                  ? schema.spec.accessLogSettings.format
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?accessLogFormat.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.accessLogFormat
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?accessLogDestinationArn.orValue("") != "")
+                          || schema.spec.accessLogSettings.destinationArn != ""
+                          || (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?accessLogDestinationArn.orValue("") != "")
+                          ? "{\"requestId\":\"$context.requestId\",\"ip\":\"$context.identity.sourceIp\",\"requestTime\":\"$context.requestTime\",\"httpMethod\":\"$context.httpMethod\",\"routeKey\":\"$context.routeKey\",\"status\":\"$context.status\",\"protocol\":\"$context.protocol\",\"responseLength\":\"$context.responseLength\"}"
+                          : "")))}
+
+    # ── ACK Stage CR ─────────────────────────────────────────────────────────
+    - id: stage
+      template:
+        apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+        kind: Stage
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2Stage
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # ACK Stage: stageName (required, immutable)
+          stageName: ${schema.spec.stageName}
+          # ACK Stage: apiRef (ACK cross-resource reference to the parent API CR)
+          apiRef:
+            from:
+              name: ${schema.spec.apiRef}
+          description: ${schema.spec.description}
+          autoDeploy: ${schema.spec.autoDeploy}
+          stageVariables: ${schema.spec.stageVariables}
+          # accessLogSettings.destinationARN (capital ARN — confirmed in crd-cache)
+          accessLogSettings:
+            destinationARN: ${resolvedAccessLog.data.destinationARN}
+            format: ${resolvedAccessLog.data.format}
+          defaultRouteSettings:
+            dataTraceEnabled: ${schema.spec.defaultRouteSettings.dataTraceEnabled}
+            detailedMetricsEnabled: ${schema.spec.defaultRouteSettings.detailedMetricsEnabled}
+            loggingLevel: ${schema.spec.defaultRouteSettings.loggingLevel}
+            # throttlingBurstLimit governance: mandatory (sentinel != 0) → instance → defaults
+            throttlingBurstLimit: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultThrottlingBurstLimit.orValue(0) != 0)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultThrottlingBurstLimit
+                : (schema.spec.defaultRouteSettings.throttlingBurstLimit != 0
+                    ? schema.spec.defaultRouteSettings.throttlingBurstLimit
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?defaultThrottlingBurstLimit.orValue(0) : 0))}
+            # throttlingRateLimit governance: mandatory (sentinel != 0.0) → instance → defaults
+            throttlingRateLimit: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultThrottlingRateLimit.orValue(0.0) != 0.0)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultThrottlingRateLimit
+                : (schema.spec.defaultRouteSettings.throttlingRateLimit != 0.0
+                    ? schema.spec.defaultRouteSettings.throttlingRateLimit
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?defaultThrottlingRateLimit.orValue(0.0) : 0.0))}
+          # routeSettings: per-route overrides; passed through directly as map[string]object
+          routeSettings: ${schema.spec.routeSettings}
+          # ACK Stage tags: map[string]string; cascade: defaults → spec → mandatory (last-writer-wins)
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags) ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})}
