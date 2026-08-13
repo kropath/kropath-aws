@@ -1,0 +1,100 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: apigatewayv2apimapping.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ApiGatewayV2ApiMapping
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # apiRef: name of a local ApiGatewayV2HttpApi or ApiGatewayV2WebSocketApi CR;
+      # the RGD wires the ACK apiRef.from.name to this value.
+      apiRef: string | required=true
+      # domainRef: name of a local ApiGatewayV2DomainName CR;
+      # the RGD wires the ACK domainRef.from.name to this value.
+      domainRef: string | required=true
+      # stage: API stage name to expose at this mapping (e.g. "$default", "prod"); immutable (ACK enforced).
+      stage: string | required=true
+      # apiMappingKey: base path prefix under the domain (e.g. "v1"); empty string = root mapping.
+      apiMappingKey: string | default=""
+    status:
+      conditions: >-
+        ${ackApiMapping.?status.?conditions.orValue([])}
+
+  resources:
+    # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
+    # APIMapping has no governed fields; the externalRef is used for standard
+    # K8s metadata (labels, annotations, deletion policy) only.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ApiGatewayV2Config
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── ACK APIMapping CR ─────────────────────────────────────────────────────
+    # Naming exempt (KRO-236): APIMapping has no spec.name field; it is identified
+    # by domain + apiMappingKey. No effectiveName, nameOverride, predictedArn,
+    # resourceName, or namingStatus.
+    # No cloud tags (G-7): ACK APIMapping does not support spec.tags.
+    - id: ackApiMapping
+      template:
+        apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+        kind: APIMapping
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ApiGatewayV2ApiMapping
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # stage: API stage name to map; immutable (ACK enforced).
+          stage: ${schema.spec.stage}
+          # apiRef: ACK cross-resource reference to the parent API CR by name.
+          apiRef:
+            from:
+              name: ${schema.spec.apiRef}
+          # domainRef: ACK cross-resource reference to the DomainName CR by name.
+          domainRef:
+            from:
+              name: ${schema.spec.domainRef}
+          # apiMappingKey: base path prefix; empty string = root mapping.
+          # Passed through as-is; ACK treats "" as the root and "v1" as /v1/.
+          apiMappingKey: ${schema.spec.apiMappingKey}
