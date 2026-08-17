@@ -1,0 +1,806 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-cloudwatchlogs-02 Chainsaw tests — one scenario per acceptance criterion.
+# Namespace: cloudwatchlogsloggroup (fixed; {namespace}-{name} template expands predictably).
+# accountId: 123456789012 | region: ap-southeast-2
+# effectiveConfig is injected via kubectl patch --subresource=status to simulate
+# kropath-controller (which is not running in the local test cluster).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cloudwatchlogsloggroup
+spec:
+  skipDelete: true
+  namespace: cloudwatchlogsloggroup
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy CloudWatchLogsConfig with effectiveConfig
+    # patched in so the RGD can resolve governance values without a live controller.
+    # Default effectiveConfig: no KMS, 90-day retention, {namespace}-{name} naming.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-cloudwatchlogsloggroup-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: Encryption — no KMS (mandatory.kmsKeyId="" and instance kmsKeyId="" and
+    #        defaults.kmsKeyId="") → ACK LogGroup spec.kmsKeyID is empty.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-encryption-no-kms-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: no-kms-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: no-kms-lg
+              spec:
+                name: cloudwatchlogsloggroup-no-kms-lg
+                kmsKeyID: ""
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: no-kms-lg
+              status:
+                resourceName: cloudwatchlogsloggroup-no-kms-lg
+                namingStatus: valid
+                predictedArn: "arn:aws:logs:ap-southeast-2:123456789012:log-group:cloudwatchlogsloggroup-no-kms-lg"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: Encryption — mandatory KMS override.
+    # mandatory.kmsKeyId set → ACK LogGroup uses mandatory key, ignores instance key.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-encryption-mandatory-kms-override
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"arn:aws:kms:ap-southeast-2:123:key/org-key","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: mandatory-kms-lg
+              spec:
+                kmsKeyId: "arn:aws:kms:ap-southeast-2:123:key/team-key"
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: mandatory-kms-lg
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123:key/org-key"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: Encryption — instance wins over defaults.
+    # mandatory.kmsKeyId="" but defaults.kmsKeyId set → instance wins.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-encryption-instance-override
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"arn:aws:kms:ap-southeast-2:123:key/default-key","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: instance-kms-lg
+              spec:
+                kmsKeyId: "arn:aws:kms:ap-southeast-2:123:key/team-key"
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: instance-kms-lg
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123:key/team-key"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: Encryption — defaults applied when instance empty.
+    # mandatory.kmsKeyId="", instance kmsKeyId="" → defaults.kmsKeyId applied.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-encryption-defaults-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: defaults-kms-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: defaults-kms-lg
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123:key/default-key"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Reset effectiveConfig to baseline (no KMS) for remaining encryption/retention tests.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: reset-to-baseline
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: Retention — mandatory override.
+    # mandatory.retentionDays=365 wins over instance retentionDays=90.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-retention-mandatory-override
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":365,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: mandatory-retention-lg
+              spec:
+                retentionDays: 90
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: mandatory-retention-lg
+              spec:
+                retentionDays: 365
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: Retention — default applied when instance retentionDays=0.
+    # mandatory.retentionDays=0, instance=0 → defaults.retentionDays=90 applied.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-retention-default
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: default-retention-lg
+              spec:
+                retentionDays: 0
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: default-retention-lg
+              spec:
+                retentionDays: 90
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: Retention — instance wins over defaults.
+    # mandatory.retentionDays=0, instance=30, defaults.retentionDays=90 → 30 wins.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-retention-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: instance-retention-lg
+              spec:
+                retentionDays: 30
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: instance-retention-lg
+              spec:
+                retentionDays: 30
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: Retention — indefinite when all zero.
+    # mandatory.retentionDays=0, instance=0, defaults.retentionDays=0 → ACK gets 0
+    # (indefinite; ACK calls DeleteRetentionPolicy).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-retention-indefinite
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: indefinite-retention-lg
+              spec:
+                retentionDays: 0
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: indefinite-retention-lg
+              spec:
+                retentionDays: 0
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Reset effectiveConfig to baseline for subscription filter tests.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: reset-to-baseline-for-filters
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: Subscription filter — Kinesis destination.
+    # destinationArn → destinationARN, roleArn → roleARN mapping verified.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-subscription-filter-kinesis
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: kinesis-filter-lg
+              spec:
+                subscriptionFilters:
+                  - filterName: to-kinesis
+                    filterPattern: ""
+                    destinationArn: "arn:aws:kinesis:ap-southeast-2:123:stream/log-stream"
+                    roleArn: "arn:aws:iam::123:role/cwl-to-kinesis"
+                    distribution: ByLogStream
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: kinesis-filter-lg
+              spec:
+                subscriptionFilters:
+                  - filterName: to-kinesis
+                    filterPattern: ""
+                    destinationARN: "arn:aws:kinesis:ap-southeast-2:123:stream/log-stream"
+                    roleARN: "arn:aws:iam::123:role/cwl-to-kinesis"
+                    distribution: ByLogStream
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: Subscription filter — Lambda destination (empty roleArn is valid).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-subscription-filter-lambda
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: lambda-filter-lg
+              spec:
+                subscriptionFilters:
+                  - filterName: to-lambda
+                    filterPattern: "[timestamp, level=ERROR]"
+                    destinationArn: "arn:aws:lambda:ap-southeast-2:123:function:log-processor"
+                    roleArn: ""
+                    distribution: Random
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: lambda-filter-lg
+              spec:
+                subscriptionFilters:
+                  - filterName: to-lambda
+                    filterPattern: "[timestamp, level=ERROR]"
+                    destinationARN: "arn:aws:lambda:ap-southeast-2:123:function:log-processor"
+                    roleARN: ""
+                    distribution: Random
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: Subscription filter — two filters (Kinesis + Lambda).
+    # AWS allows maximum 2 subscription filters per log group.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-subscription-filter-two-filters
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: two-filter-lg
+              spec:
+                subscriptionFilters:
+                  - filterName: to-kinesis
+                    filterPattern: ""
+                    destinationArn: "arn:aws:kinesis:ap-southeast-2:123:stream/log-stream"
+                    roleArn: "arn:aws:iam::123:role/cwl-to-kinesis"
+                    distribution: ByLogStream
+                  - filterName: to-lambda
+                    filterPattern: "[level=ERROR]"
+                    destinationArn: "arn:aws:lambda:ap-southeast-2:123:function:error-processor"
+                    roleArn: ""
+                    distribution: Random
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: two-filter-lg
+              spec:
+                subscriptionFilters:
+                  - filterName: to-kinesis
+                    filterPattern: ""
+                    destinationARN: "arn:aws:kinesis:ap-southeast-2:123:stream/log-stream"
+                    roleARN: "arn:aws:iam::123:role/cwl-to-kinesis"
+                    distribution: ByLogStream
+                  - filterName: to-lambda
+                    filterPattern: "[level=ERROR]"
+                    destinationARN: "arn:aws:lambda:ap-southeast-2:123:function:error-processor"
+                    roleARN: ""
+                    distribution: Random
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: Subscription filter — none (default empty array).
+    # ACK LogGroup spec.subscriptionFilters should be empty or absent.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-subscription-filter-none
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: no-filter-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: no-filter-lg
+              spec:
+                subscriptionFilters: []
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: Naming — standard {namespace}-{name} template.
+    # Namespace: cloudwatchlogsloggroup, CR: app-logs → "cloudwatchlogsloggroup-app-logs".
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: app-logs
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: app-logs
+              status:
+                resourceName: cloudwatchlogsloggroup-app-logs
+                namingStatus: valid
+                predictedArn: "arn:aws:logs:ap-southeast-2:123456789012:log-group:cloudwatchlogsloggroup-app-logs"
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: app-logs
+              spec:
+                name: cloudwatchlogsloggroup-app-logs
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: Naming — mandatory template override.
+    # mandatory.namingTemplate="corp-{namespace}-{name}" wins.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-naming-mandatory-template
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: corp-logs
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: corp-logs
+              status:
+                resourceName: corp-cloudwatchlogsloggroup-corp-logs
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: Naming — nameOverride with / (hierarchical log group name).
+    # spec.nameOverride bypasses naming template; / is preserved.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-naming-override
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: lambda-override-lg
+              spec:
+                nameOverride: "/aws/lambda/my-function"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: lambda-override-lg
+              status:
+                resourceName: /aws/lambda/my-function
+                namingStatus: valid
+                predictedArn: "arn:aws:logs:ap-southeast-2:123456789012:log-group:/aws/lambda/my-function"
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: lambda-override-lg
+              spec:
+                name: /aws/lambda/my-function
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: Naming — unresolved token.
+    # namingTemplate={tag.env}-{name} but tag env absent → namingStatus=invalid-unresolved-tokens.
+    # ACK LogGroup child is NOT created (includeWhen guards on effectiveName.contains("{")).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-naming-unresolved-token
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: unresolved-token-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: unresolved-token-lg
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Reset effectiveConfig to baseline for tags/labels tests.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: reset-to-baseline-for-tags
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: Tags — three-way merge.
+    # KropathConfig.mandatory.tags + CloudWatchLogsConfig.mandatory.tags + instance → all present.
+    # effectiveConfig.mandatory.tags pre-merged by controller (includes KropathConfig).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-tags-merge
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{"cost-centre":"platform","log-class":"production"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: tags-merge-lg
+              spec:
+                tags:
+                  app: my-service
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: tags-merge-lg
+              spec:
+                tags:
+                  cost-centre: platform
+                  log-class: production
+                  app: my-service
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: SyncedLabels — dual write.
+    # syncedLabels appear in both ACK LogGroup metadata.labels (aws.kropath.run/ prefixed)
+    # AND in spec.tags (allCloudMetadata; ADR-015 §6.1).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-synced-labels-dual
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{"data-class":"internal"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: synced-labels-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: synced-labels-lg
+                labels:
+                  aws.kropath.run/environment: production
+                  aws.kropath.run/data-class: internal
+              spec:
+                tags:
+                  environment: production
+                  data-class: internal
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-19: SyncedAnnotations — written to metadata.annotations.
+    # mandatory.syncedAnnotations → ACK LogGroup metadata.annotations with aws.kropath.run/ prefix.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac19-synced-annotations
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"observability"}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: synced-annot-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: synced-annot-lg
+                annotations:
+                  aws.kropath.run/team: observability
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-20: Tags — direct map passthrough (no list conversion).
+    # ACK CloudWatch Logs spec.tags is map<string,string> — verify it receives a map,
+    # not a [{key,value}] list conversion (unlike SNS/SQS).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac20-tags-map-passthrough
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: map-passthrough-lg
+              spec:
+                tags:
+                  app: my-service
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: map-passthrough-lg
+              spec:
+                tags:
+                  cost-centre: platform
+                  app: my-service
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Reset effectiveConfig to baseline for standard metadata and deletion policy tests.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: reset-to-baseline-for-metadata
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: Standard metadata.
+    # ACK LogGroup has: app.kubernetes.io/managed-by=kro, app.kubernetes.io/instance=<crname>,
+    # services.k8s.aws/deletion-policy=retain, ownerReferences back to CloudWatchLogsLogGroup.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac21-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: std-meta-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: std-meta-lg
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: std-meta-lg
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              (spec.ownerReferences[?name == 'std-meta-lg'] | length(@) > `0`): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22: Deletion policy — delete.
+    # spec.deletionPolicy=delete → ACK LogGroup annotation services.k8s.aws/deletion-policy=delete.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: delete-policy-lg
+              spec:
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: delete-policy-lg
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-23: Deletion policy — retain (default).
+    # Default spec.deletionPolicy=retain → ACK LogGroup annotation = retain.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac23-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: retain-policy-lg
+              spec:
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: retain-policy-lg
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-24: Immutable name — ACK LogGroup spec.name is not mutated after creation.
+    # The naming ConfigMap reflects the new effectiveName but the ACK LogGroup
+    # spec.name stays unchanged (ACK enforces self == oldSelf CEL on spec.name).
+    # In this test, we verify that the ACK LogGroup exists with the original name
+    # even after the effectiveConfig namingTemplate changes.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac24-immutable-name
+      try:
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              metadata:
+                name: immutable-name-lg
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: immutable-name-lg
+              spec:
+                name: cloudwatchlogsloggroup-immutable-name-lg
+        # Simulate template change by patching mandatory.namingTemplate
+        - script:
+            content: |
+              kubectl patch cloudwatchlogsconfig general-policy -n cloudwatchlogsloggroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"kmsKeyId":"","retentionDays":0,"namingTemplate":"new-prefix-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"kmsKeyId":"","retentionDays":90,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        # Wait for kro to reconcile; naming ConfigMap effectiveName changes but
+        # ACK LogGroup spec.name stays at the original value (immutable after creation).
+        - assert:
+            resource:
+              apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+              kind: LogGroup
+              metadata:
+                name: immutable-name-lg
+              spec:
+                name: cloudwatchlogsloggroup-immutable-name-lg
