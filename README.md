@@ -86,27 +86,37 @@ the canonical `kropath-core/docs/standards/engineering-standards.md`.
 
 ## Implementation status
 
-**46 resource RGDs** across 15 services, **24 governance CRDs**, and **74 Chainsaw test suites**.
+**46 resource RGDs** across 15 services, **24 governance CRDs**, and **74 Chainsaw test suites**
+covering **1,149 test cases**.
 
 ### Services with resource RGDs
 
-| Service | RGD kinds | Config CRD | Suites |
-|---|---|---|---|
-| API Gateway v2 | `ApiGatewayV2HttpApi`, `ApiGatewayV2WebSocketApi`, `ApiGatewayV2Stage`, `ApiGatewayV2DomainName`, `ApiGatewayV2ApiMapping`, `ApiGatewayV2VpcLink` | `APIGatewayV2Config` | 7 |
-| Auto Scaling | `AutoScalingGroup` | `AutoScalingConfig` | 2 |
-| CloudFront | `CloudFrontDistribution`, `CloudFrontCachePolicy`, `CloudFrontOriginRequestPolicy`, `CloudFrontResponseHeadersPolicy`, `CloudFrontOriginAccessControl`, `CloudFrontFunction` | `CloudFrontConfig` | 7 |
-| DynamoDB | `DynamoDBTable` | `DynamoDBConfig` | 2 |
-| ECS | `ECSCluster`, `ECSService`, `ECSTaskDefinition`, `ECSCapacityProvider` | `ECSConfig` | 5 |
-| ELBv2 | `ELBLoadBalancer`, `ELBTargetGroup`, `ELBListener`, `ELBRule` | `ELBConfig` | 5 |
-| EventBridge | `EventBridgeEventBus`, `EventBridgeRule`, `EventBridgeArchive`, `EventBridgeEndpoint` | `EventBridgeConfig` | 5 |
-| IAM | `IAMRole`, `IAMPolicy`, `IAMUser`, `IAMGroup`, `IAMIdentityProvider` | `IAMConfig` | 9 |
-| KMS | `KMSKey` | `KMSConfig` | 2 |
-| Lambda | `LambdaFunction`, `LambdaAlias`, `LambdaVersion`, `LambdaLayerVersion`, `LambdaEventSourceMapping`, `LambdaFunctionURLConfig`, `LambdaCodeSigningConfig` | `LambdaConfig` | 8 |
-| RDS | `RDSCluster`, `RDSInstance`, `RDSSubnetGroup` | `RDSConfig` | 4 |
-| S3 | `S3Bucket` | `S3Config` | 2 |
-| Secrets Manager | `SecretsManagerSecret` | `SecretsManagerConfig` | 2 |
-| SNS | `SNSTopic` | `SNSConfig` | 2 |
-| SQS | `SQSQueue` | `SQSConfig` | 2 |
+**Suites** counts `chainsaw-test.yaml` files; **Test cases** counts the behavioural steps inside
+them (setup and purge steps excluded). **AWS integration** tracks end-to-end validation against a
+live AWS account with real ACK controllers — that work is in progress outside CI, so every service
+is currently `⏳ Pending`.
+
+| Service | RGD kinds | Config CRD | Suites | Test cases | AWS integration |
+|---|---|---|---|---|---|
+| API Gateway v2 | `ApiGatewayV2HttpApi`, `ApiGatewayV2WebSocketApi`, `ApiGatewayV2Stage`, `ApiGatewayV2DomainName`, `ApiGatewayV2ApiMapping`, `ApiGatewayV2VpcLink` | `APIGatewayV2Config` | 7 | 86 | ⏳ Pending |
+| Auto Scaling | `AutoScalingGroup` | `AutoScalingConfig` | 2 | 55 | ⏳ Pending |
+| CloudFront | `CloudFrontDistribution`, `CloudFrontCachePolicy`, `CloudFrontOriginRequestPolicy`, `CloudFrontResponseHeadersPolicy`, `CloudFrontOriginAccessControl`, `CloudFrontFunction` | `CloudFrontConfig` | 7 | 84 | ⏳ Pending |
+| DynamoDB | `DynamoDBTable` | `DynamoDBConfig` | 2 | 54 | ⏳ Pending |
+| ECS | `ECSCluster`, `ECSService`, `ECSTaskDefinition`, `ECSCapacityProvider` | `ECSConfig` | 5 | 105 | ⏳ Pending |
+| ELBv2 | `ELBLoadBalancer`, `ELBTargetGroup`, `ELBListener`, `ELBRule` | `ELBConfig` | 5 | 111 | ⏳ Pending |
+| EventBridge | `EventBridgeEventBus`, `EventBridgeRule`, `EventBridgeArchive`, `EventBridgeEndpoint` | `EventBridgeConfig` | 5 | 65 | ⏳ Pending |
+| IAM | `IAMRole`, `IAMPolicy`, `IAMUser`, `IAMGroup`, `IAMIdentityProvider` | `IAMConfig` | 9 | 105 | ⏳ Pending |
+| KMS | `KMSKey` | `KMSConfig` | 2 | 38 | ⏳ Pending |
+| Lambda | `LambdaFunction`, `LambdaAlias`, `LambdaVersion`, `LambdaLayerVersion`, `LambdaEventSourceMapping`, `LambdaFunctionURLConfig`, `LambdaCodeSigningConfig` | `LambdaConfig` | 8 | 119 | ⏳ Pending |
+| RDS | `RDSCluster`, `RDSInstance`, `RDSSubnetGroup` | `RDSConfig` | 4 | 68 | ⏳ Pending |
+| S3 | `S3Bucket` | `S3Config` | 2 | 43 | ⏳ Pending |
+| Secrets Manager | `SecretsManagerSecret` | `SecretsManagerConfig` | 2 | 33 | ⏳ Pending |
+| SNS | `SNSTopic` | `SNSConfig` | 2 | 47 | ⏳ Pending |
+| SQS | `SQSQueue` | `SQSConfig` | 2 | 48 | ⏳ Pending |
+
+All Chainsaw suites pass in CI (the [RGD Tests](https://github.com/kropath/kropath-aws/actions/workflows/rgd-tests.yaml)
+badge above), but they exercise kro's graph resolution and the resulting ACK CR shape only — no
+AWS API is ever called.
 
 ### Governance config only (no resource RGDs yet)
 
@@ -198,8 +208,10 @@ make lint-crds       # fails if a resource-kind CRD is added under crds/
 
 ## Contributing
 
-Bug fixes and small changes are welcome as pull requests; larger features and architectural
-changes should start as a GitHub Issue. See [CONTRIBUTION.md](CONTRIBUTION.md).
+Bug fixes and small changes are welcome as pull requests. Feature requests and architectural
+changes should be raised as a GitHub Issue — accepted requests go onto the development roadmap and
+are implemented by the maintainers; feature PRs are not being accepted yet. See
+[CONTRIBUTION.md](CONTRIBUTION.md).
 
 ## License
 

@@ -13,8 +13,13 @@ pull request directly.
 
 **New features / architecture → Start a GitHub Issue**
 
-Open an [issue](https://github.com/kropath/kropath-aws/issues) *before* writing code when your
-change would:
+Feature requests are very welcome — open an
+[issue](https://github.com/kropath/kropath-aws/issues). Please note that **we are not accepting
+pull requests for features yet.** Accepted requests are added to the development roadmap and
+implemented by the maintainers; the issue is where the design gets agreed and where you can
+follow progress.
+
+Open an issue rather than a PR when your change would:
 
 - add a new resource RGD or a new service family
 - add or reshape a governance `<Service>Config` CRD, or change `KropathConfig`
