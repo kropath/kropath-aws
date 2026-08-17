@@ -21,7 +21,7 @@ CLUSTER_NAME ?= kropath-aws-test
 # suite, or skip a service, depending on the diff).
 .PHONY: setup teardown test chainsaw-e2e \
 	test-apigateway test-apigatewayv2 test-autoscaling test-cloudfront \
-	test-cloudwatchlogs test-dynamodb test-ec2 test-ecr test-ecs test-efs \
+	test-cloudwatch test-cloudwatchlogs test-dynamodb test-ec2 test-ecr test-ecs test-efs \
 	test-eks test-elasticache test-elb test-eventbridge test-iam test-kms \
 	test-lambda test-msk test-policy test-rds test-s3 test-secretsmanager \
 	test-sns test-sqs
@@ -74,6 +74,9 @@ test-elb:
 
 test-rds:
 	chainsaw test rds/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-cloudwatch:
+	chainsaw test cloudwatch/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-cloudwatchlogs:
 	chainsaw test cloudwatchlogs/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
