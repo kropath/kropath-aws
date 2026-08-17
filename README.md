@@ -161,8 +161,8 @@ kubectl apply -f profiles/s3/general-policy.yaml
 kubectl apply -f crds/examples/awsiamconfig/
 ```
 
-See [`docs/testing-local.md`](docs/testing-local.md) for the full walkthrough and the
-`hack/setup-local.sh` flags.
+See [`docs/testing-local.md`](docs/testing-local.md) for the full walkthrough — what `make setup`
+installs, the ACK CRD list, chainsaw defaults, and troubleshooting.
 
 ### Run the tests
 

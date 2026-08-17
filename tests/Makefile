@@ -14,7 +14,17 @@
 
 CLUSTER_NAME ?= kropath-aws-test
 
-.PHONY: setup teardown test test-iam test-kms test-sqs test-secretsmanager test-sns test-dynamodb test-eventbridge test-elb test-rds test-cloudwatchlogs test-cloudfront test-ec2 test-autoscaling test-lambda test-ecs test-eks test-msk test-ecr test-efs test-apigateway test-apigatewayv2 test-elasticache
+# NOTE: every service suite must keep its own explicit `test-<service>:` target.
+# tests/select-tests.sh discovers the known services by grepping this file for
+# `^test-<service>:` lines, so collapsing these into a `test-%:` pattern rule would
+# silently break CI's changed-file test selection (it would fall back to the full
+# suite, or skip a service, depending on the diff).
+.PHONY: setup teardown test chainsaw-e2e \
+	test-apigateway test-apigatewayv2 test-autoscaling test-cloudfront \
+	test-cloudwatchlogs test-dynamodb test-ec2 test-ecr test-ecs test-efs \
+	test-eks test-elasticache test-elb test-eventbridge test-iam test-kms \
+	test-lambda test-msk test-policy test-rds test-s3 test-secretsmanager \
+	test-sns test-sqs
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
