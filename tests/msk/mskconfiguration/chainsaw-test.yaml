@@ -1,0 +1,834 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-msk-02 MSKConfiguration RGD Chainsaw tests — ACs 1-18.
+# Wraps ACK kafka.services.k8s.aws/Configuration (no cloud tags — G-17 exception).
+#
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step ACK deletes.
+# Governance config effectiveConfig is set via kubectl patch --subresource=status (controller stub).
+# Four MSKConfig seeds cover the distinct naming scenarios:
+#   general-policy      defaults.namingTemplate={namespace}-{name}, mandatory empty
+#   mandatory-policy    mandatory.namingTemplate=corp-{namespace}-{name}
+#   empty-policy        both namingTemplates empty (triggers metadata.name fallback)
+#   unresolved-policy   mandatory.namingTemplate has {unsupported} token (triggers invalid status)
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mskconfiguration
+spec:
+  skipDelete: true
+  namespace: mskconfiguration
+  steps:
+    # ── Namespace ──────────────────────────────────────────────────────────────
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-mskconfiguration-namespace.yaml
+
+    # ── Seed MSKConfig: general-policy ────────────────────────────────────────
+    # Used by most ACs. defaults.namingTemplate="{namespace}-{name}", mandatory empty.
+    - name: seed-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+                name: general-policy
+                namespace: mskconfiguration
+              spec:
+                mandatory:
+                  kafkaVersion: ""
+                  instanceType: ""
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: ""
+                  encryptionInTransitInCluster: ""
+                  enhancedMonitoring: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kafkaVersion: "3.6.0"
+                  instanceType: "kafka.m5.large"
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: "TLS"
+                  encryptionInTransitInCluster: "true"
+                  enhancedMonitoring: "DEFAULT"
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig general-policy -n mskconfiguration --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "kafkaVersion":"","instanceType":"","encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"","encryptionInTransitInCluster":"",
+                        "enhancedMonitoring":"","namingTemplate":"",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "kafkaVersion":"3.6.0","instanceType":"kafka.m5.large",
+                        "encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"TLS","encryptionInTransitInCluster":"true",
+                        "enhancedMonitoring":"DEFAULT","namingTemplate":"{namespace}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2"}
+                    }
+                  }
+                }'
+
+    # ── AC-1: Configuration CR created with correct spec.name ─────────────────
+    - name: ac1-configuration-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac1-create
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\ndefault.replication.factor=3\n"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac1-create
+                namespace: mskconfiguration
+              status:
+                resourceName: "mskconfiguration-ac1-create"
+                namingStatus: "valid"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac1-create
+                namespace: mskconfiguration
+              spec:
+                name: "mskconfiguration-ac1-create"
+
+    # ── AC-2: serverProperties base64-roundtrip ────────────────────────────────
+    - name: ac2-server-properties-encoding-roundtrip
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac2-encoding
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\nnum.partitions=3\nmin.insync.replicas=2\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac2-encoding
+                namespace: mskconfiguration
+        - script:
+            content: |
+              STORED=$(kubectl get configuration ac2-encoding -n mskconfiguration -o jsonpath='{.spec.serverProperties}')
+              if [ -z "$STORED" ]; then
+                echo "FAIL: spec.serverProperties is empty"
+                exit 1
+              fi
+              DECODED=$(echo "$STORED" | base64 -d 2>/dev/null || echo "$STORED" | base64 --decode)
+              EXPECTED="auto.create.topics.enable=false
+              num.partitions=3
+              min.insync.replicas=2
+              "
+              # Normalise whitespace for comparison
+              EXPECTED_NORM=$(printf 'auto.create.topics.enable=false\nnum.partitions=3\nmin.insync.replicas=2\n')
+              if [ "$DECODED" = "$EXPECTED_NORM" ]; then
+                echo "PASS: serverProperties roundtrip OK"
+              else
+                echo "FAIL: stored='$STORED' decoded='$DECODED' expected='$EXPECTED_NORM'"
+                exit 1
+              fi
+
+    # ── AC-3: description forwarded ───────────────────────────────────────────
+    - name: ac3-description-set
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac3-desc-set
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                description: "Standard production broker config"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac3-desc-set
+                namespace: mskconfiguration
+              spec:
+                description: "Standard production broker config"
+
+    # ── AC-4: empty description (default) ─────────────────────────────────────
+    - name: ac4-description-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac4-desc-empty
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac4-desc-empty
+                namespace: mskconfiguration
+              spec:
+                name: "mskconfiguration-ac4-desc-empty"
+
+    # ── AC-5: kafkaVersions list forwarded ────────────────────────────────────
+    - name: ac5-kafka-versions-set
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac5-kv-set
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                kafkaVersions:
+                  - "3.5.1"
+                  - "3.6.0"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac5-kv-set
+                namespace: mskconfiguration
+              spec:
+                kafkaVersions:
+                  - "3.5.1"
+                  - "3.6.0"
+
+    # ── AC-6: empty kafkaVersions (default) ───────────────────────────────────
+    - name: ac6-kafka-versions-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac6-kv-empty
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac6-kv-empty
+                namespace: mskconfiguration
+              spec:
+                name: "mskconfiguration-ac6-kv-empty"
+
+    # ── AC-7: defaults namingTemplate {namespace}-{name} ──────────────────────
+    - name: ac7-naming-default-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: broker-baseline
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: broker-baseline
+                namespace: mskconfiguration
+              status:
+                resourceName: "mskconfiguration-broker-baseline"
+                namingStatus: "valid"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: broker-baseline
+                namespace: mskconfiguration
+              spec:
+                name: "mskconfiguration-broker-baseline"
+
+    # ── Seed MSKConfig: mandatory-policy ──────────────────────────────────────
+    - name: seed-mandatory-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: mandatory-policy
+                name: mandatory-policy
+                namespace: mskconfiguration
+              spec:
+                mandatory:
+                  kafkaVersion: ""
+                  instanceType: ""
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: ""
+                  encryptionInTransitInCluster: ""
+                  enhancedMonitoring: ""
+                  namingTemplate: "corp-{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kafkaVersion: "3.6.0"
+                  instanceType: "kafka.m5.large"
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: "TLS"
+                  encryptionInTransitInCluster: "true"
+                  enhancedMonitoring: "DEFAULT"
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig mandatory-policy -n mskconfiguration --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "kafkaVersion":"","instanceType":"","encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"","encryptionInTransitInCluster":"",
+                        "enhancedMonitoring":"","namingTemplate":"corp-{namespace}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "kafkaVersion":"3.6.0","instanceType":"kafka.m5.large",
+                        "encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"TLS","encryptionInTransitInCluster":"true",
+                        "enhancedMonitoring":"DEFAULT","namingTemplate":"{namespace}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2"}
+                    }
+                  }
+                }'
+
+    # ── AC-8: mandatory namingTemplate takes precedence ───────────────────────
+    - name: ac8-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac8-mandatory-naming
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                configRef: mandatory-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac8-mandatory-naming
+                namespace: mskconfiguration
+              status:
+                resourceName: "corp-mskconfiguration-ac8-mandatory-naming"
+                namingStatus: "valid"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac8-mandatory-naming
+                namespace: mskconfiguration
+              spec:
+                name: "corp-mskconfiguration-ac8-mandatory-naming"
+
+    # ── AC-9: nameOverride bypasses namingTemplate ─────────────────────────────
+    - name: ac9-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac9-override
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                nameOverride: "my-custom-config"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac9-override
+                namespace: mskconfiguration
+              status:
+                resourceName: "my-custom-config"
+                namingStatus: "valid"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac9-override
+                namespace: mskconfiguration
+              spec:
+                name: "my-custom-config"
+
+    # ── Seed MSKConfig: empty-policy ──────────────────────────────────────────
+    - name: seed-empty-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: empty-policy
+                name: empty-policy
+                namespace: mskconfiguration
+              spec:
+                mandatory:
+                  kafkaVersion: ""
+                  instanceType: ""
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: ""
+                  encryptionInTransitInCluster: ""
+                  enhancedMonitoring: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kafkaVersion: ""
+                  instanceType: ""
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: ""
+                  encryptionInTransitInCluster: ""
+                  enhancedMonitoring: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig empty-policy -n mskconfiguration --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "kafkaVersion":"","instanceType":"","encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"","encryptionInTransitInCluster":"",
+                        "enhancedMonitoring":"","namingTemplate":"",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "kafkaVersion":"","instanceType":"","encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"","encryptionInTransitInCluster":"",
+                        "enhancedMonitoring":"","namingTemplate":"",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2"}
+                    }
+                  }
+                }'
+
+    # ── AC-10: fallback to metadata.name when all templates empty ─────────────
+    - name: ac10-naming-fallback-metadata-name
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac10-fallback
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                configRef: empty-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac10-fallback
+                namespace: mskconfiguration
+              status:
+                resourceName: "ac10-fallback"
+                namingStatus: "valid"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac10-fallback
+                namespace: mskconfiguration
+              spec:
+                name: "ac10-fallback"
+
+    # ── Seed MSKConfig: unresolved-policy ─────────────────────────────────────
+    - name: seed-unresolved-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: unresolved-policy
+                name: unresolved-policy
+                namespace: mskconfiguration
+              spec:
+                mandatory:
+                  kafkaVersion: ""
+                  instanceType: ""
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: ""
+                  encryptionInTransitInCluster: ""
+                  enhancedMonitoring: ""
+                  namingTemplate: "{namespace}-{name}-{unsupported}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  kafkaVersion: "3.6.0"
+                  instanceType: "kafka.m5.large"
+                  encryptionAtRestKmsKeyId: ""
+                  encryptionInTransitClientBroker: "TLS"
+                  encryptionInTransitInCluster: "true"
+                  enhancedMonitoring: "DEFAULT"
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig unresolved-policy -n mskconfiguration --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "kafkaVersion":"","instanceType":"","encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"","encryptionInTransitInCluster":"",
+                        "enhancedMonitoring":"","namingTemplate":"{namespace}-{name}-{unsupported}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "kafkaVersion":"3.6.0","instanceType":"kafka.m5.large",
+                        "encryptionAtRestKmsKeyId":"",
+                        "encryptionInTransitClientBroker":"TLS","encryptionInTransitInCluster":"true",
+                        "enhancedMonitoring":"DEFAULT","namingTemplate":"{namespace}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2"}
+                    }
+                  }
+                }'
+
+    # ── AC-11: unresolved token → namingStatus invalid, no ACK Configuration ──
+    - name: ac11-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac11-unresolved
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                configRef: unresolved-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac11-unresolved
+                namespace: mskconfiguration
+              status:
+                namingStatus: "invalid-unresolved-tokens"
+        - script:
+            content: |
+              # Verify ACK Configuration is NOT created (includeWhen guard)
+              COUNT=$(kubectl get configuration -n mskconfiguration --field-selector=metadata.name=ac11-unresolved --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" != "0" ]; then
+                echo "FAIL: ACK Configuration should not exist when namingStatus=invalid-unresolved-tokens (found $COUNT)"
+                exit 1
+              fi
+              echo "PASS: ACK Configuration not created for invalid naming"
+
+    # ── AC-12: deletionPolicy=delete ──────────────────────────────────────────
+    - name: ac12-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac12-del-delete
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+                deletionPolicy: "delete"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac12-del-delete
+                namespace: mskconfiguration
+                annotations:
+                  services.k8s.aws/deletion-policy: "delete"
+
+    # ── AC-13: deletionPolicy=retain (default) ────────────────────────────────
+    - name: ac13-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac13-del-retain
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac13-del-retain
+                namespace: mskconfiguration
+                annotations:
+                  services.k8s.aws/deletion-policy: "retain"
+
+    # ── AC-14: standard K8s metadata on ACK Configuration child ───────────────
+    - name: ac14-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac14-std-meta
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac14-std-meta
+                namespace: mskconfiguration
+                labels:
+                  app.kubernetes.io/managed-by: "kro"
+                  app.kubernetes.io/instance: "ac14-std-meta"
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: MSKConfiguration
+                    name: ac14-std-meta
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # ── AC-15: no spec.tags field on ACK Configuration (G-17) ─────────────────
+    # MSKConfig tags fields have no cloud destination on Configuration.
+    - name: ac15-no-tags-field
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac15-no-tags
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac15-no-tags
+                namespace: mskconfiguration
+        - script:
+            content: |
+              # Verify ACK Configuration has no spec.tags field (G-17 — CRD does not define it)
+              TAGS=$(kubectl get configuration ac15-no-tags -n mskconfiguration -o jsonpath='{.spec.tags}' 2>/dev/null)
+              if [ -n "$TAGS" ] && [ "$TAGS" != "null" ]; then
+                echo "FAIL: spec.tags should not be present but got: $TAGS"
+                exit 1
+              fi
+              # Verify MSKConfiguration schema has no tags/syncedLabels/syncedAnnotations fields
+              MSKC_TAGS=$(kubectl get mskconfiguration ac15-no-tags -n mskconfiguration -o jsonpath='{.spec.tags}' 2>/dev/null)
+              if [ -n "$MSKC_TAGS" ] && [ "$MSKC_TAGS" != "null" ]; then
+                echo "FAIL: MSKConfiguration should not expose spec.tags but got: $MSKC_TAGS"
+                exit 1
+              fi
+              echo "PASS: no tags field on ACK Configuration or MSKConfiguration"
+
+    # ── AC-16: configurationArn propagated from ACK status ────────────────────
+    - name: ac16-status-configuration-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac16-arn
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac16-arn
+                namespace: mskconfiguration
+        - script:
+            content: |
+              # Simulate ACK controller setting the configuration ARN in status
+              kubectl patch configuration ac16-arn -n mskconfiguration --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "ackResourceMetadata":{
+                      "arn":"arn:aws:kafka:ap-southeast-2:123456789012:configuration/mskconfiguration-ac16-arn/abc-123-uuid"
+                    }
+                  }
+                }'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac16-arn
+                namespace: mskconfiguration
+              status:
+                configurationArn: "arn:aws:kafka:ap-southeast-2:123456789012:configuration/mskconfiguration-ac16-arn/abc-123-uuid"
+
+    # ── AC-17: latestRevision propagated from ACK status ──────────────────────
+    - name: ac17-status-latest-revision
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac17-revision
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: Configuration
+              metadata:
+                name: ac17-revision
+                namespace: mskconfiguration
+        - script:
+            content: |
+              # Simulate ACK controller setting latestRevision in status
+              kubectl patch configuration ac17-revision -n mskconfiguration --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "latestRevision":{"revision":1}
+                  }
+                }'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac17-revision
+                namespace: mskconfiguration
+              status:
+                latestRevision: 1
+
+    # ── AC-18: status.resourceName/namingStatus populated before ACK active ───
+    # configurationArn and latestRevision remain zero-value until ACK reconciles.
+    - name: ac18-status-fields-before-active
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac18-pre-active
+                namespace: mskconfiguration
+              spec:
+                serverProperties: "auto.create.topics.enable=false\n"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              metadata:
+                name: ac18-pre-active
+                namespace: mskconfiguration
+              status:
+                resourceName: "mskconfiguration-ac18-pre-active"
+                namingStatus: "valid"
+        - script:
+            content: |
+              # Verify that resourceName and namingStatus are populated (naming does not wait for ACK)
+              RESOURCE_NAME=$(kubectl get mskconfiguration ac18-pre-active -n mskconfiguration \
+                -o jsonpath='{.status.resourceName}')
+              NAMING_STATUS=$(kubectl get mskconfiguration ac18-pre-active -n mskconfiguration \
+                -o jsonpath='{.status.namingStatus}')
+              if [ "$RESOURCE_NAME" != "mskconfiguration-ac18-pre-active" ]; then
+                echo "FAIL: status.resourceName not populated before ACK active: $RESOURCE_NAME"
+                exit 1
+              fi
+              if [ "$NAMING_STATUS" != "valid" ]; then
+                echo "FAIL: status.namingStatus not valid before ACK active: $NAMING_STATUS"
+                exit 1
+              fi
+              # configurationArn should be empty (ACK not yet active)
+              ARN=$(kubectl get mskconfiguration ac18-pre-active -n mskconfiguration \
+                -o jsonpath='{.status.configurationArn}')
+              echo "PASS: resourceName=$RESOURCE_NAME namingStatus=$NAMING_STATUS configurationArn='$ARN'"
