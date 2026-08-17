@@ -1,0 +1,888 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-apigw-04 Chainsaw tests — 11 acceptance criteria for APIGatewayDeployment.
+# Namespace: apigatewaydeployment.
+#
+# CANONICAL pattern: every step uses a UNIQUE config (acN-cfg) and a UNIQUE resource
+# name, and deletes NOTHING between steps. skipDelete stops chainsaw's end-of-test
+# cascade delete (no ACK controllers running, so ACK finalizers are never removed).
+# effectiveConfig is injected via `kubectl patch --subresource=status` to mock
+# kropath-controller.
+#
+# Naming-exempt: APIGatewayDeployment has no effectiveName/nameOverride/resourceName/
+# predictedArn/namingStatus — neither ACK Deployment nor Stage have a cloud name field.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: apigatewaydeployment
+spec:
+  skipDelete: true
+  namespace: apigatewaydeployment
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-1: Basic deployment — restApiRef + stageName wired; stageInvokeUrl constructed.
+    # ACK Deployment CR created; ACK Stage CR created with stageName: prod.
+    # status.stageInvokeUrl = https://<restApiId>.execute-api.<region>.amazonaws.com/prod
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac1-basic-deploy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac1-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac1-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac1-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac1-api
+              spec:
+                configRef: ac1-cfg
+        - script:
+            content: |
+              kubectl patch apigatewayrestapi ac1-api -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"restApiId":"abc123def0"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac1-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac1-cfg
+                restApiRef: ac1-api
+                stageName: prod
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Deployment
+              metadata:
+                name: ac1-deploy
+                namespace: apigatewaydeployment
+              spec:
+                restAPIRef:
+                  from:
+                    name: ac1-api
+                    namespace: apigatewaydeployment
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Stage
+              metadata:
+                name: ac1-deploy
+                namespace: apigatewaydeployment
+              spec:
+                stageName: prod
+                restAPIRef:
+                  from:
+                    name: ac1-api
+                    namespace: apigatewaydeployment
+                deploymentRef:
+                  from:
+                    name: ac1-deploy
+                    namespace: apigatewaydeployment
+        - script:
+            content: |
+              URL=$(kubectl get apigatewaydeployment ac1-deploy -n apigatewaydeployment \
+                -o jsonpath='{.status.stageInvokeUrl}' 2>/dev/null)
+              echo "stageInvokeUrl: $URL"
+              EXPECTED="https://abc123def0.execute-api.us-east-1.amazonaws.com/prod"
+              if [ "$URL" != "$EXPECTED" ]; then
+                echo "FAIL: expected stageInvokeUrl=$EXPECTED, got '$URL'"
+                exit 1
+              fi
+              echo "PASS: stageInvokeUrl is correct"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-2: Caching — cacheClusterEnabled + cacheClusterSize on ACK Stage CR.
+    # ACK Deployment CR must NOT have cacheClusterEnabled set.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac2-cache-enabled
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac2-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac2-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac2-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac2-api
+              spec:
+                configRef: ac2-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac2-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac2-cfg
+                restApiRef: ac2-api
+                stageName: staging
+                cacheClusterEnabled: true
+                cacheClusterSize: "0.5"
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Stage
+              metadata:
+                name: ac2-deploy
+                namespace: apigatewaydeployment
+              spec:
+                stageName: staging
+                cacheClusterEnabled: true
+                cacheClusterSize: "0.5"
+        - script:
+            content: |
+              # ACK Deployment CR should NOT have cacheClusterEnabled (we set it only on Stage)
+              CACHE=$(kubectl get deployments.apigateway.services.k8s.aws ac2-deploy \
+                -n apigatewaydeployment -o jsonpath='{.spec.cacheClusterEnabled}' 2>/dev/null)
+              echo "Deployment cacheClusterEnabled: '$CACHE'"
+              if [ "$CACHE" = "true" ]; then
+                echo "FAIL: cacheClusterEnabled should not be set on ACK Deployment CR"
+                exit 1
+              fi
+              echo "PASS: ACK Deployment CR has no cacheClusterEnabled"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-3: Canary deployment — percentTraffic, stageVariableOverrides, useStageCache.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac3-canary-deploy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac3-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac3-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac3-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac3-api
+              spec:
+                configRef: ac3-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac3-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac3-cfg
+                restApiRef: ac3-api
+                stageName: prod
+                canarySettings:
+                  percentTraffic: 10.0
+                  stageVariableOverrides:
+                    version: v2
+                  useStageCache: true
+        - script:
+            content: |
+              TRAFFIC=$(kubectl get stages.apigateway.services.k8s.aws ac3-deploy \
+                -n apigatewaydeployment -o jsonpath='{.spec.canarySettings.percentTraffic}' 2>/dev/null)
+              echo "canarySettings.percentTraffic: $TRAFFIC"
+              if [ "$TRAFFIC" != "10" ]; then
+                echo "FAIL: expected percentTraffic=10, got '$TRAFFIC'"
+                exit 1
+              fi
+              VER=$(kubectl get stages.apigateway.services.k8s.aws ac3-deploy \
+                -n apigatewaydeployment -o jsonpath='{.spec.canarySettings.stageVariableOverrides.version}' 2>/dev/null)
+              echo "stageVariableOverrides.version: $VER"
+              if [ "$VER" != "v2" ]; then
+                echo "FAIL: expected stageVariableOverrides.version=v2, got '$VER'"
+                exit 1
+              fi
+              CACHE=$(kubectl get stages.apigateway.services.k8s.aws ac3-deploy \
+                -n apigatewaydeployment -o jsonpath='{.spec.canarySettings.useStageCache}' 2>/dev/null)
+              echo "canarySettings.useStageCache: $CACHE"
+              if [ "$CACHE" != "true" ]; then
+                echo "FAIL: expected useStageCache=true, got '$CACHE'"
+                exit 1
+              fi
+              echo "PASS: canarySettings correctly propagated to ACK Stage CR"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-4: Tracing — tracingEnabled on ACK Stage CR.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac4-tracing
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac4-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac4-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac4-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac4-api
+              spec:
+                configRef: ac4-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac4-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac4-cfg
+                restApiRef: ac4-api
+                stageName: prod
+                tracingEnabled: true
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Stage
+              metadata:
+                name: ac4-deploy
+                namespace: apigatewaydeployment
+              spec:
+                tracingEnabled: true
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-5: Stage variables — variables map propagated to ACK Stage CR.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac5-stage-variables
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac5-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac5-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac5-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac5-api
+              spec:
+                configRef: ac5-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac5-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac5-cfg
+                restApiRef: ac5-api
+                stageName: prod
+                variables:
+                  stageVar1: value1
+                  stageVar2: value2
+        - script:
+            content: |
+              V1=$(kubectl get stages.apigateway.services.k8s.aws ac5-deploy \
+                -n apigatewaydeployment -o jsonpath='{.spec.variables.stageVar1}' 2>/dev/null)
+              V2=$(kubectl get stages.apigateway.services.k8s.aws ac5-deploy \
+                -n apigatewaydeployment -o jsonpath='{.spec.variables.stageVar2}' 2>/dev/null)
+              echo "variables.stageVar1: $V1"
+              echo "variables.stageVar2: $V2"
+              if [ "$V1" != "value1" ] || [ "$V2" != "value2" ]; then
+                echo "FAIL: expected stageVar1=value1 stageVar2=value2"
+                exit 1
+              fi
+              echo "PASS: stage variables correctly propagated to ACK Stage CR"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-6: Tags — allCloudMetadata on Stage CR only; Deployment CR has no tags.
+    # mandatory.tags: {cost-centre: platform}; spec.tags: {app: orders};
+    # defaults.tags: {env: dev}. All three must appear in Stage spec.tags.
+    # effectiveConfig.mandatory.tags represents pre-merged KropathConfig + APIGatewayConfig
+    # mandatory tiers. Merge order: mandatory wins over spec wins over defaults.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac6-stage-tags
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac6-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac6-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{"cost-centre":"platform"}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{"env":"dev"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac6-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac6-api
+              spec:
+                configRef: ac6-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac6-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac6-cfg
+                restApiRef: ac6-api
+                stageName: prod
+                tags:
+                  app: orders
+        - script:
+            content: |
+              # Verify all three tags appear on the ACK Stage CR using jq (order-independent)
+              TAGS=$(kubectl get stages.apigateway.services.k8s.aws ac6-deploy \
+                -n apigatewaydeployment -o json 2>/dev/null | jq -r '.spec.tags // {}')
+              echo "Stage tags: $TAGS"
+              CC=$(echo "$TAGS" | jq -r '.["cost-centre"] // empty')
+              APP=$(echo "$TAGS" | jq -r '.app // empty')
+              ENV=$(echo "$TAGS" | jq -r '.env // empty')
+              FAIL=0
+              [ "$CC"  = "platform" ] || { echo "FAIL: missing cost-centre=platform"; FAIL=1; }
+              [ "$APP" = "orders"   ] || { echo "FAIL: missing app=orders"; FAIL=1; }
+              [ "$ENV" = "dev"      ] || { echo "FAIL: missing env=dev"; FAIL=1; }
+              [ $FAIL -eq 0 ] || exit 1
+              echo "PASS: Stage CR has all three merged tags"
+              # ACK Deployment CR must have NO tags field (AWS Deployment does not support tags)
+              DEP_TAGS=$(kubectl get deployments.apigateway.services.k8s.aws ac6-deploy \
+                -n apigatewaydeployment -o jsonpath='{.spec.tags}' 2>/dev/null)
+              echo "Deployment tags: '$DEP_TAGS'"
+              if [ -n "$DEP_TAGS" ] && [ "$DEP_TAGS" != "null" ] && [ "$DEP_TAGS" != "{}" ]; then
+                echo "FAIL: ACK Deployment CR should not have tags, got '$DEP_TAGS'"
+                exit 1
+              fi
+              echo "PASS: ACK Deployment CR has no tags"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-7: RestAPI reference — spec.restAPIRef.from.name wired on both Deployment
+    # and Stage CRs; status.restApiId propagates from patched RestAPI status.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac7-restapi-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac7-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac7-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac7-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac7-api
+              spec:
+                configRef: ac7-cfg
+        - script:
+            content: |
+              kubectl patch apigatewayrestapi ac7-api -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"restApiId":"abc123"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac7-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac7-cfg
+                restApiRef: ac7-api
+                stageName: prod
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Deployment
+              metadata:
+                name: ac7-deploy
+                namespace: apigatewaydeployment
+              spec:
+                restAPIRef:
+                  from:
+                    name: ac7-api
+                    namespace: apigatewaydeployment
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Stage
+              metadata:
+                name: ac7-deploy
+                namespace: apigatewaydeployment
+              spec:
+                restAPIRef:
+                  from:
+                    name: ac7-api
+                    namespace: apigatewaydeployment
+                deploymentRef:
+                  from:
+                    name: ac7-deploy
+                    namespace: apigatewaydeployment
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-8: Deletion policy — annotation on BOTH Deployment and Stage CRs.
+    # AC-8a: deletionPolicy: delete
+    # AC-8b: deletionPolicy: retain (default)
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac8a-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac8a-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac8a-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac8a-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac8a-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac8a-api
+              spec:
+                configRef: ac8a-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac8a-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac8a-cfg
+                restApiRef: ac8a-api
+                stageName: prod
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Deployment
+              metadata:
+                name: ac8a-deploy
+                namespace: apigatewaydeployment
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Stage
+              metadata:
+                name: ac8a-deploy
+                namespace: apigatewaydeployment
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    - name: ac8b-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac8b-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac8b-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac8b-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac8b-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac8b-api
+              spec:
+                configRef: ac8b-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac8b-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac8b-cfg
+                restApiRef: ac8b-api
+                stageName: prod
+                # deletionPolicy defaults to retain
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Deployment
+              metadata:
+                name: ac8b-deploy
+                namespace: apigatewaydeployment
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Stage
+              metadata:
+                name: ac8b-deploy
+                namespace: apigatewaydeployment
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-9: Negative — missing required fields (restApiRef or stageName).
+    # The kro-generated CRD marks these fields as required; the API server
+    # rejects CRs missing them.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac9-missing-required
+      try:
+        - script:
+            content: |
+              # Test 1: missing restApiRef — should fail
+              OUT=$(kubectl apply -n apigatewaydeployment -f - 2>&1 <<'YAML'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac9-no-restapi
+                namespace: apigatewaydeployment
+              spec:
+                stageName: prod
+              YAML
+              ) && RC=0 || RC=$?
+              echo "Exit code: $RC"
+              echo "Output: $OUT"
+              if [ "$RC" -eq 0 ]; then
+                echo "FAIL: CR without restApiRef should have been rejected"
+                exit 1
+              fi
+              echo "PASS: CR without restApiRef was rejected"
+              # Test 2: missing stageName — should fail
+              OUT2=$(kubectl apply -n apigatewaydeployment -f - 2>&1 <<'YAML'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac9-no-stage
+                namespace: apigatewaydeployment
+              spec:
+                restApiRef: some-api
+              YAML
+              ) && RC2=0 || RC2=$?
+              echo "Exit code: $RC2"
+              echo "Output: $OUT2"
+              if [ "$RC2" -eq 0 ]; then
+                echo "FAIL: CR without stageName should have been rejected"
+                exit 1
+              fi
+              echo "PASS: CR without stageName was rejected"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-10: Naming-exempt — schema has no nameOverride field; status has no
+    # resourceName, predictedArn, or namingStatus fields.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac10-naming-exempt
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac10-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac10-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac10-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac10-api
+              spec:
+                configRef: ac10-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac10-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac10-cfg
+                restApiRef: ac10-api
+                stageName: prod
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Deployment
+              metadata:
+                name: ac10-deploy
+                namespace: apigatewaydeployment
+        - script:
+            content: |
+              # Verify no naming fields exist in CR spec or status
+              SPEC_JSON=$(kubectl get apigatewaydeployment ac10-deploy -n apigatewaydeployment \
+                -o json 2>/dev/null)
+              FAIL=0
+              for FIELD in nameOverride; do
+                VAL=$(echo "$SPEC_JSON" | jq -r ".spec.$FIELD // empty")
+                if [ -n "$VAL" ]; then
+                  echo "FAIL: spec.$FIELD should not exist in naming-exempt RGD, got '$VAL'"
+                  FAIL=1
+                fi
+              done
+              for FIELD in resourceName predictedArn namingStatus; do
+                VAL=$(echo "$SPEC_JSON" | jq -r ".status.$FIELD // empty")
+                if [ -n "$VAL" ]; then
+                  echo "FAIL: status.$FIELD should not exist in naming-exempt RGD, got '$VAL'"
+                  FAIL=1
+                fi
+              done
+              [ $FAIL -eq 0 ] || exit 1
+              echo "PASS: no naming fields present in spec or status (naming-exempt confirmed)"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-11: Standard metadata — both ACK Deployment and Stage CRs carry:
+    # app.kubernetes.io/managed-by: kro
+    # app.kubernetes.io/instance: <cr-name>
+    # services.k8s.aws/deletion-policy annotation
+    # ownerReferences back to APIGatewayDeployment CR
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac11-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac11-cfg
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac11-cfg -n apigatewaydeployment \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac11-api
+                namespace: apigatewaydeployment
+                labels:
+                  aws.kropath.run/resource-name: ac11-api
+              spec:
+                configRef: ac11-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              metadata:
+                name: ac11-deploy
+                namespace: apigatewaydeployment
+              spec:
+                configRef: ac11-cfg
+                restApiRef: ac11-api
+                stageName: prod
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Deployment
+              metadata:
+                name: ac11-deploy
+                namespace: apigatewaydeployment
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac11-deploy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Stage
+              metadata:
+                name: ac11-deploy
+                namespace: apigatewaydeployment
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac11-deploy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              # Verify ownerReferences on ACK Deployment CR
+              DEP_OWNER=$(kubectl get deployments.apigateway.services.k8s.aws ac11-deploy \
+                -n apigatewaydeployment -o json | \
+                jq -r '.metadata.ownerReferences[] | select(.kind=="APIGatewayDeployment") | .name' 2>/dev/null)
+              echo "Deployment ownerRef name: $DEP_OWNER"
+              if [ "$DEP_OWNER" != "ac11-deploy" ]; then
+                echo "FAIL: ACK Deployment CR missing ownerReference to APIGatewayDeployment"
+                exit 1
+              fi
+              DEP_CTRL=$(kubectl get deployments.apigateway.services.k8s.aws ac11-deploy \
+                -n apigatewaydeployment -o json | \
+                jq -r '.metadata.ownerReferences[] | select(.kind=="APIGatewayDeployment") | .controller' 2>/dev/null)
+              if [ "$DEP_CTRL" != "true" ]; then
+                echo "FAIL: ownerReference controller flag not set on ACK Deployment CR"
+                exit 1
+              fi
+              # Verify ownerReferences on ACK Stage CR
+              STAGE_OWNER=$(kubectl get stages.apigateway.services.k8s.aws ac11-deploy \
+                -n apigatewaydeployment -o json | \
+                jq -r '.metadata.ownerReferences[] | select(.kind=="APIGatewayDeployment") | .name' 2>/dev/null)
+              echo "Stage ownerRef name: $STAGE_OWNER"
+              if [ "$STAGE_OWNER" != "ac11-deploy" ]; then
+                echo "FAIL: ACK Stage CR missing ownerReference to APIGatewayDeployment"
+                exit 1
+              fi
+              STAGE_CTRL=$(kubectl get stages.apigateway.services.k8s.aws ac11-deploy \
+                -n apigatewaydeployment -o json | \
+                jq -r '.metadata.ownerReferences[] | select(.kind=="APIGatewayDeployment") | .controller' 2>/dev/null)
+              if [ "$STAGE_CTRL" != "true" ]; then
+                echo "FAIL: ownerReference controller flag not set on ACK Stage CR"
+                exit 1
+              fi
+              echo "PASS: both child CRs have correct ownerReferences to APIGatewayDeployment"

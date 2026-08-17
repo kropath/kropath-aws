@@ -1,0 +1,193 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: apigatewaydeployment.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: APIGatewayDeployment
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Deployment properties
+      restApiRef: string | required=true
+      description: string | default=""
+
+      # Stage properties
+      stageName: string | required=true
+      stageDescription: string | default=""
+      variables: map[string]string | default={}
+
+      # Caching (applied to Stage only)
+      cacheClusterEnabled: boolean | default=false
+      cacheClusterSize: string | default=""
+
+      # Observability (applied to Stage only)
+      tracingEnabled: boolean | default=false
+
+      # Canary (applied to Stage only)
+      canarySettings:
+        # 0.0 = no canary traffic (all goes to main stage)
+        percentTraffic: float | default=0.0
+        stageVariableOverrides: map[string]string | default={}
+        useStageCache: boolean | default=false
+
+    status:
+      deploymentId: >-
+        ${ackDeployment.?status.?id.orValue("")}
+      stageInvokeUrl: >-
+        ${"https://" + (restApiCr.size() > 0 ? restApiCr[0].?status.?restApiId.orValue("") : "") + ".execute-api." + (rsrcCfg.size() > 0 ? rsrcCfg[0].?status.?effectiveConfig.?aws.?region.orValue("") : "") + ".amazonaws.com/" + ackStage.?spec.?stageName.orValue("")}
+      conditions: >-
+        ${ackStage.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: DeploymentId
+        type: string
+        jsonPath: .status.deploymentId
+      - name: StageInvokeUrl
+        type: string
+        jsonPath: .status.stageInvokeUrl
+
+  resources:
+    # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: APIGatewayConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── REST API lookup — reads status.restApiId for stageInvokeUrl construction ──
+    # restApiRef is required, so selector always matches an existing CR when present.
+    - id: restApiCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: APIGatewayRestAPI
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.spec.restApiRef}
+
+    # ── ACK Deployment CR ─────────────────────────────────────────────────────
+    # Tags are NOT wired to ACK Deployment (AWS Deployment CR does not support tags).
+    # Standard K8s labels, annotations, and ownerReferences are applied.
+    # Naming exempt: no effectiveName, no naming ConfigMap (KRO-236, AC-10).
+    - id: ackDeployment
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: Deployment
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # ACK field: restAPIRef — references the APIGatewayRestAPI K8s CR by name.
+          # The ACK Deployment controller resolves the REST API ID from this reference.
+          restAPIRef:
+            from:
+              name: ${schema.spec.restApiRef}
+              namespace: ${schema.metadata.namespace}
+          description: ${schema.spec.description}
+
+    # ── ACK Stage CR ─────────────────────────────────────────────────────────
+    # Tags (allCloudMetadata) are wired to Stage only — ACK Stage supports tags;
+    # ACK Deployment does not.
+    - id: ackStage
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: Stage
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayDeployment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # ACK field: stageName (required — user-visible stage identifier, e.g. "prod", "v2")
+          stageName: ${schema.spec.stageName}
+          # ACK field: restAPIRef — references the APIGatewayRestAPI K8s CR by name.
+          restAPIRef:
+            from:
+              name: ${schema.spec.restApiRef}
+              namespace: ${schema.metadata.namespace}
+          # ACK field: deploymentRef — references the ACK Deployment CR created above.
+          # The ACK Stage controller resolves the deploymentID from this reference.
+          deploymentRef:
+            from:
+              name: ${schema.metadata.name}
+              namespace: ${schema.metadata.namespace}
+          description: ${schema.spec.stageDescription}
+          cacheClusterEnabled: ${schema.spec.cacheClusterEnabled}
+          cacheClusterSize: ${schema.spec.cacheClusterSize}
+          tracingEnabled: ${schema.spec.tracingEnabled}
+          variables: ${schema.spec.variables}
+          canarySettings:
+            percentTraffic: ${schema.spec.canarySettings.percentTraffic}
+            stageVariableOverrides: ${schema.spec.canarySettings.stageVariableOverrides}
+            useStageCache: ${schema.spec.canarySettings.useStageCache}
+          # Tags: allCloudMetadata = (syncedAnnotations + syncedLabels + tags) across all tiers.
+          # Merge order: defaults → spec → mandatory (last-writer-wins; mandatory wins on conflict).
+          # Applied to Stage only — ACK Deployment CR does not support tags.
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags) ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})}
