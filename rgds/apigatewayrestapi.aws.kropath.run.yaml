@@ -1,0 +1,566 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: apigatewayrestapi.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: APIGatewayRestAPI
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      description: string | default=""
+      # "" = fall through to APIGatewayConfig cascade; HEADER | AUTHORIZER
+      apiKeySource: string | default=""
+      # "" = fall through to APIGatewayConfig cascade; REGIONAL | EDGE | PRIVATE
+      endpointType: string | default=""
+      vpcEndpointIds: "[]string | default=[]"
+      minimumCompressionSize: integer | default=0
+      # Tri-state boolean — do NOT add | default=false (frequent-rgd-errors.md §booleans)
+      disableExecuteApiEndpoint: boolean
+      policy: string | default=""
+      resourcePolicyRef: string | default=""
+      binaryMediaTypes: "[]string | default=[]"
+      resources: "[]Resource | default=[]"
+    types:
+      Resource:
+        pathPart: string | required=true
+        # dot-separated path to parent (e.g. "orders" for /orders/{id}); "" = root child
+        parentPath: string | default=""
+        methods: "[]Method | required=true"
+      Method:
+        httpMethod: string | required=true
+        authorizationType: string | default="NONE"
+        authorizerRef: string | default=""
+        # Tri-state — no default (frequent-rgd-errors.md §booleans)
+        apiKeyRequired: boolean
+        operationName: string | default=""
+        # method.request.{location}.{name} -> "true"/"false" (string; ACK expects boolean — known limitation)
+        requestParameters: map[string]string | default={}
+        requestModels: map[string]string | default={}
+        integration: Integration
+        methodResponses: "[]MethodResponse | default=[]"
+      Integration:
+        # "" allows methods without integration; filter uses != "" in forEach
+        type: string | default=""
+        uri: string | default=""
+        integrationHttpMethod: string | default=""
+        credentials: string | default=""
+        connectionType: string | default="INTERNET"
+        connectionRef: string | default=""
+        passthroughBehavior: string | default="WHEN_NO_MATCH"
+        requestParameters: map[string]string | default={}
+        requestTemplates: map[string]string | default={}
+        contentHandling: string | default=""
+        # 0 = use ACK/AWS default (29000ms); valid range 50-29000
+        timeoutInMillis: integer | default=0
+        cacheKeyParameters: "[]string | default=[]"
+        cacheNamespace: string | default=""
+        # Tri-state — no default (frequent-rgd-errors.md §booleans)
+        tlsInsecureSkipVerify: boolean
+        responses: "[]IntegrationResponse | default=[]"
+      IntegrationResponse:
+        statusCode: string | required=true
+        selectionPattern: string | default=""
+        contentHandling: string | default=""
+        responseParameters: map[string]string | default={}
+        responseTemplates: map[string]string | default={}
+      MethodResponse:
+        statusCode: string | required=true
+        responseModels: map[string]string | default={}
+        # method.response.header.{name} -> "true"/"false" (string; ACK expects boolean — known limitation)
+        responseParameters: map[string]string | default={}
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      restApiId: >-
+        ${restApi.?status.?id.orValue("")}
+      rootResourceId: >-
+        ${restApi.?status.?rootResourceID.orValue("")}
+      # restApiId is system-assigned; predictedArn uses region only — use ackResourceMetadata.arn at runtime
+      predictedArn: >-
+        ${"arn:aws:apigateway:" + (rsrcCfg.size() > 0 ? rsrcCfg[0].?status.?effectiveConfig.?aws.?region.orValue("") : "") + "::/restapis/<pending>"}
+      conditions: >-
+        ${restApi.?status.?conditions.orValue([])}
+      validationError: >-
+        ${has(mutualExclusionError.data) && mutualExclusionError.data.error != "" ? mutualExclusionError.data.error : ""}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
+
+  resources:
+    # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: APIGatewayConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── PolicyDocument lookup — Sentinel Fallback (frequent-rgd-errors.md §Unbound Variable Freeze)
+    # ── includeWhen would cause "no such variable: policyDocCr" in resolvedPolicy CEL.
+    # ── Sentinel "kro-empty-fallback-sentinel" never matches; policyDocCr resolves to [].
+    - id: policyDocCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: PolicyDocument
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: "${schema.spec.resourcePolicyRef != '' ? schema.spec.resourcePolicyRef : 'kro-empty-fallback-sentinel'}"
+
+    # ── Naming ConfigMap (status block cannot access schema.* directly) ───────
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # ── Advisory ConfigMap — mutual exclusion: policy and resourcePolicyRef ───
+    # ── x-kubernetes-validations cannot be preserved by kro v0.9.2 (frequent-rgd-errors.md).
+    # ── Always created; data.error non-empty only when the condition fires.
+    - id: mutualExclusionError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-mutual-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.policy != "" && schema.spec.resourcePolicyRef != ""
+              ? "policy and resourcePolicyRef are mutually exclusive; set one or neither."
+              : ""}
+
+    # ── ACK RestAPI (single static resource) ──────────────────────────────────
+    - id: restApi
+      includeWhen:
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: RestAPI
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          description: ${schema.spec.description}
+          # apiKeySource: mandatory -> instance -> defaults -> HEADER
+          apiKeySource: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?apiKeySource.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.apiKeySource
+              : (schema.spec.apiKeySource != ""
+                ? schema.spec.apiKeySource
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?apiKeySource.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.defaults.apiKeySource
+                  : "HEADER"))}
+          # endpointConfiguration: mandatory -> instance -> defaults -> REGIONAL
+          endpointConfiguration:
+            types:
+              - >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?endpointType.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointType
+                  : (schema.spec.endpointType != ""
+                    ? schema.spec.endpointType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?endpointType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.endpointType
+                      : "REGIONAL"))}
+            # vpcEndpointIDs populated only when effective endpoint type is PRIVATE
+            vpcEndpointIDs: >-
+              ${(rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?endpointType.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointType
+                  : (schema.spec.endpointType != ""
+                    ? schema.spec.endpointType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?endpointType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.endpointType
+                      : "REGIONAL"))) == "PRIVATE" ? schema.spec.vpcEndpointIds : []}
+          # securityPolicy: mandatory minimumTlsVersion -> defaults -> "" (omit)
+          securityPolicy: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?minimumTlsVersion.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.minimumTlsVersion
+              : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?minimumTlsVersion.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.defaults.minimumTlsVersion
+                : "")}
+          # ACK field: disableExecuteAPIEndpoint (capital API — confirmed in crd-cache)
+          disableExecuteAPIEndpoint: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?disableExecuteApiEndpoint.orValue(false))
+              ? true
+              : (has(schema.spec.disableExecuteApiEndpoint)
+                  ? schema.spec.disableExecuteApiEndpoint
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?disableExecuteApiEndpoint.orValue(false)))}
+          # policy: resourcePolicyRef (via policyDocCr sentinel) -> inline policy
+          policy: >-
+            ${policyDocCr.size() > 0 && schema.spec.resourcePolicyRef != ""
+              ? policyDocCr[0].status.resolvedDocumentJSON
+              : schema.spec.policy}
+          binaryMediaTypes: ${schema.spec.binaryMediaTypes}
+          minimumCompressionSize: ${schema.spec.minimumCompressionSize}
+          # Cloud tags: only RestAPI supports tags among API Gateway sub-resources.
+          # Cascade order: defaults (syncedAnnotations, syncedLabels, tags) -> spec -> mandatory
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags) ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})}
+
+    # ── ACK Resource CRs (forEach over spec.resources) ───────────────────────
+    # pathSlug: (parentPath + "." + pathPart or pathPart).lowerAscii().strip-braces().dot-to-hyphen
+    - id: apiResources
+      includeWhen:
+        - >-
+          ${schema.spec.resources.size() > 0
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
+      forEach:
+        - res: "${schema.spec.resources}"
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: Resource
+        metadata:
+          name: "${schema.metadata.name}-res-${(res.parentPath != '' ? res.parentPath + '.' + res.pathPart : res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}"
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          pathPart: ${res.pathPart}
+          restAPIRef:
+            from:
+              name: ${schema.metadata.name}
+          # Root resources (parentPath == "") use parentID from restApi.status.rootResourceID.
+          # Nested resources use parentRef pointing to the parent Resource CR by computed name.
+          parentID: "${res.parentPath == '' ? restApi.?status.?rootResourceID.orValue('') : ''}"
+          parentRef:
+            from:
+              name: "${res.parentPath != '' ? schema.metadata.name + '-res-' + res.parentPath.lowerAscii().replace('{','').replace('}','').replace('.','-') : ''}"
+
+    # ── ACK Method CRs (forEach over flattened resources x methods) ───────────
+    - id: apiMethods
+      includeWhen:
+        - >-
+          ${schema.spec.resources.map(r, r.methods.size()).sum() > 0
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
+      forEach:
+        - entry: "${schema.spec.resources.map(r, r.methods.map(m, {'res': r, 'method': m})).flatten()}"
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: Method
+        metadata:
+          name: "${schema.metadata.name}-m-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}-${entry.method.httpMethod.lowerAscii()}"
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          httpMethod: ${entry.method.httpMethod}
+          authorizationType: ${entry.method.authorizationType}
+          restAPIRef:
+            from:
+              name: ${schema.metadata.name}
+          resourceRef:
+            from:
+              name: "${schema.metadata.name}-res-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}"
+          # authorizerRef: empty string = no authorizer (ACK skips lookup)
+          authorizerRef:
+            from:
+              name: ${entry.method.authorizerRef}
+          apiKeyRequired: '${has(entry.method.apiKeyRequired) ? entry.method.apiKeyRequired : false}'
+          operationName: ${entry.method.operationName}
+          requestModels: ${entry.method.requestModels}
+          requestParameters: ${entry.method.requestParameters}
+
+    # ── ACK Integration CRs (forEach over methods that declare an integration) ─
+    - id: apiIntegrations
+      includeWhen:
+        - >-
+          ${schema.spec.resources.map(r, r.methods.filter(m, m.?integration.?type.orValue('') != '').size()).sum() > 0
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
+      forEach:
+        - entry: "${schema.spec.resources.map(r, r.methods.filter(m, m.?integration.?type.orValue('') != '').map(m, {'res': r, 'method': m})).flatten()}"
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: Integration
+        metadata:
+          name: "${schema.metadata.name}-int-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}-${entry.method.httpMethod.lowerAscii()}"
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # ACK Integration.httpMethod = the method verb (same as parent Method.httpMethod)
+          httpMethod: ${entry.method.httpMethod}
+          # ACK field: type (not integrationType — confirmed in crd-cache for REST API Integration)
+          type: ${entry.method.integration.type}
+          restAPIRef:
+            from:
+              name: ${schema.metadata.name}
+          resourceRef:
+            from:
+              name: "${schema.metadata.name}-res-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}"
+          uri: ${entry.method.integration.uri}
+          # ACK field: integrationHTTPMethod (not integrationHttpMethod — confirmed in crd-cache)
+          integrationHTTPMethod: ${entry.method.integration.integrationHttpMethod}
+          credentials: ${entry.method.integration.credentials}
+          connectionType: ${entry.method.integration.connectionType}
+          # connectionRef: empty = no VPC Link; populated when connectionType == VPC_LINK
+          connectionRef:
+            from:
+              name: '${entry.method.integration.connectionType == "VPC_LINK" ? entry.method.integration.connectionRef : ""}'
+          passthroughBehavior: ${entry.method.integration.passthroughBehavior}
+          requestParameters: ${entry.method.integration.requestParameters}
+          requestTemplates: ${entry.method.integration.requestTemplates}
+          contentHandling: ${entry.method.integration.contentHandling}
+          # Map 0 (spec zero-value sentinel) to ACK default 29000ms
+          timeoutInMillis: '${entry.method.integration.timeoutInMillis > 0 ? entry.method.integration.timeoutInMillis : 29000}'
+          cacheKeyParameters: ${entry.method.integration.cacheKeyParameters}
+          cacheNamespace: ${entry.method.integration.cacheNamespace}
+          tlsConfig:
+            # ACK field: insecureSkipVerification (not insecureSkipVerify)
+            insecureSkipVerification: '${has(entry.method.integration.tlsInsecureSkipVerify) ? entry.method.integration.tlsInsecureSkipVerify : false}'
+
+    # ── ACK APIIntegrationResponse CRs ────────────────────────────────────────
+    - id: apiIntegrationResponses
+      includeWhen:
+        - >-
+          ${schema.spec.resources.map(r, r.methods.filter(m, m.?integration.?type.orValue('') != '' && m.integration.responses.size() > 0).map(m, m.integration.responses.size()).sum()).sum() > 0
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
+      forEach:
+        - entry: "${schema.spec.resources.map(r, r.methods.filter(m, m.?integration.?type.orValue('') != '' && m.integration.responses.size() > 0).map(m, m.integration.responses.map(resp, {'res': r, 'method': m, 'resp': resp})).flatten()).flatten()}"
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: APIIntegrationResponse
+        metadata:
+          name: "${schema.metadata.name}-ir-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}-${entry.method.httpMethod.lowerAscii()}-${entry.resp.statusCode}"
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          httpMethod: ${entry.method.httpMethod}
+          statusCode: ${entry.resp.statusCode}
+          restAPIRef:
+            from:
+              name: ${schema.metadata.name}
+          resourceRef:
+            from:
+              name: "${schema.metadata.name}-res-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}"
+          selectionPattern: ${entry.resp.selectionPattern}
+          contentHandling: ${entry.resp.contentHandling}
+          responseParameters: ${entry.resp.responseParameters}
+          responseTemplates: ${entry.resp.responseTemplates}
+
+    # ── ACK APIMethodResponse CRs ─────────────────────────────────────────────
+    - id: apiMethodResponses
+      includeWhen:
+        - >-
+          ${schema.spec.resources.map(r, r.methods.filter(m, m.methodResponses.size() > 0).map(m, m.methodResponses.size()).sum()).sum() > 0
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
+      forEach:
+        - entry: "${schema.spec.resources.map(r, r.methods.filter(m, m.methodResponses.size() > 0).map(m, m.methodResponses.map(mr, {'res': r, 'method': m, 'mr': mr})).flatten()).flatten()}"
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: APIMethodResponse
+        metadata:
+          name: "${schema.metadata.name}-mr-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}-${entry.method.httpMethod.lowerAscii()}-${entry.mr.statusCode}"
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          httpMethod: ${entry.method.httpMethod}
+          statusCode: ${entry.mr.statusCode}
+          restAPIRef:
+            from:
+              name: ${schema.metadata.name}
+          resourceRef:
+            from:
+              name: "${schema.metadata.name}-res-${(entry.res.parentPath != '' ? entry.res.parentPath + '.' + entry.res.pathPart : entry.res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}"
+          responseModels: ${entry.mr.responseModels}
+          # responseParameters omitted: ACK expects map[string]boolean but RGD schema uses map[string]string (known limitation)

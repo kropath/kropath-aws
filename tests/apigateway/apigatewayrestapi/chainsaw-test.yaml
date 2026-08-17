@@ -1,0 +1,1740 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates uniquely-named config + CR and deletes nothing
+# between steps. skipDelete stops chainsaw's end-of-test cascade delete (no ACK
+# controllers running, so ACK finalizers are never removed). Ephemeral kind cluster
+# is discarded after the suite.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: apigatewayrestapi
+spec:
+  skipDelete: true
+  namespace: apigatewayrestapi
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-1: Simple Lambda proxy — one resource, one method, one integration,
+    #       one integration response, one method response.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac1-simple-lambda-proxy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac1-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac1-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac1-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac1-cfg
+                resources:
+                  - pathPart: orders
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:orders/invocations
+                          integrationHttpMethod: POST
+                          responses:
+                            - statusCode: "200"
+                        methodResponses:
+                          - statusCode: "200"
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac1-api
+                namespace: apigatewayrestapi
+              spec:
+                name: apigatewayrestapi-ac1-api
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac1-api
+                namespace: apigatewayrestapi
+              status:
+                resourceName: apigatewayrestapi-ac1-api
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Resource
+              metadata:
+                name: ac1-api-res-orders
+                namespace: apigatewayrestapi
+              spec:
+                pathPart: orders
+                restAPIRef:
+                  from:
+                    name: ac1-api
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Method
+              metadata:
+                name: ac1-api-m-orders-get
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: GET
+                authorizationType: NONE
+                restAPIRef:
+                  from:
+                    name: ac1-api
+                resourceRef:
+                  from:
+                    name: ac1-api-res-orders
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Integration
+              metadata:
+                name: ac1-api-int-orders-get
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: GET
+                type: AWS_PROXY
+                uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:orders/invocations
+                integrationHTTPMethod: POST
+                restAPIRef:
+                  from:
+                    name: ac1-api
+                resourceRef:
+                  from:
+                    name: ac1-api-res-orders
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: APIIntegrationResponse
+              metadata:
+                name: ac1-api-ir-orders-get-200
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: GET
+                statusCode: "200"
+                restAPIRef:
+                  from:
+                    name: ac1-api
+                resourceRef:
+                  from:
+                    name: ac1-api-res-orders
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: APIMethodResponse
+              metadata:
+                name: ac1-api-mr-orders-get-200
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: GET
+                statusCode: "200"
+                restAPIRef:
+                  from:
+                    name: ac1-api
+                resourceRef:
+                  from:
+                    name: ac1-api-res-orders
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-2: Multi-resource tree — /orders, /orders/{id} (nested), /products.
+    #       Verifies parentRef wiring for nested resource.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac2-multi-resource-tree
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac2-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac2-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac2-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac2-cfg
+                resources:
+                  - pathPart: orders
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:orders/invocations
+                          integrationHttpMethod: POST
+                  - pathPart: "{id}"
+                    parentPath: orders
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:order-detail/invocations
+                          integrationHttpMethod: POST
+                  - pathPart: products
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:products/invocations
+                          integrationHttpMethod: POST
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Resource
+              metadata:
+                name: ac2-api-res-orders
+                namespace: apigatewayrestapi
+              spec:
+                pathPart: orders
+                restAPIRef:
+                  from:
+                    name: ac2-api
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Resource
+              metadata:
+                name: ac2-api-res-orders-id
+                namespace: apigatewayrestapi
+              spec:
+                pathPart: "{id}"
+                restAPIRef:
+                  from:
+                    name: ac2-api
+                parentRef:
+                  from:
+                    name: ac2-api-res-orders
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Resource
+              metadata:
+                name: ac2-api-res-products
+                namespace: apigatewayrestapi
+              spec:
+                pathPart: products
+                restAPIRef:
+                  from:
+                    name: ac2-api
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-3: Empty resources — only RestAPI CR created, no children.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac3-empty-resources
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac3-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac3-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac3-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac3-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac3-api
+                namespace: apigatewayrestapi
+              spec:
+                name: apigatewayrestapi-ac3-api
+        - script:
+            content: |
+              COUNT=$(kubectl get resource -n apigatewayrestapi --selector=app.kubernetes.io/instance=ac3-api -o name 2>/dev/null | wc -l | tr -d ' ')
+              echo "Resource CR count: $COUNT"
+              if [ "$COUNT" -eq "0" ]; then echo "PASS: no Resource CRs created"; exit 0; fi
+              echo "FAIL: expected 0 Resource CRs, found $COUNT"; exit 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-4: Scale-up — start with GET, add POST to the same path.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac4-scale-up-add-method
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac4-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac4-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac4-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac4-cfg
+                resources:
+                  - pathPart: items
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:list-items/invocations
+                          integrationHttpMethod: POST
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Method
+              metadata:
+                name: ac4-api-m-items-get
+                namespace: apigatewayrestapi
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac4-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac4-cfg
+                resources:
+                  - pathPart: items
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:list-items/invocations
+                          integrationHttpMethod: POST
+                      - httpMethod: POST
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:create-item/invocations
+                          integrationHttpMethod: POST
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Method
+              metadata:
+                name: ac4-api-m-items-post
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: POST
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Method
+              metadata:
+                name: ac4-api-m-items-get
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: GET
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-5: Scale-down — remove /products, verify /orders child CRs survive.
+    #       Note: ACK Resource CR for /products will be stuck in Terminating
+    #       without a live ACK controller. We verify the surviving path only.
+    #       (Lifecycle test — single resource name across sub-steps is correct
+    #        per CLAUDE.md carve-out #2 for genuine lifecycle tests.)
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac5-scale-down-remove-path
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac5-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac5-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac5-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac5-cfg
+                resources:
+                  - pathPart: orders
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:orders/invocations
+                          integrationHttpMethod: POST
+                  - pathPart: products
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:products/invocations
+                          integrationHttpMethod: POST
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Resource
+              metadata:
+                name: ac5-api-res-products
+                namespace: apigatewayrestapi
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac5-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac5-cfg
+                resources:
+                  - pathPart: orders
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: AWS_PROXY
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:orders/invocations
+                          integrationHttpMethod: POST
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Resource
+              metadata:
+                name: ac5-api-res-orders
+                namespace: apigatewayrestapi
+              spec:
+                pathPart: orders
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-6: Mandatory endpointType override — mandatory REGIONAL wins over
+    #       instance EDGE.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac6-mandatory-override-endpointtype
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac6-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  endpointType: REGIONAL
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac6-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"REGIONAL","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac6-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac6-cfg
+                endpointType: EDGE
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac6-api
+                namespace: apigatewayrestapi
+              spec:
+                endpointConfiguration:
+                  types:
+                    - REGIONAL
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-7: Defaults fallback endpointType — defaults REGIONAL when mandatory
+    #       is empty and instance spec is empty.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac7-defaults-fallback-endpointtype
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac7-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  endpointType: REGIONAL
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac7-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"REGIONAL","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac7-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac7-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac7-api
+                namespace: apigatewayrestapi
+              spec:
+                endpointConfiguration:
+                  types:
+                    - REGIONAL
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-8: minimumTlsVersion → securityPolicy.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac8-tls-security-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac8-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory:
+                  minimumTlsVersion: TLS_1_2
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac8-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"TLS_1_2","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac8-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac8-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac8-api
+                namespace: apigatewayrestapi
+              spec:
+                securityPolicy: TLS_1_2
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-9: Naming template — {namespace}-{name} → apigatewayrestapi-ac9-api.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac9-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac9-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac9-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac9-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac9-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac9-api
+                namespace: apigatewayrestapi
+              status:
+                resourceName: apigatewayrestapi-ac9-api
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac9-api
+                namespace: apigatewayrestapi
+              spec:
+                name: apigatewayrestapi-ac9-api
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-10: nameOverride bypasses naming template.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac10-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac10-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac10-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac10-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac10-cfg
+                nameOverride: my-custom-api
+                resources: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac10-api
+                namespace: apigatewayrestapi
+              status:
+                resourceName: my-custom-api
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac10-api
+                namespace: apigatewayrestapi
+              spec:
+                name: my-custom-api
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-11: Tags merged — mandatory > instance > defaults across config tiers.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac11-tags-merged
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac11-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory:
+                  tags:
+                    api-type: rest
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac11-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{"api-type":"rest"}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac11-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac11-cfg
+                tags:
+                  app: orders
+                resources: []
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 15); do
+                TAGS=$(kubectl get restapi ac11-api -n apigatewayrestapi -o jsonpath='{.spec.tags}' 2>/dev/null)
+                if echo "$TAGS" | grep -q "api-type" && echo "$TAGS" | grep -q "app"; then
+                  echo "PASS: tags contain api-type and app: $TAGS"; exit 0
+                fi
+                sleep 2
+              done
+              echo "FAIL: expected both api-type and app in tags"
+              kubectl get restapi ac11-api -n apigatewayrestapi -o jsonpath='{.spec.tags}'
+              exit 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-12: Mutual exclusion — policy AND resourcePolicyRef both set.
+    #        Advisory ConfigMap validation error surfaced in status.validationError.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac12-mutual-exclusion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac12-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac12-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac12-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac12-cfg
+                policy: '{"Version":"2012-10-17","Statement":[]}'
+                resourcePolicyRef: some-policy
+                resources: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac12-api
+                namespace: apigatewayrestapi
+              status:
+                (validationError != ""): true
+        - script:
+            content: |
+              # Verify RestAPI ACK CR was NOT created (includeWhen blocks it on mutual exclusion)
+              COUNT=$(kubectl get restapi ac12-api -n apigatewayrestapi --ignore-not-found 2>/dev/null | grep -v NAME | wc -l | tr -d ' ')
+              echo "RestAPI CR count: $COUNT"
+              if [ "$COUNT" -eq "0" ]; then echo "PASS: RestAPI CR not created"; exit 0; fi
+              echo "FAIL: RestAPI CR should not be created when policy and resourcePolicyRef are both set"; exit 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-13: VPC_LINK integration — connectionRef wired to VPC Link name.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac13-vpc-link-integration
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac13-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac13-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac13-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac13-cfg
+                resources:
+                  - pathPart: internal
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: HTTP
+                          uri: http://internal.example.com/v1/items
+                          integrationHttpMethod: GET
+                          connectionType: VPC_LINK
+                          connectionRef: my-vpc-link
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Integration
+              metadata:
+                name: ac13-api-int-internal-get
+                namespace: apigatewayrestapi
+              spec:
+                connectionType: VPC_LINK
+                connectionRef:
+                  from:
+                    name: my-vpc-link
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-14: Deletion policy — delete annotation on all child CRs.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac14-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac14-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac14-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac14-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac14-cfg
+                deletionPolicy: delete
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac14-api
+                namespace: apigatewayrestapi
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-15: Deletion policy retain (default).
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac15-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac15-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac15-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac15-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac15-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac15-api
+                namespace: apigatewayrestapi
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-17: Mandatory apiKeySource override — mandatory AUTHORIZER wins over
+    #        instance HEADER.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac17-mandatory-override-apikeysource
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac17-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory:
+                  apiKeySource: AUTHORIZER
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac17-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"AUTHORIZER","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac17-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac17-cfg
+                apiKeySource: HEADER
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac17-api
+                namespace: apigatewayrestapi
+              spec:
+                apiKeySource: AUTHORIZER
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-18: disableExecuteApiEndpoint — mandatory true wins over instance false.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac18-mandatory-disable-execute-api
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac18-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                mandatory:
+                  disableExecuteApiEndpoint: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac18-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":true,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac18-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac18-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac18-api
+                namespace: apigatewayrestapi
+              spec:
+                disableExecuteAPIEndpoint: true
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-19: Standard metadata — all child CRs have managed-by label and
+    #        deletion-policy annotation.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac19-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac19-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac19-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac19-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac19-cfg
+                resources:
+                  - pathPart: ping
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: MOCK
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac19-api
+                namespace: apigatewayrestapi
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac19-api
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Resource
+              metadata:
+                name: ac19-api-res-ping
+                namespace: apigatewayrestapi
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac19-api
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: Method
+              metadata:
+                name: ac19-api-m-ping-get
+                namespace: apigatewayrestapi
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac19-api
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-20: Synced labels — labels appear on child CR metadata with
+    #        aws.kropath.run/ prefix.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac20-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac20-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    environment: production
+                defaults:
+                  syncedLabels:
+                    data-class: internal
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac20-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{"environment":"production"},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{"data-class":"internal"},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac20-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac20-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac20-api
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/environment: production
+                  aws.kropath.run/data-class: internal
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-21: Synced annotations — annotations appear on child CR metadata
+    #        with aws.kropath.run/ prefix.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac21-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac21-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec:
+                mandatory:
+                  syncedAnnotations:
+                    team: api-platform
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac21-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{"team":"api-platform"},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac21-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac21-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac21-api
+                namespace: apigatewayrestapi
+                annotations:
+                  aws.kropath.run/team: api-platform
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-22: Naming unresolved token — {tag.env} absent → namingStatus invalid.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac22-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac22-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac22-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac22-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{tag.env}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac22-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac22-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac22-api
+                namespace: apigatewayrestapi
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-23: PRIVATE endpoint with VPC endpoint IDs.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac23-private-endpoint-vpc
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac23-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac23-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac23-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac23-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac23-cfg
+                endpointType: PRIVATE
+                vpcEndpointIds:
+                  - vpce-abc123
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac23-api
+                namespace: apigatewayrestapi
+              spec:
+                endpointConfiguration:
+                  types:
+                    - PRIVATE
+                  vpcEndpointIDs:
+                    - vpce-abc123
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-24: Resource policy via PolicyDocument reference.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac24-resource-policy-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac24-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac24-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac24-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PolicyDocument
+              metadata:
+                name: my-api-policy
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: my-api-policy
+              spec:
+                documentJSON: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"execute-api:Invoke","Resource":"*"}]}'
+        - script:
+            content: |
+              # Patch PolicyDocument status since no controller runs locally
+              kubectl patch policydocument my-api-policy -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"resolvedDocumentJSON":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::123456789012:root\"},\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac24-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac24-cfg
+                resourcePolicyRef: my-api-policy
+                resources: []
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 15); do
+                POLICY=$(kubectl get restapi ac24-api -n apigatewayrestapi -o jsonpath='{.spec.policy}' 2>/dev/null)
+                if [ -n "$POLICY" ]; then
+                  echo "PASS: policy is set (length ${#POLICY})"
+                  exit 0
+                fi
+                echo "Attempt $i: policy not yet set, waiting..."
+                sleep 2
+              done
+              echo "FAIL: policy still not set after 30s"
+              kubectl get restapi ac24-api -n apigatewayrestapi -o yaml
+              exit 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-25: Inline resource policy — spec.policy passed verbatim.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac25-resource-policy-inline
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac25-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac25-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac25-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac25-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac25-cfg
+                policy: '{"Version":"2012-10-17","Statement":[]}'
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac25-api
+                namespace: apigatewayrestapi
+              spec:
+                policy: '{"Version":"2012-10-17","Statement":[]}'
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-25a: No resource policy — spec.policy and resourcePolicyRef both empty;
+    #         policyDocCr sentinel resolves to []; RestAPI.spec.policy is empty.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac25a-no-resource-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac25a-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac25a-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac25a-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac25a-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac25a-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac25a-api
+                namespace: apigatewayrestapi
+        - script:
+            content: |
+              POLICY=$(kubectl get restapi ac25a-api -n apigatewayrestapi -o jsonpath='{.spec.policy}' 2>/dev/null)
+              echo "Policy value: '$POLICY'"
+              if [ -z "$POLICY" ]; then echo "PASS: policy is empty/absent"; exit 0; fi
+              echo "FAIL: expected empty policy, got: $POLICY"; exit 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-26: Integration response mappings — two responses per method.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac26-integration-responses
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac26-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac26-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac26-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac26-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac26-cfg
+                resources:
+                  - pathPart: data
+                    parentPath: ""
+                    methods:
+                      - httpMethod: POST
+                        authorizationType: NONE
+                        integration:
+                          type: AWS
+                          uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:handler/invocations
+                          integrationHttpMethod: POST
+                          responses:
+                            - statusCode: "200"
+                              selectionPattern: ""
+                              responseParameters:
+                                method.response.header.Content-Type: integration.response.header.Content-Type
+                              responseTemplates:
+                                application/json: ""
+                            - statusCode: "400"
+                              selectionPattern: "4\\d{2}"
+                              contentHandling: CONVERT_TO_TEXT
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: APIIntegrationResponse
+              metadata:
+                name: ac26-api-ir-data-post-200
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: POST
+                statusCode: "200"
+                restAPIRef:
+                  from:
+                    name: ac26-api
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: APIIntegrationResponse
+              metadata:
+                name: ac26-api-ir-data-post-400
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: POST
+                statusCode: "400"
+                contentHandling: CONVERT_TO_TEXT
+                restAPIRef:
+                  from:
+                    name: ac26-api
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-27: Method response mappings — responseModels and responseParameters.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac27-method-responses
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac27-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac27-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac27-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac27-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac27-cfg
+                resources:
+                  - pathPart: report
+                    parentPath: ""
+                    methods:
+                      - httpMethod: GET
+                        authorizationType: NONE
+                        integration:
+                          type: MOCK
+                        methodResponses:
+                          - statusCode: "200"
+                            responseModels:
+                              application/json: Empty
+                            responseParameters:
+                              method.response.header.Content-Type: "false"
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: APIMethodResponse
+              metadata:
+                name: ac27-api-mr-report-get-200
+                namespace: apigatewayrestapi
+              spec:
+                httpMethod: GET
+                statusCode: "200"
+                responseModels:
+                  application/json: Empty
+                restAPIRef:
+                  from:
+                    name: ac27-api
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-28: Binary media types and compression threshold.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac28-binary-media-compression
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac28-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac28-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac28-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac28-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac28-cfg
+                binaryMediaTypes:
+                  - application/octet-stream
+                minimumCompressionSize: 1024
+                resources: []
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac28-api
+                namespace: apigatewayrestapi
+              spec:
+                binaryMediaTypes:
+                  - application/octet-stream
+                minimumCompressionSize: 1024
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AC-29: Mandatory naming template from governance config.
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: ac29-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayConfig
+              metadata:
+                name: ac29-cfg
+                namespace: apigatewayrestapi
+                labels:
+                  aws.kropath.run/resource-name: ac29-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch apigatewayconfig ac29-cfg -n apigatewayrestapi \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"corp-{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"apiKeySource":"","disableExecuteApiEndpoint":false,"endpointType":"","minimumTlsVersion":"","namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac29-api
+                namespace: apigatewayrestapi
+              spec:
+                configRef: ac29-cfg
+                resources: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              metadata:
+                name: ac29-api
+                namespace: apigatewayrestapi
+              status:
+                resourceName: corp-apigatewayrestapi-ac29-api
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: apigateway.services.k8s.aws/v1alpha1
+              kind: RestAPI
+              metadata:
+                name: ac29-api
+                namespace: apigatewayrestapi
+              spec:
+                name: corp-apigatewayrestapi-ac29-api
