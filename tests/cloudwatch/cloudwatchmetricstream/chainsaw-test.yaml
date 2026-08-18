@@ -1,0 +1,977 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named CloudWatchConfig + CloudWatchMetricStream.
+# skipDelete: true stops chainsaw's end-of-test cascade delete.
+#
+# MetricStream-specific notes:
+# - outputFormat cascades: mandatory > instance > defaults > built-in "json"
+# - ACK field names: spec.firehoseARN and spec.roleARN (capital ARN)
+# - ACK MetricStream spec.tags is {key,value} list — use jq for order-independent asserts
+# - ARN: arn:aws:cloudwatch:<region>:<accountId>:metric-stream/<effectiveName>
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cloudwatchmetricstream
+spec:
+  skipDelete: true
+  namespace: cloudwatchmetricstream
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: firehoseArn and roleArn pass through as ACK spec.firehoseARN and spec.roleARN.
+    # Note ACK field names use capital ARN.
+    - name: ac1-firehose-role-arn-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac1-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac1-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac1-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac1-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/my-stream"
+                roleArn: "arn:aws:iam::123456789012:role/my-metric-stream-role"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac1-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                name: cloudwatchmetricstream-ac1-stream
+                firehoseARN: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/my-stream"
+                roleARN: "arn:aws:iam::123456789012:role/my-metric-stream-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac1-stream
+                namespace: cloudwatchmetricstream
+              status:
+                resourceName: cloudwatchmetricstream-ac1-stream
+                namingStatus: valid
+
+    # AC-2: outputFormat default cascade — when not set anywhere, built-in "json" is used.
+    - name: ac2-output-format-builtin-default-json
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac2-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac2-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac2-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac2-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac2-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                outputFormat: json
+
+    # AC-3: outputFormat from defaults.outputFormat when mandatory and instance are unset.
+    - name: ac3-output-format-from-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac3-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  outputFormat: "opentelemetry0.7"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac3-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"opentelemetry0.7","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac3-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac3-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac3-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                outputFormat: opentelemetry0.7
+
+    # AC-4: outputFormat instance override when mandatory is unset.
+    - name: ac4-output-format-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac4-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  outputFormat: "json"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac4-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac4-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac4-cfg
+                outputFormat: "opentelemetry1.0"
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac4-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                outputFormat: opentelemetry1.0
+
+    # AC-5: outputFormat mandatory wins over instance and defaults.
+    - name: ac5-output-format-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac5-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  outputFormat: "opentelemetry0.7"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac5-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"opentelemetry0.7","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac5-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac5-cfg
+                outputFormat: "json"
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac5-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                outputFormat: opentelemetry0.7
+
+    # AC-6: includeFilters pass through (namespace + metricNames).
+    - name: ac6-include-filters-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac6-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac6-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac6-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac6-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+                includeFilters:
+                  - namespace: AWS/EC2
+                    metricNames:
+                      - CPUUtilization
+                      - NetworkIn
+                  - namespace: AWS/RDS
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac6-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                includeFilters:
+                  - namespace: AWS/EC2
+                    metricNames:
+                      - CPUUtilization
+                      - NetworkIn
+                  - namespace: AWS/RDS
+
+    # AC-7: excludeFilters pass through.
+    - name: ac7-exclude-filters-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac7-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac7-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac7-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac7-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+                excludeFilters:
+                  - namespace: AWS/Billing
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac7-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                excludeFilters:
+                  - namespace: AWS/Billing
+
+    # AC-8: includeLinkedAccountsMetrics pass-through.
+    - name: ac8-include-linked-accounts-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac8-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac8-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac8-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac8-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+                includeLinkedAccountsMetrics: true
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac8-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                includeLinkedAccountsMetrics: true
+
+    # AC-9: predictedArn built from effectiveName and region/accountId from aws config.
+    - name: ac9-predicted-arn-metric-stream
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac9-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac9-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac9-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac9-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac9-stream
+                namespace: cloudwatchmetricstream
+              status:
+                predictedArn: "arn:aws:cloudwatch:ap-southeast-2:123456789012:metric-stream/cloudwatchmetricstream-ac9-stream"
+
+    # AC-10: nameOverride takes precedence over namingTemplate.
+    - name: ac10-name-override-takes-precedence
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac10-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac10-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac10-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac10-cfg
+                nameOverride: my-custom-stream
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac10-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                name: my-custom-stream
+
+    # AC-11: Naming: unresolved {tag.X} token → namingStatus=invalid-unresolved-tokens,
+    # ACK MetricStream CR is NOT created.
+    - name: ac11-unresolved-tag-token-blocks-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac11-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "stream-{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac11-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"stream-{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac11-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac11-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac11-stream
+                namespace: cloudwatchmetricstream
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              COUNT=$(kubectl get metricstream ac11-stream -n cloudwatchmetricstream 2>&1 | grep -c "not found" || true)
+              if [ "$COUNT" -lt 1 ]; then
+                echo "ERROR: MetricStream should NOT exist when naming has unresolved tokens"
+                exit 1
+              fi
+              echo "Confirmed: MetricStream not created for ac11-stream (unresolved token)"
+
+    # AC-12: Cloud tags merge order: defaults → spec → mandatory (mandatory wins on collision).
+    # Uses jq for order-independent {key,value} list assertion.
+    - name: ac12-tags-mandatory-wins-over-spec
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac12-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac12-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{"env":"prod-mandatory"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{"tier":"default-tier"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac12-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac12-cfg
+                tags:
+                  env: spec-env-attempt
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac12-stream
+                namespace: cloudwatchmetricstream
+        - script:
+            content: |
+              TAGS=$(kubectl get metricstream ac12-stream -n cloudwatchmetricstream -o json | jq -r '.spec.tags')
+              echo "Tags: $TAGS"
+              ENV_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "env") | .value')
+              TIER_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "tier") | .value')
+              if [ "$ENV_VAL" != "prod-mandatory" ]; then
+                echo "ERROR: expected env=prod-mandatory (mandatory wins), got: $ENV_VAL"
+                exit 1
+              fi
+              if [ "$TIER_VAL" != "default-tier" ]; then
+                echo "ERROR: expected tier=default-tier (from defaults), got: $TIER_VAL"
+                exit 1
+              fi
+              echo "PASS: tag merge order correct"
+
+    # AC-13: syncedLabels written to K8s metadata.labels (prefixed) AND cloud tags (plain key).
+    - name: ac13-synced-labels-dual-write
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac13-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac13-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{"team":"data-platform"},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac13-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac13-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac13-stream
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/team: data-platform
+        - script:
+            content: |
+              TAGS=$(kubectl get metricstream ac13-stream -n cloudwatchmetricstream -o json | jq -r '.spec.tags')
+              TEAM_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "team") | .value')
+              if [ "$TEAM_VAL" != "data-platform" ]; then
+                echo "ERROR: expected cloud tag team=data-platform (plain key, no prefix), got: $TEAM_VAL"
+                exit 1
+              fi
+              echo "PASS: syncedLabel team=data-platform written to both K8s labels (prefixed) and cloud tags (plain)"
+
+    # AC-14: deletionPolicy=retain → services.k8s.aws/deletion-policy: retain annotation.
+    - name: ac14-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac14-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac14-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac14-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac14-cfg
+                deletionPolicy: retain
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac14-stream
+                namespace: cloudwatchmetricstream
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-15: deletionPolicy=delete → services.k8s.aws/deletion-policy: delete annotation.
+    - name: ac15-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac15-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac15-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac15-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac15-cfg
+                deletionPolicy: delete
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac15-stream
+                namespace: cloudwatchmetricstream
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-16: K8s metadata.name = schema.metadata.name (not effectiveName).
+    - name: ac16-k8s-name-is-schema-name
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac16-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "very-different-stream-cloud-name"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac16-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"very-different-stream-cloud-name","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac16-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac16-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac16-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                name: very-different-stream-cloud-name
+
+    # AC-17: syncedAnnotations written to K8s metadata.annotations (prefixed).
+    - name: ac17-synced-annotations-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac17-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac17-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"streaming-team"}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac17-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac17-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac17-stream
+                namespace: cloudwatchmetricstream
+                annotations:
+                  aws.kropath.run/owner: streaming-team
+
+    # AC-18: Naming: {tag.X} token resolved from instance spec.tags.
+    - name: ac18-naming-tag-token-from-spec
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac18-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                defaults:
+                  namingTemplate: "stream-{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac18-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"stream-{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac18-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac18-cfg
+                tags:
+                  env: staging
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac18-stream
+                namespace: cloudwatchmetricstream
+              status:
+                resourceName: stream-staging-ac18-stream
+                namingStatus: valid
+
+    # AC-19: configRef references a non-default named config.
+    - name: ac19-custom-config-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac19-special-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac19-special-cfg
+              spec:
+                mandatory:
+                  outputFormat: "opentelemetry1.0"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac19-special-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"opentelemetry1.0","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac19-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac19-special-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac19-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                outputFormat: opentelemetry1.0
+
+    # AC-20: mandatory.namingTemplate wins over defaults.namingTemplate.
+    - name: ac20-mandatory-naming-template-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac20-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "mand-stream-{name}"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac20-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"mand-stream-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac20-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac20-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac20-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                name: mand-stream-ac20-stream
+
+    # AC-21: app.kubernetes.io/managed-by and app.kubernetes.io/instance always present.
+    - name: ac21-standard-k8s-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac21-cfg
+                namespace: cloudwatchmetricstream
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac21-cfg -n cloudwatchmetricstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchMetricStream
+              metadata:
+                name: ac21-stream
+                namespace: cloudwatchmetricstream
+              spec:
+                configRef: ac21-cfg
+                firehoseArn: "arn:aws:firehose:ap-southeast-2:123456789012:deliverystream/s"
+                roleArn: "arn:aws:iam::123456789012:role/r"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricStream
+              metadata:
+                name: ac21-stream
+                namespace: cloudwatchmetricstream
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac21-stream
