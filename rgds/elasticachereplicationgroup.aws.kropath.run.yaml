@@ -1,0 +1,298 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: elasticachereplicationgroup.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ElastiCacheReplicationGroup
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Engine — governed: mandatory → instance → defaults → "valkey".
+      engine: string | default=valkey
+      # Node configuration
+      cacheNodeType: string | default=""
+      description: string | default=""
+      engineVersion: string | default=""
+      # Encryption — governed booleans; mandatory can only force true.
+      # Declared as plain boolean (not *bool) — kro handles nil semantics via has().
+      atRestEncryptionEnabled: boolean
+      transitEncryptionEnabled: boolean
+      # HA — governed. multiAZEnabled forces automaticFailoverEnabled via OR-logic.
+      automaticFailoverEnabled: boolean
+      multiAZEnabled: boolean
+      # Snapshots — mandatory floor; instance value below floor is clamped up.
+      snapshotRetentionLimit: integer | default=0
+      snapshotWindow: string | default=""
+      preferredMaintenanceWindow: string | default=""
+      # Cluster mode
+      numNodeGroups: integer | default=0
+      replicasPerNodeGroup: integer | default=0
+      nodeGroupConfiguration: "[]NodeGroupConfiguration | default=[]"
+      # Networking
+      cacheSubnetGroupName: string | default=""
+      securityGroupIDs: "[]string | default=[]"
+      cacheParameterGroupName: string | default=""
+      port: integer | default=0
+      networkType: string | default=""
+      # Advanced
+      kmsKeyID: string | default=""
+      userGroupIDs: "[]string | default=[]"
+      dataTieringEnabled: boolean
+      notificationTopicARN: string | default=""
+      logDeliveryConfigurations: "[]LogDeliveryConfiguration | default=[]"
+    types:
+      NodeGroupConfiguration:
+        nodeGroupID: string | default=""
+        replicaCount: integer | default=0
+        slots: string | default=""
+        primaryAvailabilityZone: string | default=""
+        replicaAvailabilityZones: "[]string | default=[]"
+      LogDeliveryConfiguration:
+        logType: string | default=""
+        destinationType: string | default=""
+        logFormat: string | default=""
+        destinationDetails: LogDestinationDetails | default={}
+      LogDestinationDetails:
+        cloudWatchLogsDetails: CloudWatchLogsDetails | default={}
+        kinesisFirehoseDetails: KinesisFirehoseDetails | default={}
+      CloudWatchLogsDetails:
+        logGroup: string | default=""
+      KinesisFirehoseDetails:
+        deliveryStream: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && !naming.data.effectiveName.contains("{") && naming.data.effectiveName != ""
+          ? "arn:aws:elasticache:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":replicationgroup:" + naming.data.effectiveName
+          : ""}
+      conditions: >-
+        ${ackReplicationGroup.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ElastiCacheConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # replicationGroupID must be lowercase — .lowerAscii() applied as final step.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheReplicationGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)
+              .lowerAscii())}
+
+    # ACK ReplicationGroup CR — primary cloud resource.
+    # Only created when naming is valid.
+    - id: ackReplicationGroup
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: elasticache.services.k8s.aws/v1alpha1
+        kind: ReplicationGroup
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheReplicationGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource ID — from effectiveName (naming template or nameOverride).
+          replicationGroupID: ${naming.data.effectiveName}
+          # Description — required by ACK.
+          description: ${schema.spec.description}
+          # Engine — governed: mandatory wins, then instance, then defaults, then "valkey".
+          engine: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?engine.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.engine
+              : (schema.spec.engine != ""
+                  ? schema.spec.engine
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?engine.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.engine
+                      : "valkey"))}
+          # Node configuration — direct pass-through.
+          cacheNodeType: ${schema.spec.cacheNodeType}
+          engineVersion: ${schema.spec.engineVersion}
+          # At-rest encryption — governed boolean; mandatory forces true, cannot force false.
+          # Immutable after creation (ACK enforces; x-kubernetes-validations not preserved by kro).
+          atRestEncryptionEnabled: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?atRestEncryptionEnabled.orValue(false)
+              ? true
+              : (has(schema.spec.atRestEncryptionEnabled)
+                  ? schema.spec.atRestEncryptionEnabled
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?atRestEncryptionEnabled.orValue(false) : false))}
+          # In-transit encryption — governed boolean; mandatory forces true, cannot force false.
+          transitEncryptionEnabled: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?transitEncryptionEnabled.orValue(false)
+              ? true
+              : (has(schema.spec.transitEncryptionEnabled)
+                  ? schema.spec.transitEncryptionEnabled
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?transitEncryptionEnabled.orValue(false) : false))}
+          # Multi-AZ — governed boolean.
+          multiAZEnabled: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?multiAZEnabled.orValue(false)
+              ? true
+              : (has(schema.spec.multiAZEnabled)
+                  ? schema.spec.multiAZEnabled
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?multiAZEnabled.orValue(false) : false))}
+          # Automatic failover — governed boolean OR-ed with multiAZEnabled (multiAZ always forces failover on).
+          automaticFailoverEnabled: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?automaticFailoverEnabled.orValue(false)
+                ? true
+                : (has(schema.spec.automaticFailoverEnabled)
+                    ? schema.spec.automaticFailoverEnabled
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?automaticFailoverEnabled.orValue(false) : false)))
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?multiAZEnabled.orValue(false)
+                  ? true
+                  : (has(schema.spec.multiAZEnabled)
+                      ? schema.spec.multiAZEnabled
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?multiAZEnabled.orValue(false) : false)))}
+          # Snapshot retention — mandatory floor: instance value clamped up to floor, cannot be disabled.
+          snapshotRetentionLimit: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?snapshotRetentionLimit.orValue(0) > 0
+              ? (has(schema.spec.snapshotRetentionLimit) && schema.spec.snapshotRetentionLimit > rsrcCfg[0].status.effectiveConfig.mandatory.snapshotRetentionLimit
+                  ? schema.spec.snapshotRetentionLimit
+                  : rsrcCfg[0].status.effectiveConfig.mandatory.snapshotRetentionLimit)
+              : (has(schema.spec.snapshotRetentionLimit)
+                  ? schema.spec.snapshotRetentionLimit
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?snapshotRetentionLimit.orValue(0) > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.snapshotRetentionLimit
+                      : 1))}
+          # Cluster mode — direct pass-through.
+          numNodeGroups: ${schema.spec.numNodeGroups}
+          replicasPerNodeGroup: ${schema.spec.replicasPerNodeGroup}
+          nodeGroupConfiguration: ${schema.spec.nodeGroupConfiguration}
+          # Networking — direct pass-through.
+          cacheSubnetGroupName: ${schema.spec.cacheSubnetGroupName}
+          securityGroupIDs: ${schema.spec.securityGroupIDs}
+          cacheParameterGroupName: ${schema.spec.cacheParameterGroupName}
+          port: ${schema.spec.port}
+          networkType: ${schema.spec.networkType}
+          # Advanced — direct pass-through.
+          kmsKeyID: ${schema.spec.kmsKeyID}
+          userGroupIDs: ${schema.spec.userGroupIDs}
+          dataTieringEnabled: >-
+            ${has(schema.spec.dataTieringEnabled) ? schema.spec.dataTieringEnabled : false}
+          notificationTopicARN: ${schema.spec.notificationTopicARN}
+          preferredMaintenanceWindow: ${schema.spec.preferredMaintenanceWindow}
+          snapshotWindow: ${schema.spec.snapshotWindow}
+          logDeliveryConfigurations: ${schema.spec.logDeliveryConfigurations}
+          # Cloud resource tags — ElastiCache uses [{key,value}] array format.
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations are also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${((rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})}

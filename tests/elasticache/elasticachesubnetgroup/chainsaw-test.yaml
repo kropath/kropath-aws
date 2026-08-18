@@ -1,0 +1,430 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ec-02 Chainsaw tests — ElastiCacheSubnetGroup (KRO-413).
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: elasticachesubnetgroup
+spec:
+  skipDelete: true
+  namespace: elasticachesubnetgroup
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: happy-path: basic-create
+    # subnetIDs and description forwarded verbatim to ACK CacheSubnetGroup.
+    - name: ac1-basic-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac1-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac1-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac1-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac1-cfg
+                subnetIDs:
+                  - subnet-aaa
+                  - subnet-bbb
+                description: "prod cache subnets"
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: CacheSubnetGroup
+              metadata:
+                name: ac1-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                subnetIDs:
+                  - subnet-aaa
+                  - subnet-bbb
+                cacheSubnetGroupDescription: "prod cache subnets"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac1-subnet
+                namespace: elasticachesubnetgroup
+              status:
+                resourceName: elasticachesubnetgroup-ac1-subnet
+                namingStatus: valid
+
+    # AC-2: happy-path: tag-merge
+    # mandatory tags win on key conflict; defaults and spec tags all present.
+    - name: ac2-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac2-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  tags:
+                    cost-centre: platform
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    tier: baseline
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac2-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{"tier":"baseline"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac2-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac2-cfg
+                subnetIDs:
+                  - subnet-ccc
+                tags:
+                  app: orders
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: CacheSubnetGroup
+              metadata:
+                name: ac2-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                subnetIDs:
+                  - subnet-ccc
+        - script:
+            timeout: 60s
+            content: |
+              TAGS=$(kubectl get cachesubnetgroup ac2-subnet -n elasticachesubnetgroup -o json | jq -r '.spec.tags // []')
+              echo "Tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key == "cost-centre" and .value == "platform")) | length == 1' && \
+              echo "$TAGS" | jq -e 'map(select(.key == "tier" and .value == "baseline")) | length == 1' && \
+              echo "$TAGS" | jq -e 'map(select(.key == "app" and .value == "orders")) | length == 1'
+
+    # AC-3: happy-path: synced-labels
+    # mandatory.syncedLabels forwarded to ACK labels (with aws.kropath.run/ prefix) and spec.tags.
+    - name: ac3-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac3-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    environment: production
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac3-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac3-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac3-cfg
+                subnetIDs:
+                  - subnet-ddd
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: CacheSubnetGroup
+              metadata:
+                name: ac3-subnet
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            timeout: 60s
+            content: |
+              TAGS=$(kubectl get cachesubnetgroup ac3-subnet -n elasticachesubnetgroup -o json | jq -r '.spec.tags // []')
+              echo "Tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key == "environment" and .value == "production")) | length == 1'
+
+    # AC-4: happy-path: naming-template
+    # defaults.namingTemplate controls status.resourceName and ACK cacheSubnetGroupName.
+    - name: ac4-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac4-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac4-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: redis-subnets
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac4-cfg
+                subnetIDs:
+                  - subnet-eee
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: redis-subnets
+                namespace: elasticachesubnetgroup
+              status:
+                resourceName: elasticachesubnetgroup-redis-subnets
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: CacheSubnetGroup
+              metadata:
+                name: redis-subnets
+                namespace: elasticachesubnetgroup
+              spec:
+                cacheSubnetGroupName: elasticachesubnetgroup-redis-subnets
+
+    # AC-5: happy-path: name-override
+    # spec.nameOverride bypasses the naming template entirely.
+    - name: ac5-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac5-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac5-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac5-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac5-cfg
+                nameOverride: "shared-vpc-subnets"
+                subnetIDs:
+                  - subnet-fff
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac5-subnet
+                namespace: elasticachesubnetgroup
+              status:
+                resourceName: shared-vpc-subnets
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: CacheSubnetGroup
+              metadata:
+                name: ac5-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                cacheSubnetGroupName: shared-vpc-subnets
+
+    # AC-6: happy-path: deletion-policy retain (default)
+    # ACK CacheSubnetGroup annotation services.k8s.aws/deletion-policy: retain
+    - name: ac6-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac6-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac6-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac6-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac6-cfg
+                subnetIDs:
+                  - subnet-ggg
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: CacheSubnetGroup
+              metadata:
+                name: ac6-subnet
+                namespace: elasticachesubnetgroup
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-7: happy-path: deletion-policy delete
+    # spec.deletionPolicy: delete propagates to ACK annotation.
+    - name: ac7-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac7-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac7-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac7-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac7-cfg
+                deletionPolicy: "delete"
+                subnetIDs:
+                  - subnet-hhh
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: CacheSubnetGroup
+              metadata:
+                name: ac7-subnet
+                namespace: elasticachesubnetgroup
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-8: negative: empty-subnets advisory
+    # subnetIDs=[] → advisory ConfigMap created; ACK CacheSubnetGroup not created.
+    - name: ac8-empty-subnets-negative
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac8-cfg
+                namespace: elasticachesubnetgroup
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac8-cfg -n elasticachesubnetgroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheSubnetGroup
+              metadata:
+                name: ac8-subnet
+                namespace: elasticachesubnetgroup
+              spec:
+                configRef: ac8-cfg
+                subnetIDs: []
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac8-subnet-empty-subnets-error
+                namespace: elasticachesubnetgroup
+        - script:
+            timeout: 60s
+            content: |
+              sleep 5
+              COUNT=$(kubectl get cachesubnetgroup ac8-subnet -n elasticachesubnetgroup --ignore-not-found 2>/dev/null | wc -l)
+              echo "CacheSubnetGroup count: $COUNT"
+              test "$COUNT" -eq 0
