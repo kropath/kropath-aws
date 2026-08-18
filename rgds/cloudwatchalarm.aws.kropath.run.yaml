@@ -1,0 +1,312 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# CloudWatchAlarm RGD — wraps ACK cloudwatch.services.k8s.aws/MetricAlarm.
+# Supports three mutually exclusive alarm types: simple metric, metric math,
+# and PromQL (evaluationCriteria). Governance: actionsEnabled and
+# treatMissingData cascade from CloudWatchConfig (mandatory → instance → defaults).
+# Tags: ACK MetricAlarm spec.tags is {key,value} list format (not map).
+# ACK identifier field: spec.name (NOT spec.alarmName).
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cloudwatchalarm.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: CloudWatchAlarm
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Alarm description
+      alarmDescription: string | default=""
+      # actionsEnabled — boolean pointer (nil != false); NO default.
+      # nil = fall through to CloudWatchConfig cascade → RGD built-in true.
+      actionsEnabled: boolean
+      # Alarm action ARNs (max 5 each)
+      alarmActions: "[]string | default=[]"
+      okActions: "[]string | default=[]"
+      insufficientDataActions: "[]string | default=[]"
+      # Evaluation configuration (non-PromQL)
+      comparisonOperator: string | default=""
+      # 0 = not set (falls through to API requirement for non-PromQL alarms)
+      evaluationPeriods: integer | default=0
+      datapointsToAlarm: integer | default=0
+      # "" = fall through to CloudWatchConfig cascade → RGD built-in "missing"
+      treatMissingData: string | default=""
+      # Simple metric alarm fields
+      metricName: string | default=""
+      namespace: string | default=""
+      statistic: string | default=""
+      extendedStatistic: string | default=""
+      dimensions: "[]AlarmDimension | default=[]"
+      # 0 = not set
+      period: integer | default=0
+      unit: string | default=""
+      # 0 = not set (use 0 explicitly for zero-threshold alarms)
+      threshold: float | default=0
+      # Metric math alarm fields
+      metrics: "[]MetricDataQuery | default=[]"
+      thresholdMetricID: string | default=""
+      # PromQL alarm fields
+      evaluationCriteria:
+        promQLCriteria:
+          query: string | default=""
+          pendingPeriod: integer | default=0
+          recoveryPeriod: integer | default=0
+      # 0 = not set (required for PromQL alarms)
+      evaluationInterval: integer | default=0
+      # Evaluation window — wallClockWindow.timezone="" = not set (use sliding window default)
+      evaluationWindow:
+        wallClockWindow:
+          timezone: string | default=""
+      # Percentile alarm configuration
+      evaluateLowSampleCountPercentile: string | default=""
+    types:
+      AlarmDimension:
+        name: string | default=""
+        value: string | default=""
+      MetricDataQuery:
+        id: string | default=""
+        expression: string | default=""
+        label: string | default=""
+        returnData: boolean | default=false
+        period: integer | default=0
+        accountID: string | default=""
+        metricStat:
+          metric:
+            metricName: string | default=""
+            namespace: string | default=""
+          period: integer | default=0
+          stat: string | default=""
+          unit: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && !naming.data.effectiveName.contains("{") && naming.data.effectiveName != ""
+          ? "arn:aws:cloudwatch:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":alarm:" + naming.data.effectiveName
+          : ""}
+      conditions: >-
+        ${ackMetricAlarm.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudWatchConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap materialising effectiveName with full {tag.X} dynamic substitution support.
+    # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+    # Any {tag.X} token whose key is absent in all tiers is kept verbatim so that
+    # namingStatus (computed in status block) reports "invalid-unresolved-tokens".
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # ACK CloudWatch MetricAlarm CR — primary cloud resource.
+    # Only created when namingStatus is valid (effectiveName has no unresolved tokens).
+    - id: ackMetricAlarm
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+        kind: MetricAlarm
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource name — effectiveName, not metadata.name (KRO-349: spec.name not spec.alarmName)
+          name: ${naming.data.effectiveName}
+          # Alarm description
+          alarmDescription: ${schema.spec.alarmDescription}
+          # actionsEnabled governance: mandatory → instance → defaults → RGD built-in true.
+          # actionsEnabled is a boolean pointer — nil vs false is semantically distinct.
+          actionsEnabled: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.actionsEnabled))
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.actionsEnabled
+              : (has(schema.spec.actionsEnabled)
+                  ? schema.spec.actionsEnabled
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.actionsEnabled))
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.actionsEnabled
+                      : true))}
+          # Alarm action ARNs (passed through; ACK will set actions on alarm state transitions)
+          alarmActions: ${schema.spec.alarmActions}
+          # oKActions: note ACK uses capital K (camelCase per CloudWatch API)
+          oKActions: ${schema.spec.okActions}
+          insufficientDataActions: ${schema.spec.insufficientDataActions}
+          # Evaluation configuration
+          comparisonOperator: ${schema.spec.comparisonOperator}
+          evaluationPeriods: ${schema.spec.evaluationPeriods}
+          datapointsToAlarm: ${schema.spec.datapointsToAlarm}
+          # treatMissingData governance: mandatory → instance → defaults → RGD built-in "missing"
+          treatMissingData: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?treatMissingData.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.treatMissingData
+              : (schema.spec.treatMissingData != ""
+                  ? schema.spec.treatMissingData
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?treatMissingData.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.treatMissingData
+                      : "missing"))}
+          # Simple metric alarm fields
+          metricName: ${schema.spec.metricName}
+          namespace: ${schema.spec.namespace}
+          statistic: ${schema.spec.statistic}
+          extendedStatistic: ${schema.spec.extendedStatistic}
+          # Dimensions: pass through as {name, value} array (ACK native format)
+          dimensions: >-
+            ${schema.spec.dimensions.map(d, {"name": d.name, "value": d.value})}
+          period: ${schema.spec.period}
+          unit: ${schema.spec.unit}
+          threshold: ${schema.spec.threshold}
+          # Metric math alarm fields
+          metrics: >-
+            ${schema.spec.metrics.map(m, {
+              "id": m.id,
+              "expression": m.expression,
+              "label": m.label,
+              "returnData": m.returnData,
+              "period": m.period,
+              "accountID": m.accountID,
+              "metricStat": {
+                "metric": {
+                  "metricName": m.metricStat.metric.metricName,
+                  "namespace": m.metricStat.metric.namespace
+                },
+                "period": m.metricStat.period,
+                "stat": m.metricStat.stat,
+                "unit": m.metricStat.unit
+              }
+            })}
+          thresholdMetricID: ${schema.spec.thresholdMetricID}
+          # PromQL alarm fields
+          evaluationCriteria:
+            promQLCriteria:
+              query: ${schema.spec.evaluationCriteria.promQLCriteria.query}
+              pendingPeriod: ${schema.spec.evaluationCriteria.promQLCriteria.pendingPeriod}
+              recoveryPeriod: ${schema.spec.evaluationCriteria.promQLCriteria.recoveryPeriod}
+          evaluationInterval: ${schema.spec.evaluationInterval}
+          # Evaluation window: wallClockWindow.timezone="" = not set (ACK uses sliding window by default)
+          evaluationWindow:
+            wallClockWindow:
+              timezone: ${schema.spec.evaluationWindow.wallClockWindow.timezone}
+          # Percentile configuration
+          evaluateLowSampleCountPercentile: ${schema.spec.evaluateLowSampleCountPercentile}
+          # Cloud resource tags — ACK MetricAlarm uses {key,value} list format (not map).
+          # Merge order: defaults → spec → mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations are also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}

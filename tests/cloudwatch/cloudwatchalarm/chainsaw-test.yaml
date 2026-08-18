@@ -1,0 +1,1552 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named CloudWatchConfig + CloudWatchAlarm and
+# deletes nothing between steps, so no ACK finalizer ever blocks a delete and kro's
+# per-object-key backoff never compounds. Test-level skipDelete: true stops chainsaw's
+# end-of-test cascade delete; the ephemeral kind cluster is discarded after the suite.
+#
+# effectiveConfig injected via kubectl patch --subresource=status (controller pre-merges
+# all cascade layers; tests bypass the controller by patching status directly).
+#
+# Tag assertions use a script + jq pattern (order-independent) because ACK MetricAlarm
+# spec.tags is a {key,value} list whose iteration order is not guaranteed stable.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cloudwatchalarm
+spec:
+  skipDelete: true
+  namespace: cloudwatchalarm
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: Simple metric alarm — comparisonOperator, metricName, namespace, statistic,
+    # period, threshold pass through to ACK MetricAlarm spec.
+    - name: ac1-simple-metric-alarm-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac1-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac1-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac1-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac1-cfg
+                comparisonOperator: GreaterThanThreshold
+                metricName: CPUUtilization
+                namespace: AWS/EC2
+                statistic: Average
+                period: 300
+                threshold: 80
+                evaluationPeriods: 2
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac1-alarm
+                namespace: cloudwatchalarm
+              spec:
+                name: cloudwatchalarm-ac1-alarm
+                comparisonOperator: GreaterThanThreshold
+                metricName: CPUUtilization
+                namespace: AWS/EC2
+                statistic: Average
+                period: 300
+                threshold: 80
+                evaluationPeriods: 2
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac1-alarm
+                namespace: cloudwatchalarm
+              status:
+                resourceName: cloudwatchalarm-ac1-alarm
+                namingStatus: valid
+
+    # AC-2: treatMissingData default cascade — mandatory > instance > defaults > "missing".
+    # When instance does not set it and defaults.treatMissingData = "missing", ACK gets "missing".
+    - name: ac2-treat-missing-data-defaults-cascade
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac2-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  treatMissingData: "missing"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac2-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac2-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac2-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac2-alarm
+                namespace: cloudwatchalarm
+              spec:
+                treatMissingData: missing
+
+    # AC-3: treatMissingData mandatory wins over instance and defaults.
+    - name: ac3-treat-missing-data-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac3-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  treatMissingData: "breaching"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac3-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"breaching","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac3-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac3-cfg
+                treatMissingData: "notBreaching"
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac3-alarm
+                namespace: cloudwatchalarm
+              spec:
+                treatMissingData: breaching
+
+    # AC-4: treatMissingData instance value used when mandatory is unset and instance is set.
+    - name: ac4-treat-missing-data-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac4-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  treatMissingData: "missing"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac4-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac4-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac4-cfg
+                treatMissingData: "ignore"
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac4-alarm
+                namespace: cloudwatchalarm
+              spec:
+                treatMissingData: ignore
+
+    # AC-5: actionsEnabled boolean pointer cascade — mandatory true overrides instance and defaults.
+    - name: ac5-actions-enabled-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac5-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  actionsEnabled: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac5-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":true,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac5-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac5-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac5-alarm
+                namespace: cloudwatchalarm
+              spec:
+                actionsEnabled: true
+
+    # AC-6: actionsEnabled defaults to true (RGD built-in) when not set anywhere.
+    - name: ac6-actions-enabled-rg-builtin-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac6-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac6-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac6-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac6-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac6-alarm
+                namespace: cloudwatchalarm
+              spec:
+                actionsEnabled: true
+
+    # AC-7: alarmActions, okActions, insufficientDataActions pass through.
+    # Note ACK field name: oKActions (capital K).
+    - name: ac7-action-arns-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac7-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac7-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac7-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac7-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+                alarmActions:
+                  - arn:aws:sns:ap-southeast-2:123456789012:alarm-action
+                okActions:
+                  - arn:aws:sns:ap-southeast-2:123456789012:ok-action
+                insufficientDataActions:
+                  - arn:aws:sns:ap-southeast-2:123456789012:insufficient-action
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac7-alarm
+                namespace: cloudwatchalarm
+              spec:
+                alarmActions:
+                  - arn:aws:sns:ap-southeast-2:123456789012:alarm-action
+                oKActions:
+                  - arn:aws:sns:ap-southeast-2:123456789012:ok-action
+                insufficientDataActions:
+                  - arn:aws:sns:ap-southeast-2:123456789012:insufficient-action
+
+    # AC-8: alarmDescription pass-through.
+    - name: ac8-alarm-description-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac8-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac8-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac8-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac8-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+                alarmDescription: "High CPU utilization alert"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac8-alarm
+                namespace: cloudwatchalarm
+              spec:
+                alarmDescription: "High CPU utilization alert"
+
+    # AC-9: dimensions pass through as {name,value} array.
+    - name: ac9-dimensions-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac9-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac9-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac9-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac9-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+                metricName: CPUUtilization
+                namespace: AWS/EC2
+                dimensions:
+                  - name: InstanceId
+                    value: i-1234567890abcdef0
+                  - name: AutoScalingGroupName
+                    value: my-asg
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac9-alarm
+                namespace: cloudwatchalarm
+              spec:
+                dimensions:
+                  - name: InstanceId
+                    value: i-1234567890abcdef0
+                  - name: AutoScalingGroupName
+                    value: my-asg
+
+    # AC-10: datapointsToAlarm and evaluateLowSampleCountPercentile pass-through.
+    - name: ac10-percentile-and-datapoints-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac10-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac10-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac10-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac10-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 5
+                datapointsToAlarm: 3
+                evaluateLowSampleCountPercentile: evaluate
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac10-alarm
+                namespace: cloudwatchalarm
+              spec:
+                datapointsToAlarm: 3
+                evaluateLowSampleCountPercentile: evaluate
+
+    # AC-11: nameOverride takes precedence over namingTemplate.
+    - name: ac11-name-override-takes-precedence
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac11-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac11-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac11-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac11-cfg
+                nameOverride: my-custom-alarm-name
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac11-alarm
+                namespace: cloudwatchalarm
+              spec:
+                name: my-custom-alarm-name
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac11-alarm
+                namespace: cloudwatchalarm
+              status:
+                resourceName: my-custom-alarm-name
+
+    # AC-12: Naming: mandatory.namingTemplate overrides defaults.namingTemplate.
+    - name: ac12-mandatory-naming-template-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac12-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "mandatory-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac12-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"mandatory-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac12-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac12-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac12-alarm
+                namespace: cloudwatchalarm
+              spec:
+                name: mandatory-ac12-alarm
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac12-alarm
+                namespace: cloudwatchalarm
+              status:
+                resourceName: mandatory-ac12-alarm
+                namingStatus: valid
+
+    # AC-13: Naming: {account_id} and {region} tokens resolved from aws config.
+    - name: ac13-naming-account-region-tokens
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac13-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{account_id}-{region}-alarm"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac13-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{account_id}-{region}-alarm","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac13-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac13-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac13-alarm
+                namespace: cloudwatchalarm
+              spec:
+                name: 123456789012-ap-southeast-2-alarm
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac13-alarm
+                namespace: cloudwatchalarm
+              status:
+                resourceName: 123456789012-ap-southeast-2-alarm
+
+    # AC-14: Naming: {tag.X} token resolved from instance spec.tags.
+    - name: ac14-naming-tag-token-from-spec
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac14-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "alarm-{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac14-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"alarm-{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac14-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac14-cfg
+                tags:
+                  env: prod
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac14-alarm
+                namespace: cloudwatchalarm
+              status:
+                resourceName: alarm-prod-ac14-alarm
+                namingStatus: valid
+
+    # AC-15: Naming: unresolved {tag.X} → namingStatus = invalid-unresolved-tokens,
+    # ackMetricAlarm is NOT created (includeWhen guard on effectiveName containing "{").
+    - name: ac15-unresolved-tag-token-blocks-acr-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac15-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                defaults:
+                  namingTemplate: "alarm-{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac15-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"alarm-{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac15-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac15-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac15-alarm
+                namespace: cloudwatchalarm
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              COUNT=$(kubectl get metricalarm ac15-alarm -n cloudwatchalarm 2>&1 | grep -c "not found" || true)
+              if [ "$COUNT" -lt 1 ]; then
+                echo "ERROR: MetricAlarm should NOT exist when naming has unresolved tokens"
+                exit 1
+              fi
+              echo "Confirmed: MetricAlarm not created for ac15-alarm (unresolved token)"
+
+    # AC-16: predictedArn is built from effectiveName and aws config (not metadata.name).
+    - name: ac16-predicted-arn-from-effective-name
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac16-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac16-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac16-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac16-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac16-alarm
+                namespace: cloudwatchalarm
+              status:
+                predictedArn: "arn:aws:cloudwatch:ap-southeast-2:123456789012:alarm:cloudwatchalarm-ac16-alarm"
+
+    # AC-17: ACK MetricAlarm spec.name = effectiveName (not metadata.name).
+    - name: ac17-ack-spec-name-is-effective-name
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac17-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "custom-{name}-alarm"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac17-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"custom-{name}-alarm","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac17-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac17-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac17-alarm
+                namespace: cloudwatchalarm
+              spec:
+                name: custom-ac17-alarm-alarm
+
+    # AC-18: Cloud tags merge: mandatory.tags wins over spec.tags (which wins over defaults.tags).
+    # Uses jq script for order-independent list assertion.
+    - name: ac18-tags-mandatory-wins-over-spec
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac18-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac18-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{"env":"prod-override"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{"cost-center":"default-cc"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac18-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac18-cfg
+                tags:
+                  env: dev-attempt
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac18-alarm
+                namespace: cloudwatchalarm
+        - script:
+            content: |
+              TAGS=$(kubectl get metricalarm ac18-alarm -n cloudwatchalarm -o json | jq -r '.spec.tags')
+              echo "Tags: $TAGS"
+              ENV_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "env") | .value')
+              CC_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "cost-center") | .value')
+              if [ "$ENV_VAL" != "prod-override" ]; then
+                echo "ERROR: expected env=prod-override (mandatory wins), got: $ENV_VAL"
+                exit 1
+              fi
+              if [ "$CC_VAL" != "default-cc" ]; then
+                echo "ERROR: expected cost-center=default-cc (from defaults), got: $CC_VAL"
+                exit 1
+              fi
+              echo "PASS: tag merge order correct (mandatory wins over spec, defaults present)"
+
+    # AC-19: syncedLabels written to K8s metadata.labels (prefixed aws.kropath.run/) AND
+    # cloud tags (plain key, no prefix). Mandatory syncedLabels override defaults.
+    - name: ac19-synced-labels-dual-write
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac19-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac19-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{"team":"platform"},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac19-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac19-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac19-alarm
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/team: platform
+        - script:
+            content: |
+              TAGS=$(kubectl get metricalarm ac19-alarm -n cloudwatchalarm -o json | jq -r '.spec.tags')
+              TEAM_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "team") | .value')
+              if [ "$TEAM_VAL" != "platform" ]; then
+                echo "ERROR: expected cloud tag team=platform (plain key, no prefix), got: $TEAM_VAL"
+                exit 1
+              fi
+              echo "PASS: syncedLabel team=platform written to both K8s labels (prefixed) and cloud tags (plain)"
+
+    # AC-20: syncedAnnotations written to K8s metadata.annotations (prefixed aws.kropath.run/).
+    - name: ac20-synced-annotations-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac20-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac20-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"sre-team"}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac20-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac20-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac20-alarm
+                namespace: cloudwatchalarm
+                annotations:
+                  aws.kropath.run/owner: sre-team
+
+    # AC-21: deletionPolicy=retain → services.k8s.aws/deletion-policy: retain annotation.
+    - name: ac21-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac21-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac21-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac21-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac21-cfg
+                deletionPolicy: retain
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac21-alarm
+                namespace: cloudwatchalarm
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-22: deletionPolicy=delete → services.k8s.aws/deletion-policy: delete annotation.
+    - name: ac22-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac22-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac22-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac22-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac22-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac22-cfg
+                deletionPolicy: delete
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac22-alarm
+                namespace: cloudwatchalarm
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-23: K8s child metadata.name = schema.metadata.name (not effectiveName).
+    # effectiveName only goes to spec.name (cloud resource name).
+    - name: ac23-k8s-name-is-schema-name
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac23-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac23-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "very-different-cloud-name"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac23-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"very-different-cloud-name","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac23-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac23-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac23-alarm
+                namespace: cloudwatchalarm
+              spec:
+                name: very-different-cloud-name
+
+    # AC-24: Metric math alarm — spec.metrics array with thresholdMetricID pass-through.
+    - name: ac24-metric-math-alarm
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac24-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac24-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac24-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac24-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac24-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+                threshold: 100
+                thresholdMetricID: rate
+                metrics:
+                  - id: requests
+                    returnData: false
+                    metricStat:
+                      metric:
+                        metricName: RequestCount
+                        namespace: AWS/ApplicationELB
+                      period: 60
+                      stat: Sum
+                  - id: errors
+                    returnData: false
+                    metricStat:
+                      metric:
+                        metricName: HTTPCode_ELB_5XX_Count
+                        namespace: AWS/ApplicationELB
+                      period: 60
+                      stat: Sum
+                  - id: rate
+                    returnData: true
+                    expression: "errors / requests * 100"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac24-alarm
+                namespace: cloudwatchalarm
+              spec:
+                thresholdMetricID: rate
+
+    # AC-25: PromQL alarm — evaluationCriteria.promQLCriteria pass-through.
+    - name: ac25-promql-alarm
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac25-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac25-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac25-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac25-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac25-cfg
+                evaluationInterval: 60
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+                evaluationCriteria:
+                  promQLCriteria:
+                    query: "rate(http_requests_total[5m]) > 100"
+                    pendingPeriod: 300
+                    recoveryPeriod: 600
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac25-alarm
+                namespace: cloudwatchalarm
+              spec:
+                evaluationInterval: 60
+                evaluationCriteria:
+                  promQLCriteria:
+                    query: "rate(http_requests_total[5m]) > 100"
+                    pendingPeriod: 300
+                    recoveryPeriod: 600
+
+    # AC-26: evaluationWindow.wallClockWindow.timezone pass-through.
+    - name: ac26-evaluation-window-timezone
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac26-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac26-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac26-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac26-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac26-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+                evaluationWindow:
+                  wallClockWindow:
+                    timezone: America/New_York
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac26-alarm
+                namespace: cloudwatchalarm
+              spec:
+                evaluationWindow:
+                  wallClockWindow:
+                    timezone: America/New_York
+
+    # AC-27: configRef references a non-default named config (not just "general-policy").
+    - name: ac27-custom-config-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac27-special-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac27-special-cfg
+              spec:
+                mandatory:
+                  treatMissingData: "notBreaching"
+                defaults:
+                  namingTemplate: "special-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac27-special-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"notBreaching","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"special-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac27-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac27-special-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac27-alarm
+                namespace: cloudwatchalarm
+              spec:
+                name: special-ac27-alarm
+                treatMissingData: notBreaching
+
+    # AC-28: actionsEnabled=false set explicitly at instance level overrides built-in default.
+    - name: ac28-actions-enabled-false-instance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac28-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac28-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac28-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac28-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac28-cfg
+                actionsEnabled: false
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac28-alarm
+                namespace: cloudwatchalarm
+              spec:
+                actionsEnabled: false
+
+    # Spec AC-6: all treatMissingData tiers empty → RGD built-in default "missing".
+    # No mandatory, no instance, no defaults value — cascade falls through to built-in.
+    - name: ac29-treat-missing-data-builtin-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac29-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac29-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac29-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac29-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac29-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac29-alarm
+                namespace: cloudwatchalarm
+              spec:
+                treatMissingData: missing
+
+    # Spec AC-9: extendedStatistic "p99" — statistic field must not be set.
+    - name: ac30-extended-statistic-alarm
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac30-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac30-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac30-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac30-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac30-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+                metricName: Latency
+                namespace: AWS/ELB
+                extendedStatistic: "p99"
+                period: 60
+                threshold: 200
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac30-alarm
+                namespace: cloudwatchalarm
+              spec:
+                extendedStatistic: "p99"
+                metricName: Latency
+                namespace: AWS/ELB
+
+    # Spec AC-11: anomaly detection alarm — ANOMALY_DETECTION_BAND metric math,
+    # thresholdMetricID set, spec.threshold must NOT be present.
+    - name: ac31-anomaly-detection-alarm
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac31-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac31-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac31-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac31-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac31-cfg
+                comparisonOperator: LessThanLowerOrGreaterThanUpperThreshold
+                evaluationPeriods: 2
+                thresholdMetricID: ad1
+                metrics:
+                  - id: m1
+                    returnData: false
+                    metricStat:
+                      metric:
+                        metricName: CPUUtilization
+                        namespace: AWS/EC2
+                      period: 300
+                      stat: Average
+                  - id: ad1
+                    returnData: true
+                    expression: "ANOMALY_DETECTION_BAND(m1, 2)"
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac31-alarm
+                namespace: cloudwatchalarm
+              spec:
+                thresholdMetricID: ad1
+                comparisonOperator: LessThanLowerOrGreaterThanUpperThreshold
+
+    # Spec AC-14: all alarm action arrays absent/empty → no action fields on ACK MetricAlarm.
+    - name: ac32-alarm-actions-none
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchConfig
+              metadata:
+                name: ac32-cfg
+                namespace: cloudwatchalarm
+                labels:
+                  aws.kropath.run/resource-name: ac32-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudwatchconfig ac32-cfg -n cloudwatchalarm \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"actionsEnabled":null,"treatMissingData":"","outputFormat":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"actionsEnabled":null,"treatMissingData":"missing","outputFormat":"json","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchAlarm
+              metadata:
+                name: ac32-alarm
+                namespace: cloudwatchalarm
+              spec:
+                configRef: ac32-cfg
+                comparisonOperator: GreaterThanThreshold
+                evaluationPeriods: 1
+        - assert:
+            resource:
+              apiVersion: cloudwatch.services.k8s.aws/v1alpha1
+              kind: MetricAlarm
+              metadata:
+                name: ac32-alarm
+                namespace: cloudwatchalarm
+        - script:
+            content: |
+              alarm=$(kubectl get metricalarm ac32-alarm -n cloudwatchalarm -o json)
+              for field in alarmActions oKActions insufficientDataActions; do
+                count=$(echo "$alarm" | jq -r ".spec.${field} // [] | length")
+                if [ "$count" != "0" ]; then
+                  echo "ERROR: $field should be absent or empty, got count=$count"
+                  exit 1
+                fi
+              done
+              echo "OK: no alarm action fields set on ACK MetricAlarm"
