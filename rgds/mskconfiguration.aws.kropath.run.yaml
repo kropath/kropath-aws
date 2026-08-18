@@ -1,0 +1,166 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# MSKConfiguration RGD — wraps ACK kafka.services.k8s.aws/Configuration.
+# Naming via namingTemplate from MSKConfig effectiveConfig (only field consumed).
+# No cloud tags (G-17: ACK Configuration CRD has no spec.tags field).
+# No predictedArn (Configuration ARN includes non-deterministic UUID/revision component).
+# serverProperties: callers supply plain-text Java properties; bytes() satisfies kro's
+# type checker for the ACK format:byte field; kro base64-encodes at write time.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: mskconfiguration.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: MSKConfiguration
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      serverProperties: string | default=""
+      description: string | default=""
+      kafkaVersions: "[]string | default=[]"
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      configurationArn: >-
+        ${configuration.?status.?ackResourceMetadata.?arn.orValue("")}
+      latestRevision: >-
+        ${configuration.?status.?latestRevision.?revision.orValue(0)}
+      conditions: >-
+        ${configuration.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    # Config lookup via labelSelector (Theme 28 / KRO-221).
+    # CEL expressions in externalRef.metadata.name are NOT evaluated — always use selector.matchLabels.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: MSKConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — computes effectiveName and namingStatus so the status block can
+    # reference them (status fields cannot reference schema.* directly).
+    # {tag.*} tokens always resolve to "" for MSKConfiguration (no mergedTags source — G-17).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: mskconfiguration-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ("" + (size(part.split("}")) > 1
+                    ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                    : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : schema.metadata.name))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ("" + (size(part.split("}")) > 1
+                    ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                    : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK Configuration CR — not created when naming is invalid (unresolved tokens).
+    - id: configuration
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+      template:
+        apiVersion: kafka.services.k8s.aws/v1alpha1
+        kind: Configuration
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{
+              "app.kubernetes.io/managed-by": "kro",
+              "app.kubernetes.io/instance": schema.metadata.name
+            }}
+          annotations: >-
+            ${{
+              "services.k8s.aws/deletion-policy": schema.spec.deletionPolicy
+            }}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfiguration
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          serverProperties: ${bytes(schema.spec.serverProperties)}
+          description: "${schema.spec.description}"
+          kafkaVersions: >-
+            ${schema.spec.kafkaVersions}
