@@ -1,0 +1,190 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# EFSMountTarget RGD — wraps ACK efs.services.k8s.aws/MountTarget.
+# Naming exemption: MountTarget has no provider name field.
+# Tag limitation G-5: ACK MountTarget does not support spec.tags — tags/syncedLabels/syncedAnnotations
+# are accepted in the kro schema (for K8s metadata label governance) but NOT passed to ACK spec.
+# File system reference: either fileSystemRef (kro EFSFileSystem CR) or fileSystemId (raw AWS ID).
+# subnetId: required — mount target cannot be created without a subnet.
+# securityGroups: validated by ACK at up to 5; advisory error via ConfigMap when > 5.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: efsmounttarget.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: EFSMountTarget
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      # tags/syncedLabels/syncedAnnotations: stored in K8s metadata labels/annotations only.
+      # NOT passed to ACK spec.tags — ACK MountTarget does not support direct tagging (G-5).
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # File system reference — exactly one of fileSystemRef or fileSystemId must be set.
+      fileSystemRef:
+        name: string | default=""
+      fileSystemId: string | default=""
+
+      # subnetId is required — no default sentinel; consumers must set this.
+      subnetId: string | default=""
+
+      # ipAddress: optional static IP within the subnet CIDR.
+      ipAddress: string | default=""
+
+      # securityGroups: up to 5 VPC security group IDs.
+      securityGroups: "[]string"
+
+    status:
+      mountTargetId: >-
+        ${ackMountTarget.?status.?mountTargetID.orValue("")}
+      networkInterfaceId: >-
+        ${ackMountTarget.?status.?networkInterfaceID.orValue("")}
+      lifeCycleState: >-
+        ${ackMountTarget.?status.?lifeCycleState.orValue("")}
+      availabilityZoneId: >-
+        ${ackMountTarget.?status.?availabilityZoneID.orValue("")}
+      availabilityZoneName: >-
+        ${ackMountTarget.?status.?availabilityZoneName.orValue("")}
+      conditions: >-
+        ${ackMountTarget.?status.?conditions.orValue([])}
+      validationError: >-
+        ${(mutualExclusionError.data.error != "" ? mutualExclusionError.data.error : "")
+          + (securityGroupCountError.data.error != "" ? securityGroupCountError.data.error : "")}
+
+    additionalPrinterColumns:
+      - name: MountTargetId
+        type: string
+        jsonPath: .status.mountTargetId
+      - name: LifeCycleState
+        type: string
+        jsonPath: .status.lifeCycleState
+
+  resources:
+    # Governance config lookup — syncedLabels/syncedAnnotations governance.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EFSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Parent EFSFileSystem lookup — sentinel selector when fileSystemRef.name is not set.
+    - id: parentFs
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EFSFileSystem
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: '${schema.spec.fileSystemRef.name != "" ? schema.spec.fileSystemRef.name : "kro-empty-fallback-sentinel"}'
+
+    # Mutual exclusion advisory — always created; data.error="" when condition is false.
+    # Using a sentinel ConfigMap (no includeWhen) because kro removes excluded template
+    # resource variables from the CEL context, causing any status expression that references
+    # them to fail silently and leave the field unwritten.
+    - id: mutualExclusionError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.fileSystemRef.name != "" && schema.spec.fileSystemId != ""
+              ? "fileSystemRef.name and fileSystemId are mutually exclusive — set exactly one"
+              : ""}
+
+    # Security group count advisory — always created; data.error="" when condition is false.
+    - id: securityGroupCountError
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-sg-count-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.?securityGroups.orValue([]).size() > 5
+              ? "securityGroups must contain at most 5 entries"
+              : ""}
+
+    # ACK EFS MountTarget CR.
+    # Tags NOT included in spec (G-5: ACK MountTarget does not support spec.tags).
+    - id: ackMountTarget
+      template:
+        apiVersion: efs.services.k8s.aws/v1alpha1
+        kind: MountTarget
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # fileSystemID: resolved from fileSystemRef (kro EFSFileSystem status) or direct fileSystemId.
+          fileSystemID: >-
+            ${schema.spec.fileSystemRef.name != "" && parentFs.size() > 0
+              ? parentFs[0].status.fileSystemId
+              : schema.spec.fileSystemId}
+          # subnetID: required; empty string creates an invalid ACK resource (ACK will reject).
+          subnetID: ${schema.spec.subnetId}
+          # ipAddress: optional; "" = AWS auto-assigns an IP within the subnet.
+          ipAddress: ${schema.spec.ipAddress}
+          # securityGroups: pass-through (ACK enforces max 5 at its CRD level).
+          securityGroups: ${schema.spec.?securityGroups.orValue([])}
