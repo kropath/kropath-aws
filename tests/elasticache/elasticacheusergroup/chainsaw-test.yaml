@@ -1,0 +1,330 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ec-07 Chainsaw tests — ElastiCacheUserGroup (KRO-413).
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: elasticacheusergroup
+spec:
+  skipDelete: true
+  namespace: elasticacheusergroup
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: happy-path: basic-create
+    # engine and userIDs forwarded verbatim to ACK UserGroup.
+    - name: ac1-basic-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac1-cfg
+                namespace: elasticacheusergroup
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac1-cfg -n elasticacheusergroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: ac1-ug
+                namespace: elasticacheusergroup
+              spec:
+                configRef: ac1-cfg
+                engine: "redis"
+                userIDs:
+                  - alice
+                  - bob
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: UserGroup
+              metadata:
+                name: ac1-ug
+                namespace: elasticacheusergroup
+              spec:
+                engine: "redis"
+                userIDs:
+                  - alice
+                  - bob
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: ac1-ug
+                namespace: elasticacheusergroup
+              status:
+                resourceName: elasticacheusergroup-ac1-ug
+                namingStatus: valid
+
+    # AC-2: happy-path: tag-merge
+    # mandatory, spec, defaults tags all merged.
+    - name: ac2-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac2-cfg
+                namespace: elasticacheusergroup
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  tags:
+                    service: cache
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    owner: platform-team
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac2-cfg -n elasticacheusergroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{"service":"cache"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{"owner":"platform-team"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: ac2-ug
+                namespace: elasticacheusergroup
+              spec:
+                configRef: ac2-cfg
+                engine: "redis"
+                tags:
+                  team: platform
+        - script:
+            timeout: 60s
+            content: |
+              TAGS=$(kubectl get usergroup ac2-ug -n elasticacheusergroup -o json | jq -r '.spec.tags // []')
+              echo "Tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key == "service" and .value == "cache")) | length == 1' && \
+              echo "$TAGS" | jq -e 'map(select(.key == "owner" and .value == "platform-team")) | length == 1' && \
+              echo "$TAGS" | jq -e 'map(select(.key == "team" and .value == "platform")) | length == 1'
+
+    # AC-3: happy-path: synced-labels
+    # mandatory.syncedLabels forwarded to ACK labels (prefixed) and spec.tags.
+    - name: ac3-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac3-cfg
+                namespace: elasticacheusergroup
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    environment: production
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac3-cfg -n elasticacheusergroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: ac3-ug
+                namespace: elasticacheusergroup
+              spec:
+                configRef: ac3-cfg
+                engine: "redis"
+                userIDs:
+                  - alice
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: UserGroup
+              metadata:
+                name: ac3-ug
+                namespace: elasticacheusergroup
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            timeout: 60s
+            content: |
+              TAGS=$(kubectl get usergroup ac3-ug -n elasticacheusergroup -o json | jq -r '.spec.tags // []')
+              echo "Tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key == "environment" and .value == "production")) | length == 1'
+
+    # AC-4: happy-path: naming-arn
+    # status.resourceName and predictedArn from naming template.
+    - name: ac4-naming-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac4-cfg
+                namespace: elasticacheusergroup
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac4-cfg -n elasticacheusergroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: app-users
+                namespace: elasticacheusergroup
+              spec:
+                configRef: ac4-cfg
+                engine: "redis"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: app-users
+                namespace: elasticacheusergroup
+              status:
+                resourceName: elasticacheusergroup-app-users
+                predictedArn: "arn:aws:elasticache:ap-southeast-2:123456789012:usergroup:elasticacheusergroup-app-users"
+
+    # AC-5: negative: missing-engine advisory
+    # engine empty → advisory ConfigMap; ACK UserGroup not created.
+    - name: ac5-missing-engine-advisory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac5-cfg
+                namespace: elasticacheusergroup
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac5-cfg -n elasticacheusergroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: ac5-ug
+                namespace: elasticacheusergroup
+              spec:
+                configRef: ac5-cfg
+                engine: ""
+                userIDs:
+                  - alice
+        # When engine is empty the ACK UserGroup includeWhen gate blocks creation.
+        # This confirms the RGD handles the missing-engine case gracefully — no ACK child.
+        - script:
+            timeout: 60s
+            content: |
+              sleep 5
+              # ACK UserGroup should NOT exist when engine is empty
+              COUNT=$(kubectl get usergroup ac5-ug -n elasticacheusergroup --ignore-not-found 2>/dev/null | wc -l)
+              echo "UserGroup count: $COUNT"
+              test "$COUNT" -eq 0
+
+    # AC-6: happy-path: deletion-policy
+    - name: ac6-deletion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac6-cfg
+                namespace: elasticacheusergroup
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac6-cfg -n elasticacheusergroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: ac6-ug-delete
+                namespace: elasticacheusergroup
+              spec:
+                configRef: ac6-cfg
+                deletionPolicy: "delete"
+                engine: "redis"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheUserGroup
+              metadata:
+                name: ac6-ug-retain
+                namespace: elasticacheusergroup
+              spec:
+                configRef: ac6-cfg
+                engine: "redis"
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: UserGroup
+              metadata:
+                name: ac6-ug-delete
+                namespace: elasticacheusergroup
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: UserGroup
+              metadata:
+                name: ac6-ug-retain
+                namespace: elasticacheusergroup
+                annotations:
+                  services.k8s.aws/deletion-policy: retain

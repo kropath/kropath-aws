@@ -1,0 +1,324 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ec-05 Chainsaw tests — ElastiCacheServerless (KRO-413).
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: elasticacheserverless
+spec:
+  skipDelete: true
+  namespace: elasticacheserverless
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1 + AC-2: happy-path: basic-create with usage-limits
+    # engine, cacheUsageLimits fields forwarded correctly.
+    - name: ac1-basic-create-usage-limits
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac1-cfg
+                namespace: elasticacheserverless
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac1-cfg -n elasticacheserverless \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: ac1-serverless
+                namespace: elasticacheserverless
+              spec:
+                configRef: ac1-cfg
+                engine: "valkey"
+                dataStorageMaximumGB: 100
+                ecpuPerSecondMaximum: 5000
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: ServerlessCache
+              metadata:
+                name: ac1-serverless
+                namespace: elasticacheserverless
+              spec:
+                engine: "valkey"
+                cacheUsageLimits:
+                  dataStorage:
+                    maximum: 100
+                    unit: Gigabytes
+                  eCPUPerSecond:
+                    maximum: 5000
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: ac1-serverless
+                namespace: elasticacheserverless
+              status:
+                resourceName: elasticacheserverless-ac1-serverless
+                namingStatus: valid
+
+    # AC-3: happy-path: tag-merge
+    # mandatory, spec, defaults tags all merged.
+    - name: ac3-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac3-cfg
+                namespace: elasticacheserverless
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  tags:
+                    service: cache
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    owner: platform-team
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac3-cfg -n elasticacheserverless \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{"service":"cache"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{"owner":"platform-team"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: ac3-serverless
+                namespace: elasticacheserverless
+              spec:
+                configRef: ac3-cfg
+                engine: "valkey"
+                tags:
+                  app: sessions
+        - script:
+            timeout: 60s
+            content: |
+              TAGS=$(kubectl get serverlesscache ac3-serverless -n elasticacheserverless -o json | jq -r '.spec.tags // []')
+              echo "Tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key == "service" and .value == "cache")) | length == 1' && \
+              echo "$TAGS" | jq -e 'map(select(.key == "owner" and .value == "platform-team")) | length == 1' && \
+              echo "$TAGS" | jq -e 'map(select(.key == "app" and .value == "sessions")) | length == 1'
+
+    # AC-5: happy-path: naming-arn
+    # status.resourceName and status.predictedArn derived correctly.
+    - name: ac5-naming-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac5-cfg
+                namespace: elasticacheserverless
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac5-cfg -n elasticacheserverless \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: sessions
+                namespace: elasticacheserverless
+              spec:
+                configRef: ac5-cfg
+                engine: "valkey"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: sessions
+                namespace: elasticacheserverless
+              status:
+                resourceName: elasticacheserverless-sessions
+                predictedArn: "arn:aws:elasticache:ap-southeast-2:123456789012:serverlesscache:elasticacheserverless-sessions"
+
+    # AC-6: happy-path: snapshot-governance
+    # mandatory.snapshotRetentionLimit: 5 raises instance value 2 to the floor.
+    - name: ac6-snapshot-governance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac6-cfg
+                namespace: elasticacheserverless
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  snapshotRetentionLimit: 5
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac6-cfg -n elasticacheserverless \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":5,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: ac6-serverless
+                namespace: elasticacheserverless
+              spec:
+                configRef: ac6-cfg
+                engine: "valkey"
+                snapshotRetentionLimit: 2
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: ServerlessCache
+              metadata:
+                name: ac6-serverless
+                namespace: elasticacheserverless
+              spec:
+                snapshotRetentionLimit: 5
+
+    # AC-7: happy-path: mandatory-engine
+    # mandatory.engine: "redis" overrides instance "valkey".
+    - name: ac7-mandatory-engine
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac7-cfg
+                namespace: elasticacheserverless
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory:
+                  engine: "redis"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac7-cfg -n elasticacheserverless \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"redis","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: ac7-serverless
+                namespace: elasticacheserverless
+              spec:
+                configRef: ac7-cfg
+                engine: "valkey"
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: ServerlessCache
+              metadata:
+                name: ac7-serverless
+                namespace: elasticacheserverless
+              spec:
+                engine: "redis"
+
+    # AC-11: happy-path: deletion-policy
+    # delete and retain propagate to ACK annotation.
+    - name: ac11-deletion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheConfig
+              metadata:
+                name: ac11-cfg
+                namespace: elasticacheserverless
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch elasticacheconfig ac11-cfg -n elasticacheserverless \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"atRestEncryptionEnabled":false,"transitEncryptionEnabled":false,"automaticFailoverEnabled":false,"multiAZEnabled":false,"engine":"","blockNoPasswordUsers":false,"snapshotRetentionLimit":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: ac11-serverless-delete
+                namespace: elasticacheserverless
+              spec:
+                configRef: ac11-cfg
+                engine: "valkey"
+                deletionPolicy: "delete"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ElastiCacheServerless
+              metadata:
+                name: ac11-serverless-retain
+                namespace: elasticacheserverless
+              spec:
+                configRef: ac11-cfg
+                engine: "valkey"
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: ServerlessCache
+              metadata:
+                name: ac11-serverless-delete
+                namespace: elasticacheserverless
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+        - assert:
+            resource:
+              apiVersion: elasticache.services.k8s.aws/v1alpha1
+              kind: ServerlessCache
+              metadata:
+                name: ac11-serverless-retain
+                namespace: elasticacheserverless
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
