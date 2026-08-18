@@ -1,0 +1,189 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# EFSAccessPoint RGD — wraps ACK efs.services.k8s.aws/AccessPoint.
+# Naming exemption: AccessPoint has no provider name field.
+# File system reference: either fileSystemRef (kro EFSFileSystem CR) or fileSystemId (raw ID).
+# Mutual exclusivity: validated via in-graph ConfigMap advisory pattern.
+# Immutability: rootDirectory is immutable once set — enforced by ACK CRD x-kubernetes-validations
+# (kro strips those from the kro-generated CRD; ACK's own CRD retains it).
+# posixUser: uid=0 and gid=0 both = "omit this field" sentinel; include only when uid/gid > 0.
+# rootDirectory: include only when rootDirectory.path != "".
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: efsaccesspoint.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: EFSAccessPoint
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # File system reference — exactly one of fileSystemRef or fileSystemId must be set.
+      # Mutual exclusivity is advisory via in-graph ConfigMap.
+      fileSystemRef:
+        name: string | default=""
+      fileSystemId: string | default=""
+
+      # POSIX user — uid=0 and gid=0 both signal "omit posixUser from ACK spec".
+      # secondaryGIDs is included only when posixUser is active.
+      posixUser:
+        uid: integer | default=0
+        gid: integer | default=0
+        secondaryGIDs: "[]integer"
+
+      # Root directory — path="" signals "omit rootDirectory from ACK spec".
+      # creationInfo is included only when rootDirectory.path is set.
+      rootDirectory:
+        path: string | default=""
+        creationInfo:
+          ownerUID: integer | default=0
+          ownerGID: integer | default=0
+          permissions: string | default=""
+
+    status:
+      accessPointId: >-
+        ${ackAccessPoint.?status.?accessPointID.orValue("")}
+      accessPointArn: >-
+        ${ackAccessPoint.?status.?ackResourceMetadata.?arn.orValue("")}
+      lifeCycleState: >-
+        ${ackAccessPoint.?status.?lifeCycleState.orValue("")}
+      conditions: >-
+        ${ackAccessPoint.?status.?conditions.orValue([])}
+      validationError: >-
+        ${has(mutualExclusionError.data) && has(mutualExclusionError.data.error) ? mutualExclusionError.data.error : ""}
+
+    additionalPrinterColumns:
+      - name: AccessPointId
+        type: string
+        jsonPath: .status.accessPointId
+      - name: LifeCycleState
+        type: string
+        jsonPath: .status.lifeCycleState
+
+  resources:
+    # Governance config lookup — tags/syncedLabels/syncedAnnotations governance only.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EFSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Parent EFSFileSystem lookup — sentinel selector when fileSystemRef.name is not set.
+    # Always bound as a list (may be empty when using fileSystemId directly).
+    - id: parentFs
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EFSFileSystem
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: '${schema.spec.fileSystemRef.name != "" ? schema.spec.fileSystemRef.name : "kro-empty-fallback-sentinel"}'
+
+    # Mutual exclusion advisory: fires when BOTH fileSystemRef.name and fileSystemId are set.
+    - id: mutualExclusionError
+      includeWhen:
+        - '${schema.spec.fileSystemRef.name != "" && schema.spec.fileSystemId != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "fileSystemRef.name and fileSystemId are mutually exclusive — set exactly one"
+
+    # ACK EFS AccessPoint CR.
+    - id: ackAccessPoint
+      template:
+        apiVersion: efs.services.k8s.aws/v1alpha1
+        kind: AccessPoint
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # fileSystemID: resolved from fileSystemRef (kro EFSFileSystem status) or direct fileSystemId.
+          # When fileSystemRef is used, parentFs list contains the referenced EFSFileSystem CR.
+          fileSystemID: >-
+            ${schema.spec.fileSystemRef.name != "" && parentFs.size() > 0
+              ? parentFs[0].status.fileSystemId
+              : schema.spec.fileSystemId}
+          # posixUser: include when uid > 0 or gid > 0; {} strips cleanly when both are 0.
+          # All three keys in one map literal (avoids merge of map(string,int) with map(string,list(int))).
+          # secondaryGIDs is an empty list [] by default — kro strips empty lists as zero values.
+          posixUser: >-
+            ${(schema.spec.posixUser.uid > 0 || schema.spec.posixUser.gid > 0)
+              ? {"uid": schema.spec.posixUser.uid, "gid": schema.spec.posixUser.gid, "secondaryGIDs": schema.spec.posixUser.secondaryGIDs}
+              : {}}
+          # rootDirectory: include when path is set; {} strips cleanly when path is "".
+          rootDirectory: >-
+            ${schema.spec.rootDirectory.path != ""
+              ? {"path": schema.spec.rootDirectory.path,
+                  "creationInfo": (schema.spec.rootDirectory.creationInfo.ownerUID > 0 || schema.spec.rootDirectory.creationInfo.ownerGID > 0 || schema.spec.rootDirectory.creationInfo.permissions != "")
+                    ? {"ownerUID": schema.spec.rootDirectory.creationInfo.ownerUID,
+                       "ownerGID": schema.spec.rootDirectory.creationInfo.ownerGID,
+                       "permissions": schema.spec.rootDirectory.creationInfo.permissions}
+                    : {}}
+              : {}}
+          # tags: merge order defaults → spec → mandatory (mandatory wins on key conflict).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
