@@ -1,0 +1,663 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# EFSMountTarget Chainsaw tests.
+# 15 ACs: 11 happy-path, 4 negative.
+# Canonical pattern: unique resource name per step, spec.skipDelete: true.
+#
+# G-5 tag limitation: ACK MountTarget does not support spec.tags.
+# Tags/syncedLabels/syncedAnnotations appear only in K8s metadata on the ACK CR,
+# not in the ACK MountTarget spec.
+# Advisory error pattern: mutual-exclusivity and securityGroup-count violations
+# surface via status.validationError (backed by in-graph ConfigMap resources).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: efsmounttarget
+spec:
+  skipDelete: true
+  namespace: efsmounttarget
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: fileSystemId provided directly → ACK MountTarget fileSystemID set.
+    - name: ac1-filesystem-id-direct
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac1-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac1-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac1-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac1-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60000
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac1-mt
+                namespace: efsmounttarget
+              spec:
+                fileSystemID: fs-0123456789abcdef0
+                subnetID: subnet-0a1b2c3d4e5f60000
+
+    # AC-2: fileSystemRef.name provided → ACK MountTarget fileSystemID resolved from EFSFileSystem status.
+    - name: ac2-filesystem-ref-lookup
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac2-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac2-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSFileSystem
+              metadata:
+                name: ac2-parent-fs
+                namespace: efsmounttarget
+                labels:
+                  app.kubernetes.io/instance: ac2-parent-fs
+              spec:
+                configRef: ac2-cfg
+        - script:
+            content: |
+              kubectl patch efsfilesystem ac2-parent-fs -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"fileSystemId":"fs-abcdef0123456789"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac2-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac2-cfg
+                fileSystemRef:
+                  name: ac2-parent-fs
+                subnetId: subnet-0a1b2c3d4e5f60001
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac2-mt
+                namespace: efsmounttarget
+              spec:
+                fileSystemID: fs-abcdef0123456789
+                subnetID: subnet-0a1b2c3d4e5f60001
+
+    # AC-3: subnetId propagates to ACK MountTarget subnetID.
+    # (Verified in AC-1; this step confirms with a distinct subnet ID.)
+    - name: ac3-subnet-id-propagated
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac3-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac3-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac3-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac3-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-custom-abc123
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac3-mt
+                namespace: efsmounttarget
+              spec:
+                subnetID: subnet-custom-abc123
+
+    # AC-4: ipAddress set → ACK MountTarget ipAddress set.
+    - name: ac4-ip-address-set
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac4-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac4-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac4-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac4-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60002
+                ipAddress: 10.0.1.42
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac4-mt
+                namespace: efsmounttarget
+              spec:
+                ipAddress: 10.0.1.42
+
+    # AC-5: ipAddress omitted → ACK MountTarget spec.ipAddress is empty (AWS auto-assigns).
+    - name: ac5-ip-address-omitted
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac5-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac5-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac5-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac5-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60003
+        - script:
+            content: |
+              # ipAddress should be empty string (AWS auto-assigns when "" or absent).
+              kubectl get mounttarget ac5-mt -n efsmounttarget -o json \
+                | jq -e '.spec.ipAddress == ""'
+
+    # AC-6: securityGroups provided → ACK MountTarget securityGroups set.
+    - name: ac6-security-groups-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac6-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac6-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac6-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac6-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60004
+                securityGroups:
+                  - sg-00000000000000001
+                  - sg-00000000000000002
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac6-mt
+                namespace: efsmounttarget
+              spec:
+                securityGroups:
+                  - sg-00000000000000001
+                  - sg-00000000000000002
+
+    # AC-7: tags NOT in ACK MountTarget spec (G-5 limitation).
+    # Tags provided in kro spec must NOT appear in ACK MountTarget spec.tags.
+    - name: ac7-tags-not-in-ack-spec
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac7-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  tags:
+                    env: test
+        - script:
+            content: |
+              kubectl patch efsconfig ac7-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{"env":"test"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac7-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac7-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60005
+                tags:
+                  env: test
+        - script:
+            content: |
+              # ACK MountTarget spec must NOT contain a 'tags' field (G-5 limitation).
+              kubectl get mounttarget ac7-mt -n efsmounttarget -o json \
+                | jq -e '.spec | has("tags") | not'
+
+    # AC-8: syncedLabels → K8s labels on ACK MountTarget with aws.kropath.run/ prefix.
+    - name: ac8-synced-labels-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac8-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    team: platform
+        - script:
+            content: |
+              kubectl patch efsconfig ac8-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{"team":"platform"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac8-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac8-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60006
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac8-mt
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/team: platform
+
+    # AC-9: syncedAnnotations → K8s annotations on ACK MountTarget with aws.kropath.run/ prefix.
+    - name: ac9-synced-annotations-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac9-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  syncedAnnotations:
+                    cost-center: cc-9999
+        - script:
+            content: |
+              kubectl patch efsconfig ac9-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-center":"cc-9999"}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac9-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac9-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60007
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac9-mt
+                namespace: efsmounttarget
+                annotations:
+                  aws.kropath.run/cost-center: cc-9999
+
+    # AC-10: ownerReferences set on ACK MountTarget CR.
+    - name: ac10-owner-references
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac10-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac10-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac10-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac10-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60008
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac10-mt
+                namespace: efsmounttarget
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: EFSMountTarget
+                    name: ac10-mt
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # AC-11: deletionPolicy annotation written to ACK MountTarget CR.
+    - name: ac11-deletion-policy-annotation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac11-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac11-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac11-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac11-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60009
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: MountTarget
+              metadata:
+                name: ac11-mt
+                namespace: efsmounttarget
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-12 (NEGATIVE): fileSystemRef.name and fileSystemId both set →
+    # status.validationError contains error message (mutual exclusion advisory).
+    - name: ac12-negative-mutual-exclusivity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac12-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac12-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac12-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac12-cfg
+                fileSystemRef:
+                  name: some-parent-fs
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60010
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac12-mt
+                namespace: efsmounttarget
+              status:
+                (validationError != ""): true
+
+    # AC-13 (NEGATIVE): securityGroups.size() > 5 → status.validationError contains error message.
+    - name: ac13-negative-security-groups-count-exceeded
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac13-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac13-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac13-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac13-cfg
+                fileSystemId: fs-0123456789abcdef0
+                subnetId: subnet-0a1b2c3d4e5f60011
+                securityGroups:
+                  - sg-00000000000000001
+                  - sg-00000000000000002
+                  - sg-00000000000000003
+                  - sg-00000000000000004
+                  - sg-00000000000000005
+                  - sg-00000000000000006
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac13-mt
+                namespace: efsmounttarget
+              status:
+                (validationError != ""): true
+
+    # AC-14 (NEGATIVE): subnetId empty → ACK MountTarget created with empty subnetID.
+    # Note: kro does not prevent creation when subnetId is empty (no advisory ConfigMap).
+    # ACK will reject the resource; this test documents the kro-level behavior (passthrough).
+    - name: ac14-negative-subnet-id-empty-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac14-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac14-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac14-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac14-cfg
+                fileSystemId: fs-0123456789abcdef0
+        - script:
+            content: |
+              # kro passes through an empty subnetId to ACK — ACK will reject with
+              # a validation error. Verify kro creates the ACK CR with empty subnetID.
+              kubectl get mounttarget ac14-mt -n efsmounttarget -o json \
+                | jq -e '.spec.subnetID == ""'
+
+    # AC-15 (NEGATIVE): neither fileSystemRef.name nor fileSystemId set →
+    # ACK MountTarget receives empty fileSystemID (ACK will reject).
+    # Tests that kro does not panic; advisory error is NOT emitted (only mutual-exclusion fires).
+    - name: ac15-negative-no-filesystem-source
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac15-cfg
+                namespace: efsmounttarget
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac15-cfg -n efsmounttarget \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSMountTarget
+              metadata:
+                name: ac15-mt
+                namespace: efsmounttarget
+              spec:
+                configRef: ac15-cfg
+                subnetId: subnet-0a1b2c3d4e5f60012
+        - script:
+            content: |
+              # When neither fileSystemRef.name nor fileSystemId is set, kro resolves
+              # fileSystemID to "" (empty string from spec.fileSystemId default).
+              # The ACK CR is created with an empty fileSystemID — ACK will reject it.
+              # Verify kro does not panic and produces the ACK CR.
+              kubectl get mounttarget ac15-mt -n efsmounttarget -o json \
+                | jq -e '.spec.fileSystemID == ""'

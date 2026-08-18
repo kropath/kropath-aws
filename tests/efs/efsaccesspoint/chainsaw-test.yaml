@@ -1,0 +1,679 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# EFSAccessPoint Chainsaw tests.
+# 18 ACs: 15 happy-path, 3 negative.
+# Canonical pattern: unique resource name per step, spec.skipDelete: true.
+#
+# Negative test format: kro's advisory ConfigMap validation (status.validationError != "")
+# is asserted for mutual-exclusivity violations.
+# Immutability (AC-11 rootDirectory self==oldSelf) is enforced at the ACK CRD level;
+# the ACK AccessPoint CRD carries x-kubernetes-validations with self==oldSelf on rootDirectory.
+# AC-12 and AC-13 are marked "skipped — ACK CRD level enforcement only" per spec.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: efsaccesspoint
+spec:
+  skipDelete: true
+  namespace: efsaccesspoint
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: fileSystemId provided directly → ACK AccessPoint fileSystemID set.
+    - name: ac1-filesystem-id-direct
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac1-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac1-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac1-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac1-cfg
+                fileSystemId: fs-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac1-ap
+                namespace: efsaccesspoint
+              spec:
+                fileSystemID: fs-0123456789abcdef0
+
+    # AC-2: fileSystemRef.name provided → ACK AccessPoint fileSystemID from EFSFileSystem status.
+    - name: ac2-filesystem-ref-lookup
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac2-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac2-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSFileSystem
+              metadata:
+                name: ac2-parent-fs
+                namespace: efsaccesspoint
+                labels:
+                  app.kubernetes.io/instance: ac2-parent-fs
+              spec:
+                configRef: ac2-cfg
+        - script:
+            content: |
+              kubectl patch efsfilesystem ac2-parent-fs -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"fileSystemId":"fs-abcdef1234567890"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac2-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac2-cfg
+                fileSystemRef:
+                  name: ac2-parent-fs
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac2-ap
+                namespace: efsaccesspoint
+              spec:
+                fileSystemID: fs-abcdef1234567890
+
+    # AC-3 (NEGATIVE): fileSystemRef.name and fileSystemId both set →
+    # status.validationError contains error message.
+    - name: ac3-negative-mutual-exclusivity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac3-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac3-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac3-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac3-cfg
+                fileSystemRef:
+                  name: some-fs
+                fileSystemId: fs-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac3-ap
+                namespace: efsaccesspoint
+              status:
+                (validationError != ""): true
+
+    # AC-4: posixUser.gid set → ACK AccessPoint posixUser.gid set.
+    - name: ac4-posixuser-gid
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac4-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac4-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac4-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac4-cfg
+                fileSystemId: fs-0123456789abcdef0
+                posixUser:
+                  uid: 1000
+                  gid: 2000
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac4-ap
+                namespace: efsaccesspoint
+              spec:
+                fileSystemID: fs-0123456789abcdef0
+                posixUser:
+                  uid: 1000
+                  gid: 2000
+
+    # AC-5: posixUser.uid set → ACK AccessPoint posixUser.uid set.
+    # Verified as part of AC-4 (combined test).
+
+    # AC-6: posixUser.secondaryGIDs set → ACK AccessPoint posixUser.secondaryGIDs set.
+    - name: ac6-posixuser-secondary-gids
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac6-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac6-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac6-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac6-cfg
+                fileSystemId: fs-0123456789abcdef0
+                posixUser:
+                  uid: 1000
+                  gid: 2000
+                  secondaryGIDs:
+                    - 3000
+                    - 4000
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac6-ap
+                namespace: efsaccesspoint
+              spec:
+                posixUser:
+                  uid: 1000
+                  gid: 2000
+                  secondaryGIDs:
+                    - 3000
+                    - 4000
+
+    # AC-7: posixUser not set → ACK AccessPoint created without posixUser.
+    - name: ac7-posixuser-omitted-when-not-set
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac7-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac7-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac7-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac7-cfg
+                fileSystemId: fs-0123456789abcdef0
+        - script:
+            content: |
+              kubectl get accesspoint ac7-ap -n efsaccesspoint -o json \
+                | jq -e '.spec | has("posixUser") | not'
+
+    # AC-8: rootDirectory.path set → ACK AccessPoint rootDirectory.path set.
+    - name: ac8-rootdirectory-path
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac8-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac8-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac8-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac8-cfg
+                fileSystemId: fs-0123456789abcdef0
+                rootDirectory:
+                  path: /data/apps
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac8-ap
+                namespace: efsaccesspoint
+              spec:
+                rootDirectory:
+                  path: /data/apps
+
+    # AC-9: rootDirectory.creationInfo set → ACK AccessPoint rootDirectory.creationInfo set.
+    - name: ac9-rootdirectory-creationinfo
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac9-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac9-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac9-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac9-cfg
+                fileSystemId: fs-0123456789abcdef0
+                rootDirectory:
+                  path: /data/apps
+                  creationInfo:
+                    ownerUID: 1000
+                    ownerGID: 2000
+                    permissions: "755"
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac9-ap
+                namespace: efsaccesspoint
+              spec:
+                rootDirectory:
+                  path: /data/apps
+                  creationInfo:
+                    ownerUID: 1000
+                    ownerGID: 2000
+                    permissions: "755"
+
+    # AC-10: rootDirectory not set → ACK AccessPoint created without rootDirectory.
+    - name: ac10-rootdirectory-omitted-when-not-set
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac10-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac10-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac10-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac10-cfg
+                fileSystemId: fs-0123456789abcdef0
+        - script:
+            content: |
+              kubectl get accesspoint ac10-ap -n efsaccesspoint -o json \
+                | jq -e '.spec | has("rootDirectory") | not'
+
+    # AC-11 (NEGATIVE): rootDirectory is immutable once set — enforced by ACK CRD.
+    # Note: This test verifies the ACK CRD x-kubernetes-validations rule (self==oldSelf
+    # on rootDirectory). It creates an AccessPoint with rootDirectory, then attempts to
+    # update the path and expects rejection.
+    - name: ac11-negative-rootdirectory-immutability
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac11-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac11-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac11-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac11-cfg
+                fileSystemId: fs-0123456789abcdef0
+                rootDirectory:
+                  path: /data/original
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac11-ap
+                namespace: efsaccesspoint
+              spec:
+                rootDirectory:
+                  path: /data/original
+        - script:
+            content: |
+              # Attempt to update rootDirectory.path — ACK CRD should reject this.
+              if kubectl patch accesspoint ac11-ap -n efsaccesspoint --type=merge \
+                -p '{"spec":{"rootDirectory":{"path":"/data/changed"}}}' 2>/dev/null; then
+                echo "ERROR: expected rejection of rootDirectory mutation, but update succeeded"
+                exit 1
+              else
+                echo "OK: rootDirectory mutation correctly rejected by ACK CRD"
+              fi
+
+    # AC-12: posixUser is immutable once set — ACK CRD level enforcement only.
+    # Skipped: kro-generated CRD does not retain x-kubernetes-validations; ACK CRD
+    # on the AccessPoint itself does not carry a posixUser immutability rule (only
+    # rootDirectory has self==oldSelf). Covered by ACK behavior documentation only.
+
+    # AC-13: fileSystemId is immutable once set — ACK CRD level enforcement only.
+    # Skipped: kro-generated CRD does not retain x-kubernetes-validations; covered by ACK behavior.
+
+    # AC-14: tags from defaults → ACK AccessPoint tags.
+    - name: ac14-tags-from-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac14-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  tags:
+                    env: test
+        - script:
+            content: |
+              kubectl patch efsconfig ac14-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{"env":"test"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac14-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac14-cfg
+                fileSystemId: fs-0123456789abcdef0
+        - script:
+            content: |
+              kubectl get accesspoint ac14-ap -n efsaccesspoint -o json \
+                | jq -e '.spec.tags | map(select(.key=="env" and .value=="test")) | length == 1'
+
+    # AC-15: tags from mandatory override spec.
+    - name: ac15-tags-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac15-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory:
+                  tags:
+                    env: production
+        - script:
+            content: |
+              kubectl patch efsconfig ac15-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{"env":"production"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{"env":"test"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac15-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac15-cfg
+                fileSystemId: fs-0123456789abcdef0
+                tags:
+                  env: dev
+        - script:
+            content: |
+              kubectl get accesspoint ac15-ap -n efsaccesspoint -o json \
+                | jq -e '.spec.tags | map(select(.key=="env" and .value=="production")) | length == 1'
+
+    # AC-16: syncedLabels → K8s labels with aws.kropath.run/ prefix.
+    - name: ac16-synced-labels-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac16-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    team: platform
+        - script:
+            content: |
+              kubectl patch efsconfig ac16-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{"team":"platform"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac16-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac16-cfg
+                fileSystemId: fs-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac16-ap
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/team: platform
+
+    # AC-17: ownerReferences set on ACK AccessPoint CR.
+    - name: ac17-owner-references
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac17-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac17-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac17-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac17-cfg
+                fileSystemId: fs-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac17-ap
+                namespace: efsaccesspoint
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: EFSAccessPoint
+                    name: ac17-ap
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # AC-18: deletionPolicy annotation written to ACK CR.
+    - name: ac18-deletion-policy-annotation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSConfig
+              metadata:
+                name: ac18-cfg
+                namespace: efsaccesspoint
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch efsconfig ac18-cfg -n efsaccesspoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encrypted":false,"kmsKeyId":"","performanceMode":"","throughputMode":"","backupEnabled":false,"transitionToIA":"","transitionToArchive":"","transitionToPrimaryStorage":"","replicationOverwriteProtection":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSAccessPoint
+              metadata:
+                name: ac18-ap
+                namespace: efsaccesspoint
+              spec:
+                configRef: ac18-cfg
+                fileSystemId: fs-0123456789abcdef0
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: efs.services.k8s.aws/v1alpha1
+              kind: AccessPoint
+              metadata:
+                name: ac18-ap
+                namespace: efsaccesspoint
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
