@@ -684,6 +684,58 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **What Works Instead:** Always use the fully-qualified plural resource name for ACK kinds that collide with built-in Kubernetes kinds — `roles.iam.services.k8s.aws` instead of `role`. This matches the pattern already used elsewhere in these test files for other ACK kinds (`policies.iam.services.k8s.aws`, `keys.kms.services.k8s.aws`, `groups.iam.services.k8s.aws`). ACK `User`, `Bucket`, `Key`, `OpenIDConnectProvider` have no built-in-Kubernetes-kind collision and are safe to query with their bare short name.
 * **Rule:** Any new `kubectl get <ack-kind>` in a test script must use the fully-qualified `<plural>.<group>` form, never the bare kind name, for any kind that might shadow a built-in Kubernetes resource (`role`, and watch for `service`, `endpoint`, `event`, `secret`, etc. if ACK ever adds CRDs with those names).
 
+### Ambiguous kubectl Resource Name — `Illegal number` / Wrong-Group Resolution (KRO-674)
+
+* **Symptom string:** `Illegal number` — emitted by the Kubernetes API server when two CRDs
+  registered under different API groups share the same plural name and kubectl's discovery cache
+  resolves the bare name to the wrong group. The error text varies by resource but often looks like:
+    ```
+    Error from server: error when retrieving current configuration of:
+    Resource: "iam.services.k8s.aws/v1alpha1, Resource=users", GroupVersionKind: "iam.services.k8s.aws/v1alpha1, Kind=User"
+    ...
+    Illegal number
+    ```
+  In practice the suite-level symptom is a `SCRIPT ERROR` on a `kubectl get <resource>` line, or
+  a chainsaw step that returns an object from the *wrong* ACK service, causing downstream `jq`
+  checks to fail on unexpected JSON shapes.
+
+* **Why:** `kubectl` resolves bare resource names (e.g. `user`, `cluster`, `acl`, `snapshot`) by
+  scanning the discovery cache and returning whichever API group sorts first alphabetically. After
+  KRO-413 added `users.elasticache.services.k8s.aws` and KRO-431 added MemoryDB CRDs (`users`,
+  `clusters`, `subnetgroups`, `parametergroups`, `snapshots`, `acls` under
+  `memorydb.services.k8s.aws`), many ACK plural names that were unique before now have two or more
+  registrations. The wrong-group lookup produces `Illegal number` (or `NotFound`) depending on
+  which group sorted first and what it did with the query.
+
+* **What Works Instead:** Always use the fully-qualified `<plural>.<service>.services.k8s.aws`
+  form in every `- script:` step of a chainsaw test:
+    ```bash
+    # ❌ Ambiguous — resolves to whichever ACK group sorts first
+    kubectl get user test-user -n iamuser -o json
+
+    # ✅ Unambiguous — exact API group
+    kubectl get users.iam.services.k8s.aws test-user -n iamuser -o json
+    ```
+  Qualification is required for ALL ACK resource kinds, not only the historically-known
+  `role`/`user` collision with Kubernetes RBAC built-ins (see the entry immediately above).
+
+* **Lint guard:** `tests/lint-test-scripts.sh` (run via `make lint-test-scripts`) catches
+  unqualified ACK resource names in chainsaw test scripts before they reach CI. The guard checks
+  all `chainsaw-test.yaml` files for `kubectl get <bare-name> ` where `<bare-name>` matches any
+  known ACK plural name and the token does not already contain a dot. It is wired into
+  `.github/workflows/rgd-tests.yaml` as a pre-Chainsaw CI step.
+
+  When adding a new ACK-backed resource kind, add its plural to `ACK_BARE_NAMES` in
+  `tests/lint-test-scripts.sh` so new bare names are caught from day one. Do NOT add
+  kropath.run wrapper CRD names (those are unique compound names like `iamconfig`, `kmskey`
+  and need no qualification).
+
+* **Reference:** `docs/troubleshooting-logs/` for the original KRO-674 IAM/Elasticache/MemoryDB
+  collision investigation. Also see §"`kubectl get role`/`kubectl get user` Short-Name Collisions"
+  immediately above for the specific RBAC built-in case.
+
+---
+
 ### Chainsaw Cleanup Timeout — kro Cascade Deletion Queue Backup
 
 > **Superseded** by §"CANONICAL: Unique-Name-Per-Step + `skipDelete`". Setting
