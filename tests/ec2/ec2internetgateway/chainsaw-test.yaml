@@ -1,0 +1,316 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ec2-06 EC2InternetGateway governance tests — 10 acceptance criteria.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+# Note: ACK InternetGateway uses spec.vpc (string VPC ID), NOT spec.vpcID.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ec2internetgateway
+spec:
+  skipDelete: true
+  namespace: ec2internetgateway
+  steps:
+    # AC-1: Basic creation with VPC attachment.
+    # AC-6: Standard metadata labels.
+    - name: ac1-basic-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac1-cfg
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+        - script:
+            content: kubectl patch ec2config ac1-cfg -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac1-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: ac1-cfg
+                vpcId: vpc-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac1-igw
+                namespace: ec2internetgateway
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac1-igw
+              spec:
+                # ACK InternetGateway uses spec.vpc (not spec.vpcID)
+                vpc: vpc-0123456789abcdef0
+
+    # AC-2: Route table IDs propagated to spec.routeTables.
+    - name: ac2-route-tables
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac2-cfg
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+        - script:
+            content: kubectl patch ec2config ac2-cfg -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac2-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: ac2-cfg
+                vpcId: vpc-0123456789abcdef0
+                routeTableIds:
+                  - rtb-0123456789abcdef0
+                  - rtb-0fedcba9876543210
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac2-igw
+                namespace: ec2internetgateway
+              spec:
+                routeTables:
+                  - rtb-0123456789abcdef0
+                  - rtb-0fedcba9876543210
+
+    # AC-3: Tag merge — mandatory > spec > defaults.
+    - name: ac3-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac3-cfg
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+        - script:
+            content: kubectl patch ec2config ac3-cfg -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"type":"public"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{"type":"private","region":"us-east-1"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac3-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: ac3-cfg
+                vpcId: vpc-0123456789abcdef0
+                tags:
+                  owner: networking
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac3-igw
+                namespace: ec2internetgateway
+        - script:
+            content: |
+              TAGS=$(kubectl get internetgateway ac3-igw -n ec2internetgateway -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e '.[] | select(.key=="type" and .value=="public")' || (echo "FAIL: mandatory tag not winning" && exit 1)
+              echo "$TAGS" | jq -e '.[] | select(.key=="owner" and .value=="networking")' || (echo "FAIL: spec tag missing" && exit 1)
+              echo "$TAGS" | jq -e '.[] | select(.key=="region" and .value=="us-east-1")' || (echo "FAIL: defaults-only tag missing" && exit 1)
+
+    # AC-4: Synced labels propagated with aws.kropath.run/ prefix.
+    - name: ac4-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac4-cfg
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+        - script:
+            content: kubectl patch ec2config ac4-cfg -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac4-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: ac4-cfg
+                vpcId: vpc-0123456789abcdef0
+                syncedLabels:
+                  gateway-type: internet
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac4-igw
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/gateway-type: internet
+
+    # AC-5: Deletion policy retain (default).
+    - name: ac5-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac5-cfg
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+        - script:
+            content: kubectl patch ec2config ac5-cfg -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac5-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: ac5-cfg
+                vpcId: vpc-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac5-igw
+                namespace: ec2internetgateway
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-7: Deletion policy delete.
+    - name: ac7-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac7-cfg
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+        - script:
+            content: kubectl patch ec2config ac7-cfg -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac7-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: ac7-cfg
+                vpcId: vpc-0123456789abcdef0
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac7-igw
+                namespace: ec2internetgateway
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-8: No route tables when not specified.
+    - name: ac8-no-route-tables
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac8-cfg
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+        - script:
+            content: kubectl patch ec2config ac8-cfg -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac8-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: ac8-cfg
+                vpcId: vpc-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac8-igw
+                namespace: ec2internetgateway
+              spec:
+                routeTables: []
+
+    # AC-10: Custom configRef selects a different EC2Config.
+    - name: ac10-config-selector
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: igw-policy
+                namespace: ec2internetgateway
+                labels:
+                  aws.kropath.run/resource-name: igw-policy
+        - script:
+            content: kubectl patch ec2config igw-policy -n ec2internetgateway --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"policy":"igw-policy"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2InternetGateway
+              metadata:
+                name: ac10-igw
+                namespace: ec2internetgateway
+              spec:
+                configRef: igw-policy
+                vpcId: vpc-0123456789abcdef0
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: InternetGateway
+              metadata:
+                name: ac10-igw
+                namespace: ec2internetgateway
+        - script:
+            content: |
+              kubectl get internetgateway ac10-igw -n ec2internetgateway -o json | jq -e '.spec.tags[] | select(.key=="policy" and .value=="igw-policy")' || (echo "FAIL: config-selector tag not applied" && exit 1)
