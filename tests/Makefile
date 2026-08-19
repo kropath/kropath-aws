@@ -19,7 +19,7 @@ CLUSTER_NAME ?= kropath-aws-test
 # `^test-<service>:` lines, so collapsing these into a `test-%:` pattern rule would
 # silently break CI's changed-file test selection (it would fall back to the full
 # suite, or skip a service, depending on the diff).
-.PHONY: setup teardown test chainsaw-e2e \
+.PHONY: setup teardown test chainsaw-e2e lint-test-scripts \
 	test-apigateway test-apigatewayv2 test-autoscaling test-cloudfront \
 	test-cloudwatch test-cloudwatchlogs test-dynamodb test-ec2 test-ecr test-ecs test-efs \
 	test-eks test-elasticache test-elb test-eventbridge test-iam test-kms \
@@ -29,6 +29,18 @@ CLUSTER_NAME ?= kropath-aws-test
 setup:
 	./setup.sh $(CLUSTER_NAME)
 	mkdir -p test-results
+
+# lint-test-scripts: fail fast when a kubectl get in a - script: step addresses an ACK resource
+# by an unqualified bare or short name instead of <plural>.<service>.services.k8s.aws.
+#
+# Any `kubectl get <word>` where <word> is a known ACK resource name (listed below) and does
+# NOT already contain a dot is an error — it will resolve to whichever API group sorts first in
+# the discovery cache and silently break when a second ACK service installs a CRD with the same
+# plural (see docs/frequent-rgd-errors.md §"Ambiguous kubectl Resource Name").
+lint-test-scripts:
+	@echo "==> Checking for unqualified ACK resource names in chainsaw test scripts..."
+	@./lint-test-scripts.sh
+	@echo "==> lint-test-scripts: PASS"
 
 teardown:
 	./teardown.sh $(CLUSTER_NAME)
