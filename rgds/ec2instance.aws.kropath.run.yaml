@@ -1,0 +1,176 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: ec2instance.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: EC2Instance
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Required compute fields.
+      imageId: string
+      instanceType: string
+      subnetId: string
+      # Optional compute fields.
+      securityGroupIds: "[]string | default=[]"
+      keyName: string | default=""
+      userData: string | default=""
+      iamInstanceProfile: IamInstanceProfile | default={}
+      blockDeviceMappings: "[]BlockDeviceMapping | default=[]"
+      disableApiTermination: boolean | default=false
+      # metadataHttpTokens — user's requested IMDSv2 mode ("required"|"optional"|"").
+      # Governance may enforce "required" regardless of this value.
+      metadataHttpTokens: string | default=""
+      # sourceDestCheck — bare boolean (no default) to preserve tri-state detection.
+      # Governance may block disabling (force true) based on allowSourceDestCheckDisable.
+      sourceDestCheck: boolean
+    types:
+      IamInstanceProfile:
+        arn: string | default=""
+        name: string | default=""
+      BlockDeviceMapping:
+        deviceName: string | default=""
+        volumeSize: integer | default=0
+        volumeType: string | default=gp3
+        iops: integer | default=0
+        throughput: integer | default=0
+        # encrypted: bare boolean — governance overrides via ebsEncryptionRequired when mandatory.
+        encrypted: boolean | default=false
+        kmsKeyId: string | default=""
+        deleteOnTermination: boolean | default=true
+    status:
+      instanceId: >-
+        ${ackInstance.?status.?instanceID.orValue("")}
+      # state.name: "pending"|"running"|"shutting-down"|"terminated"|"stopping"|"stopped".
+      state: >-
+        ${ackInstance.?status.?state.?name.orValue("")}
+      publicIpAddress: >-
+        ${ackInstance.?status.?publicIPAddress.orValue("")}
+      # publicIpStatus: advisory field. "public-ip-restricted" when mandatory.publicIpRestricted=true.
+      publicIpStatus: >-
+        ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.publicIpRestricted) && rsrcCfg[0].status.effectiveConfig.mandatory.publicIpRestricted) ? "public-ip-restricted" : ""}
+      conditions: >-
+        ${ackInstance.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: InstanceId
+        type: string
+        jsonPath: .status.instanceId
+      - name: State
+        type: string
+        jsonPath: .status.state
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EC2Config
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACK Instance CR — primary cloud resource.
+    - id: ackInstance
+      template:
+        apiVersion: ec2.services.k8s.aws/v1alpha1
+        kind: Instance
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Instance
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          imageID: ${schema.spec.imageId}
+          instanceType: ${schema.spec.instanceType}
+          subnetID: ${schema.spec.subnetId}
+          securityGroupIDs: ${schema.spec.securityGroupIds}
+          keyName: ${schema.spec.keyName}
+          userData: ${schema.spec.userData}
+          iamInstanceProfile:
+            arn: ${schema.spec.iamInstanceProfile.arn}
+            name: ${schema.spec.iamInstanceProfile.name}
+          disableAPITermination: '${schema.spec.disableApiTermination}'
+          # IMDSv2 enforcement — mandatory.imdsv2Required=true forces "required" regardless of instance spec.
+          # If mandatory is false/unset: instance spec.metadataHttpTokens takes priority over defaults.
+          metadataOptions:
+            httpTokens: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.imdsv2Required) && rsrcCfg[0].status.effectiveConfig.mandatory.imdsv2Required)
+                ? "required"
+                : (schema.spec.metadataHttpTokens != "")
+                  ? schema.spec.metadataHttpTokens
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.imdsv2Required) && rsrcCfg[0].status.effectiveConfig.defaults.imdsv2Required)
+                    ? "required"
+                    : "optional"}
+          # sourceDestCheck — governance blocks disable when mandatory.allowSourceDestCheckDisable=false.
+          sourceDestCheckEnabled: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.allowSourceDestCheckDisable) && rsrcCfg[0].status.effectiveConfig.mandatory.allowSourceDestCheckDisable)
+              ? (has(schema.spec.sourceDestCheck) ? schema.spec.sourceDestCheck : true)
+              : true}
+          # blockDeviceMappings — governance applies encryption and KMS key override per BDM.
+          # mandatory.ebsEncryptionRequired=true forces encrypted=true on all volumes.
+          # mandatory.ebsDefaultKmsKeyId overrides per-volume kmsKeyId; defaults.ebsDefaultKmsKeyId is the fallback.
+          blockDeviceMappings: >-
+            ${schema.spec.blockDeviceMappings.map(bdm, {
+              "deviceName": bdm.deviceName,
+              "ebs": {
+                "volumeSize": bdm.volumeSize,
+                "volumeType": bdm.volumeType,
+                "iops": bdm.iops,
+                "throughput": bdm.throughput,
+                "encrypted": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.ebsEncryptionRequired) && rsrcCfg[0].status.effectiveConfig.mandatory.ebsEncryptionRequired) ? true : bdm.encrypted,
+                "kmsKeyID": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?ebsDefaultKmsKeyId.orValue("") != "") ? rsrcCfg[0].status.effectiveConfig.mandatory.ebsDefaultKmsKeyId : (bdm.kmsKeyId != "") ? bdm.kmsKeyId : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?ebsDefaultKmsKeyId.orValue("") : ""),
+                "deleteOnTermination": bdm.deleteOnTermination
+              }
+            })}
+          # Cloud resource tags — ACK EC2 Instance spec.tags is array<{key, value}> (not map).
+          # Merge order: defaults -> instance spec -> mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}

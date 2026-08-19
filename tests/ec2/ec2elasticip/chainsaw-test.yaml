@@ -1,0 +1,309 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# EC2ElasticIP governance tests — 9 acceptance criteria.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ec2elasticip
+spec:
+  skipDelete: true
+  namespace: ec2elasticip
+  steps:
+    # AC-1: Basic EIP allocation with default config — ACK ElasticIPAddress created.
+    # AC-2: Standard metadata: managed-by label and app.kubernetes.io/instance label set on ACK child.
+    - name: ac1-basic-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac1-cfg
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+        - script:
+            content: kubectl patch ec2config ac1-cfg -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac1-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac1-eip
+                namespace: ec2elasticip
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac1-eip
+
+    # AC-3: networkBorderGroup passed through to ACK spec.networkBorderGroup.
+    - name: ac3-network-border-group
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac3-cfg
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+        - script:
+            content: kubectl patch ec2config ac3-cfg -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac3-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: ac3-cfg
+                networkBorderGroup: us-east-1
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac3-eip
+                namespace: ec2elasticip
+              spec:
+                networkBorderGroup: us-east-1
+
+    # AC-4: Tag merge — mandatory > spec > defaults. Assert via script (unstable order).
+    - name: ac4-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac4-cfg
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+        - script:
+            content: kubectl patch ec2config ac4-cfg -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{"env":"dev","region":"us-east-1"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac4-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: ac4-cfg
+                tags:
+                  team: networking
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac4-eip
+                namespace: ec2elasticip
+        - script:
+            content: |
+              TAGS=$(kubectl get elasticipaddress ac4-eip -n ec2elasticip -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e '.[] | select(.key=="env" and .value=="prod")' || (echo "FAIL: mandatory tag not winning" && exit 1)
+              echo "$TAGS" | jq -e '.[] | select(.key=="team" and .value=="networking")' || (echo "FAIL: spec tag missing" && exit 1)
+              echo "$TAGS" | jq -e '.[] | select(.key=="region" and .value=="us-east-1")' || (echo "FAIL: defaults-only tag missing" && exit 1)
+
+    # AC-5: Synced labels propagated to K8s child resource labels with aws.kropath.run/ prefix.
+    - name: ac5-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac5-cfg
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+        - script:
+            content: kubectl patch ec2config ac5-cfg -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{"cost-center":"networking"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac5-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: ac5-cfg
+                syncedLabels:
+                  owner: platform-team
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac5-eip
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/owner: platform-team
+                  aws.kropath.run/cost-center: networking
+        - script:
+            content: |
+              TAGS=$(kubectl get elasticipaddress ac5-eip -n ec2elasticip -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e '.[] | select(.key=="owner" and .value=="platform-team")' || (echo "FAIL: owner synced label not in spec.tags" && exit 1)
+              echo "$TAGS" | jq -e '.[] | select(.key=="cost-center" and .value=="networking")' || (echo "FAIL: cost-center synced label not in spec.tags" && exit 1)
+
+    # AC-6: Synced annotations propagated to K8s child resource annotations with aws.kropath.run/ prefix.
+    - name: ac6-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac6-cfg
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+        - script:
+            content: kubectl patch ec2config ac6-cfg -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"infra"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac6-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: ac6-cfg
+                syncedAnnotations:
+                  service: api-gateway
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac6-eip
+                namespace: ec2elasticip
+                annotations:
+                  aws.kropath.run/service: api-gateway
+                  aws.kropath.run/team: infra
+
+    # AC-7: Deletion policy delete — annotation set on ACK child.
+    - name: ac7-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac7-cfg
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+        - script:
+            content: kubectl patch ec2config ac7-cfg -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac7-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: ac7-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac7-eip
+                namespace: ec2elasticip
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-8: Deletion policy retain (default).
+    - name: ac8-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: ac8-cfg
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+        - script:
+            content: kubectl patch ec2config ac8-cfg -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac8-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: ac8-cfg
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac8-eip
+                namespace: ec2elasticip
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-9: Custom configRef selects a different EC2Config.
+    - name: ac9-config-selector
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2Config
+              metadata:
+                name: custom-eip-policy
+                namespace: ec2elasticip
+                labels:
+                  aws.kropath.run/resource-name: custom-eip-policy
+        - script:
+            content: kubectl patch ec2config custom-eip-policy -n ec2elasticip --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"policy":"custom"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2ElasticIP
+              metadata:
+                name: ac9-eip
+                namespace: ec2elasticip
+              spec:
+                configRef: custom-eip-policy
+        - assert:
+            resource:
+              apiVersion: ec2.services.k8s.aws/v1alpha1
+              kind: ElasticIPAddress
+              metadata:
+                name: ac9-eip
+                namespace: ec2elasticip
+        - script:
+            content: |
+              kubectl get elasticipaddress ac9-eip -n ec2elasticip -o json | jq -e '.spec.tags[] | select(.key=="policy" and .value=="custom")' || (echo "FAIL: custom policy tag not applied" && exit 1)

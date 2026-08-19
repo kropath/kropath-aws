@@ -1,0 +1,232 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: ec2launchtemplate.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: EC2LaunchTemplate
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      versionDescription: string | default=""
+      # Launch template data — instance configuration.
+      imageId: string | default=""
+      instanceType: string | default=""
+      securityGroupIds: "[]string | default=[]"
+      keyName: string | default=""
+      userData: string | default=""
+      iamInstanceProfile: LtIamInstanceProfile | default={}
+      blockDeviceMappings: "[]LtBlockDeviceMapping | default=[]"
+      # metadataHttpTokens — user's requested IMDSv2 mode; governance may enforce "required".
+      metadataHttpTokens: string | default=""
+      # instanceTags — tags applied to instances launched from this template.
+      # These populate spec.data.tagSpecifications[0] with resourceType: "instance".
+      instanceTags: map[string]string | default={}
+    types:
+      LtIamInstanceProfile:
+        arn: string | default=""
+        name: string | default=""
+      LtBlockDeviceMapping:
+        deviceName: string | default=""
+        volumeSize: integer | default=0
+        volumeType: string | default=gp3
+        iops: integer | default=0
+        throughput: integer | default=0
+        encrypted: boolean | default=false
+        kmsKeyId: string | default=""
+        deleteOnTermination: boolean | default=true
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      launchTemplateId: >-
+        ${ackLt.?status.?id.orValue("")}
+      latestVersionNumber: >-
+        ${ackLt.?status.?latestVersion.orValue(0)}
+      conditions: >-
+        ${ackLt.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: LaunchTemplateId
+        type: string
+        jsonPath: .status.launchTemplateId
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EC2Config
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2LaunchTemplate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # ACK LaunchTemplate CR — primary cloud resource.
+    # Only created when namingStatus is valid (effectiveName has no unresolved tokens).
+    - id: ackLt
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: ec2.services.k8s.aws/v1alpha1
+        kind: LaunchTemplate
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EC2LaunchTemplate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource name — from naming ConfigMap effectiveName.
+          name: ${naming.data.effectiveName}
+          versionDescription: ${schema.spec.versionDescription}
+          data:
+            imageID: ${schema.spec.imageId}
+            instanceType: ${schema.spec.instanceType}
+            securityGroupIDs: ${schema.spec.securityGroupIds}
+            keyName: ${schema.spec.keyName}
+            userData: ${schema.spec.userData}
+            iamInstanceProfile:
+              arn: ${schema.spec.iamInstanceProfile.arn}
+              name: ${schema.spec.iamInstanceProfile.name}
+            # IMDSv2 enforcement — same cascade as EC2Instance.
+            metadataOptions:
+              httpTokens: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.imdsv2Required) && rsrcCfg[0].status.effectiveConfig.mandatory.imdsv2Required)
+                  ? "required"
+                  : (schema.spec.metadataHttpTokens != "")
+                    ? schema.spec.metadataHttpTokens
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.imdsv2Required) && rsrcCfg[0].status.effectiveConfig.defaults.imdsv2Required)
+                      ? "required"
+                      : "optional"}
+            # blockDeviceMappings — governance applies encryption and KMS key override per BDM.
+            blockDeviceMappings: >-
+              ${schema.spec.blockDeviceMappings.map(bdm, {
+                "deviceName": bdm.deviceName,
+                "ebs": {
+                  "volumeSize": bdm.volumeSize,
+                  "volumeType": bdm.volumeType,
+                  "iops": bdm.iops,
+                  "throughput": bdm.throughput,
+                  "encrypted": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.ebsEncryptionRequired) && rsrcCfg[0].status.effectiveConfig.mandatory.ebsEncryptionRequired) ? true : bdm.encrypted,
+                  "kmsKeyID": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?ebsDefaultKmsKeyId.orValue("") != "") ? rsrcCfg[0].status.effectiveConfig.mandatory.ebsDefaultKmsKeyId : (bdm.kmsKeyId != "") ? bdm.kmsKeyId : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?ebsDefaultKmsKeyId.orValue("") : ""),
+                  "deleteOnTermination": bdm.deleteOnTermination
+                }
+              })}
+            # Instance-level tags via tagSpecifications (separate from template-level tags).
+            tagSpecifications:
+              - resourceType: instance
+                tags: >-
+                  ${schema.spec.instanceTags.transformList(k, v, {"key": k, "value": v})}
+          # Template-level tags (not instance tags) — standard governance merge.
+          # ACK LaunchTemplate spec.tags is array<{key, value}> (not map).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
