@@ -1,0 +1,160 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: ecrrepositorycreationtemplate.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ECRRepositoryCreationTemplate
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Required — namespace prefix for auto-created repositories. Immutable after creation.
+      prefix: string | default=""
+      # Required — scenarios where this template applies (PULL_THROUGH_CACHE and/or REPLICATION)
+      appliedFor: "[]string | default=[]"
+      # Optional passthrough fields — these are NOT subject to ECRConfig governance
+      description: string | default=""
+      imageTagMutability: string | default=""
+      imageTagMutabilityExclusionFilters: "[]ImageTagMutabilityExclusionFilter | default=[]"
+      lifecyclePolicy: string | default=""
+      repositoryPolicy: string | default=""
+      customRoleARN: string | default=""
+      # KMS encryption — mutually exclusive; governs auto-created repos only
+      kmsKeyRef: string | default=""
+      kmsKeyArn: string | default=""
+      encryptionType: string | default=""
+      # Cloud tags on auto-created repositories (not K8s metadata)
+      resourceTags: "[]ResourceTag | default=[]"
+    types:
+      ImageTagMutabilityExclusionFilter:
+        filter: string | default=""
+        filterType: string | default=""
+      ResourceTag:
+        key: string | default=""
+        value: string | default=""
+    status:
+      validationError: >-
+        ${has(mutualExclusionError.data) && has(mutualExclusionError.data.error) ? mutualExclusionError.data.error : ""}
+      conditions: >-
+        ${creationTemplate.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: Prefix
+        type: string
+        jsonPath: .spec.prefix
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ECRConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Optional KMSKey lookup — resolves ARN when kmsKeyRef is non-empty.
+    # Sentinel pattern: when kmsKeyRef is empty, selector never matches and kmsKey is [].
+    - id: kmsKey
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KMSKey
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.kmsKeyRef != "" ? schema.spec.kmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # Mutual exclusion guard: spec.kmsKeyRef and spec.kmsKeyArn cannot both be set.
+    # x-kubernetes-validations cannot be preserved by kro v0.9.2 — advisory ConfigMap pattern used.
+    - id: mutualExclusionError
+      includeWhen:
+        - '${schema.spec.kmsKeyRef != "" && schema.spec.kmsKeyArn != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "kmsKeyRef and kmsKeyArn are mutually exclusive — set one or neither"
+
+    # ACK ECR RepositoryCreationTemplate CR — primary cloud resource.
+    # Naming exemption (KRO-236): RepositoryCreationTemplate identity is established by prefix;
+    # there is no standalone resource name field. No effectiveName, predictedArn, or naming status.
+    # Template fields are NOT subject to ECRConfig governance (they configure auto-created repos
+    # in pull-through cache scenarios, not the kro-managed resource itself).
+    # prefix is immutable after creation — enforced by ACK's x-kubernetes-validations on the child CRD.
+    - id: creationTemplate
+      template:
+        apiVersion: ecr.services.k8s.aws/v1alpha1
+        kind: RepositoryCreationTemplate
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # prefix is immutable after creation; identity field for the template
+          prefix: "${schema.spec.prefix}"
+          appliedFor: ${schema.spec.appliedFor}
+          description: "${schema.spec.description}"
+          imageTagMutability: "${schema.spec.imageTagMutability}"
+          imageTagMutabilityExclusionFilters: >-
+            ${schema.spec.imageTagMutabilityExclusionFilters.map(f, {"filter": f.filter, "filterType": f.filterType})}
+          lifecyclePolicy: "${schema.spec.lifecyclePolicy}"
+          repositoryPolicy: "${schema.spec.repositoryPolicy}"
+          customRoleARN: "${schema.spec.customRoleARN}"
+          encryptionConfiguration:
+            encryptionType: "${schema.spec.encryptionType}"
+            kmsKey: >-
+              ${kmsKey.size() > 0 && kmsKey[0].?status.?predictedArn.orValue("") != ""
+                ? kmsKey[0].status.predictedArn
+                : schema.spec.kmsKeyArn}
+          # resourceTags — cloud tags applied to auto-created repositories (distinct from K8s metadata)
+          resourceTags: >-
+            ${schema.spec.resourceTags.map(t, {"key": t.key, "value": t.value})}
