@@ -550,6 +550,171 @@ spec:
                   aws.kropath.run/compliance: soc2
 
     # ──────────────────────────────────────────────────────────────────────────
+    # AC-2b: appliedFor with both PULL_THROUGH_CACHE and REPLICATION values.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2b-both-applied-for
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: both-scenarios-template
+              spec:
+                prefix: "both/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                  - REPLICATION
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: both-scenarios-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                  - REPLICATION
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5b: empty encryptionType default — when spec.encryptionType is unset,
+    # encryptionConfiguration.encryptionType is empty (not a default value).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5b-empty-encryption-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: no-encryption-template
+              spec:
+                prefix: "noenc/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: no-encryption-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                encryptionConfiguration:
+                  encryptionType: ""
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12b: Three-tier tags cascade — mandatory wins; tags appear in ACK child
+    # metadata.labels with aws.kropath.run/ prefix.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12b-tags-cascade
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: tmpl-tags-cascade-policy
+                namespace: ecrrepositorycreationtemplate
+                labels:
+                  aws.kropath.run/resource-name: tmpl-tags-cascade-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags:
+                    env: "production"
+                    owner: "platform-team"
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{namespace}/{name}"
+                  tags:
+                    env: "staging"
+                    tier: "template"
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig tmpl-tags-cascade-policy -n ecrrepositorycreationtemplate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{"env":"production","owner":"platform-team"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{"env":"staging","tier":"template"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: tags-cascade-tmpl
+              spec:
+                prefix: "tagscascade/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                configRef: tmpl-tags-cascade-policy
+                tags:
+                  env: "dev"
+                  service: "auto-repo"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: tags-cascade-tmpl
+                namespace: ecrrepositorycreationtemplate
+        - script:
+            content: |
+              LABELS=$(kubectl get repositorycreationtemplates.ecr.services.k8s.aws tags-cascade-tmpl -n ecrrepositorycreationtemplate -o json | jq '.metadata.labels')
+              echo "Labels: $LABELS"
+              # mandatory env=production must win over spec env=dev and defaults env=staging
+              echo "$LABELS" | jq -e '.["aws.kropath.run/env"] == "production"' || { echo "FAIL: aws.kropath.run/env should be production (mandatory wins)"; exit 1; }
+              # owner from mandatory
+              echo "$LABELS" | jq -e '.["aws.kropath.run/owner"] == "platform-team"' || { echo "FAIL: aws.kropath.run/owner should be platform-team"; exit 1; }
+              # service from spec (not overridden)
+              echo "$LABELS" | jq -e '.["aws.kropath.run/service"] == "auto-repo"' || { echo "FAIL: aws.kropath.run/service should be auto-repo"; exit 1; }
+              # tier from defaults (not overridden)
+              echo "$LABELS" | jq -e '.["aws.kropath.run/tier"] == "template"' || { echo "FAIL: aws.kropath.run/tier should be template"; exit 1; }
+              echo "PASS: three-tier tags cascade verified"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: Naming exemption (KRO-236) — status must have NO resourceName,
+    # predictedArn, or namingStatus fields. Assert via jq.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-naming-exemption-jq
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: naming-exempt-tmpl
+              spec:
+                prefix: "exemptcheck/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: naming-exempt-tmpl
+                namespace: ecrrepositorycreationtemplate
+        - script:
+            content: |
+              STATUS=$(kubectl get ecrrepositorycreationtemplate naming-exempt-tmpl -n ecrrepositorycreationtemplate -o json | jq '.status')
+              echo "status: $STATUS"
+              echo "$STATUS" | jq -e 'has("resourceName") | not' || { echo "FAIL: status.resourceName should not exist (naming exempt)"; exit 1; }
+              echo "$STATUS" | jq -e 'has("namingStatus") | not' || { echo "FAIL: status.namingStatus should not exist (naming exempt)"; exit 1; }
+              echo "$STATUS" | jq -e 'has("predictedArn") | not' || { echo "FAIL: status.predictedArn should not exist (naming exempt)"; exit 1; }
+              echo "PASS: naming exemption verified — no resourceName/namingStatus/predictedArn in status"
+
+    # ──────────────────────────────────────────────────────────────────────────
     # AC-18: imageTagMutabilityExclusionFilters passthrough.
     # ──────────────────────────────────────────────────────────────────────────
     - name: ac18-image-tag-exclusion-filters

@@ -262,6 +262,135 @@ spec:
                   aws.kropath.run/policy-version: v3
 
     # ──────────────────────────────────────────────────────────────────────────
+    # AC-3b: upstreamRegistry: github-container-registry with ghcr.io URL.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3b-ghcr-upstream-registry
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPullThroughCacheRule
+              metadata:
+                name: ghcr-rule
+              spec:
+                ecrRepositoryPrefix: ghcr
+                upstreamRegistryURL: "ghcr.io"
+                upstreamRegistry: "github-container-registry"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: PullThroughCacheRule
+              metadata:
+                name: ghcr-rule
+                namespace: ecrpullthroughcacherule
+              spec:
+                ecrRepositoryPrefix: ghcr
+                upstreamRegistryURL: "ghcr.io"
+                upstreamRegistry: github-container-registry
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6b: ecrRepositoryPrefix set to ROOT (special sentinel value).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6b-root-ecrrepo-prefix
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPullThroughCacheRule
+              metadata:
+                name: root-prefix-rule
+              spec:
+                ecrRepositoryPrefix: "ROOT"
+                upstreamRegistryURL: "public.ecr.aws"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: PullThroughCacheRule
+              metadata:
+                name: root-prefix-rule
+                namespace: ecrpullthroughcacherule
+              spec:
+                ecrRepositoryPrefix: "ROOT"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: Three-tier tags cascade — mandatory wins; tags appear in ACK child
+    # metadata.labels with aws.kropath.run/ prefix (ECRPullThroughCacheRule
+    # has no cloud-side tags API, so cascade targets K8s labels only).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-tags-cascade
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: tags-cascade-policy
+                namespace: ecrpullthroughcacherule
+                labels:
+                  aws.kropath.run/resource-name: tags-cascade-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags:
+                    env: "production"
+                    team: "platform"
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{namespace}/{name}"
+                  tags:
+                    env: "staging"
+                    tier: "cache"
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig tags-cascade-policy -n ecrpullthroughcacherule \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{"env":"production","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{"env":"staging","tier":"cache"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPullThroughCacheRule
+              metadata:
+                name: tags-cascade-rule
+              spec:
+                ecrRepositoryPrefix: tags-cascade
+                upstreamRegistryURL: "registry-1.docker.io"
+                configRef: tags-cascade-policy
+                tags:
+                  env: "dev"
+                  service: "cache-layer"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: PullThroughCacheRule
+              metadata:
+                name: tags-cascade-rule
+                namespace: ecrpullthroughcacherule
+        - script:
+            content: |
+              LABELS=$(kubectl get pullthroughcacherules.ecr.services.k8s.aws tags-cascade-rule -n ecrpullthroughcacherule -o json | jq '.metadata.labels')
+              echo "Labels: $LABELS"
+              # mandatory env=production must win over spec env=dev and defaults env=staging
+              echo "$LABELS" | jq -e '.["aws.kropath.run/env"] == "production"' || { echo "FAIL: aws.kropath.run/env should be production (mandatory wins)"; exit 1; }
+              # team from mandatory only
+              echo "$LABELS" | jq -e '.["aws.kropath.run/team"] == "platform"' || { echo "FAIL: aws.kropath.run/team should be platform"; exit 1; }
+              # service from spec (not overridden)
+              echo "$LABELS" | jq -e '.["aws.kropath.run/service"] == "cache-layer"' || { echo "FAIL: aws.kropath.run/service should be cache-layer"; exit 1; }
+              # tier from defaults (not overridden by mandatory or spec)
+              echo "$LABELS" | jq -e '.["aws.kropath.run/tier"] == "cache"' || { echo "FAIL: aws.kropath.run/tier should be cache"; exit 1; }
+              echo "PASS: three-tier tags cascade verified"
+
+    # ──────────────────────────────────────────────────────────────────────────
     # AC-13: Attempt to update ecrRepositoryPrefix — immutable, enforced at ACK.
     # The kro wrapper propagates the update to the ACK child; ACK's own CRD
     # x-kubernetes-validations reject the field change.
