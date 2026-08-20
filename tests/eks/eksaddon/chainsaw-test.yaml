@@ -1,0 +1,258 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eks-05 Chainsaw tests — EKSAddon RGD (naming exemption KRO-236).
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: eksaddon
+spec:
+  skipDelete: true
+  namespace: eksaddon
+  steps:
+    # Seed: create namespace and governance config, patch effectiveConfig.
+    - name: seed
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 00-eksconfig.yaml
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksaddon \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"owner":"platform-team"}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # AC-7: coredns addon with explicit clusterName + addonName.
+    # ACK Addon CR spec.name = addonName (not metadata.name).
+    - name: ac7-basic-coredns-addon
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: coredns-addon
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: coredns
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: coredns-addon
+                namespace: eksaddon
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: coredns-addon
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                name: coredns
+                clusterName: prod-cluster
+                resolveConflicts: OVERWRITE
+
+    # AC-9: explicit addonVersion is passed through to ACK Addon.
+    - name: ac9-addon-version
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: coredns-versioned
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: coredns
+                addonVersion: v1.11.4-eksbuild.1
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: coredns-versioned
+                namespace: eksaddon
+              spec:
+                name: coredns
+                addonVersion: v1.11.4-eksbuild.1
+
+    # AC-11: resolveConflicts defaults to OVERWRITE.
+    # AC-10: addonVersion defaults to empty string (use latest).
+    - name: ac10-ac11-addon-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: vpc-cni-addon
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: vpc-cni
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: vpc-cni-addon
+                namespace: eksaddon
+              spec:
+                name: vpc-cni
+                resolveConflicts: OVERWRITE
+                addonVersion: ""
+
+    # AC-12: explicit resolveConflicts PRESERVE.
+    - name: ac12-resolve-conflicts-preserve
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: coredns-preserve
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: coredns
+                resolveConflicts: PRESERVE
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: coredns-preserve
+                namespace: eksaddon
+              spec:
+                resolveConflicts: PRESERVE
+
+    # AC-13: configurationValues passthrough.
+    - name: ac13-configuration-values
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: coredns-cfg
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: coredns
+                configurationValues: '{"replicaCount": 3}'
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: coredns-cfg
+                namespace: eksaddon
+              spec:
+                configurationValues: '{"replicaCount": 3}'
+
+    # AC-15: serviceAccountRoleArn maps to ACK spec.serviceAccountRoleARN.
+    - name: ac15-service-account-role
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: ebs-csi-addon
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: aws-ebs-csi-driver
+                serviceAccountRoleArn: arn:aws:iam::123456789012:role/ebs-csi-driver-sa
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: ebs-csi-addon
+                namespace: eksaddon
+              spec:
+                serviceAccountRoleARN: arn:aws:iam::123456789012:role/ebs-csi-driver-sa
+
+    # AC-1: mandatory tags win over instance tags; mandatory syncedLabels added.
+    # AC-2: mandatory syncedLabels applied to ACK Addon metadata.labels.
+    # AC-3: mandatory syncedAnnotations applied to ACK Addon metadata.annotations.
+    - name: ac1-ac2-ac3-tags-and-labels-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: coredns-tagged
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: coredns
+                tags:
+                  team: data-eng
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: coredns-tagged
+                namespace: eksaddon
+                labels:
+                  aws.kropath.run/environment: production
+              spec:
+                tags:
+                  cost-centre: platform
+                  team: data-eng
+
+    # AC-4: deletion-policy annotation defaults to retain.
+    - name: ac4-deletion-policy-retain-default
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: coredns-addon
+                namespace: eksaddon
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-5 / AC-6: deletion policy delete.
+    - name: ac5-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAddon
+              metadata:
+                name: coredns-delete
+                namespace: eksaddon
+              spec:
+                clusterName: prod-cluster
+                addonName: coredns
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Addon
+              metadata:
+                name: coredns-delete
+                namespace: eksaddon
+                annotations:
+                  services.k8s.aws/deletion-policy: delete

@@ -1,0 +1,309 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eks-06 Chainsaw tests — EKSAccessEntry RGD (naming exemption KRO-236).
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: eksaccessentry
+spec:
+  skipDelete: true
+  namespace: eksaccessentry
+  steps:
+    # Seed: namespace, governance config, patch effectiveConfig.
+    - name: seed
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 00-eksconfig.yaml
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksaccessentry \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"owner":"security-team"}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # AC-7: role principal entry — principalARN and clusterName passthrough.
+    # Default type STANDARD when not set.
+    - name: ac7-role-principal
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: platform-admin-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/platform-admin
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: platform-admin-entry
+                namespace: eksaccessentry
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: platform-admin-entry
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                principalARN: arn:aws:iam::123456789012:role/platform-admin
+                clusterName: prod-cluster
+                type: STANDARD
+
+    # AC-8: user principal — IAM user entry.
+    - name: ac8-user-principal
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: developer-user-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:user/developer
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: developer-user-entry
+                namespace: eksaccessentry
+              spec:
+                principalARN: arn:aws:iam::123456789012:user/developer
+
+    # AC-10: explicit type EC2_LINUX.
+    - name: ac10-ec2-linux-type
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: ec2-linux-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/node-role
+                type: EC2_LINUX
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: ec2-linux-entry
+                namespace: eksaccessentry
+              spec:
+                type: EC2_LINUX
+
+    # AC-11: accessPolicies with cluster-scoped policy.
+    - name: ac11-access-policy-cluster-scoped
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: admin-policy-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/admin-role
+                accessPolicies:
+                  - policyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+                    accessScope:
+                      type: cluster
+                      namespaces: []
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: admin-policy-entry
+                namespace: eksaccessentry
+              spec:
+                accessPolicies:
+                  - policyARN: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+                    accessScope:
+                      type: cluster
+
+    # AC-12: accessPolicies with namespace-scoped policy.
+    - name: ac12-access-policy-namespace-scoped
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: ns-policy-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/dev-role
+                accessPolicies:
+                  - policyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy
+                    accessScope:
+                      type: namespace
+                      namespaces:
+                        - payments
+                        - orders
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: ns-policy-entry
+                namespace: eksaccessentry
+              spec:
+                accessPolicies:
+                  - policyARN: arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy
+                    accessScope:
+                      type: namespace
+                      namespaces:
+                        - payments
+                        - orders
+
+    # AC-13: omitted accessPolicies → empty list.
+    - name: ac13-no-access-policies
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: no-policy-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/read-only-role
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: no-policy-entry
+                namespace: eksaccessentry
+              spec:
+                accessPolicies: []
+
+    # AC-14: kubernetesGroups passthrough.
+    - name: ac14-kubernetes-groups
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: groups-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/groups-role
+                kubernetesGroups:
+                  - cluster-admins
+                  - platform-ops
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: groups-entry
+                namespace: eksaccessentry
+              spec:
+                kubernetesGroups:
+                  - cluster-admins
+                  - platform-ops
+
+    # AC-16: username override passthrough.
+    - name: ac16-username
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: username-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/ops-role
+                username: ops-admin
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: username-entry
+                namespace: eksaccessentry
+              spec:
+                username: ops-admin
+
+    # AC-1: mandatory tags win; AC-2: syncedLabels on ACK metadata.labels; AC-3: syncedAnnotations.
+    - name: ac1-ac2-ac3-governance-metadata
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: platform-admin-entry
+                namespace: eksaccessentry
+                labels:
+                  aws.kropath.run/environment: production
+              spec:
+                tags:
+                  cost-centre: platform
+
+    # AC-4: deletion-policy retain default.
+    - name: ac4-deletion-policy-retain
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: platform-admin-entry
+                namespace: eksaccessentry
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-5/AC-6: deletion-policy delete.
+    - name: ac5-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              metadata:
+                name: delete-entry
+                namespace: eksaccessentry
+              spec:
+                clusterName: prod-cluster
+                principalArn: arn:aws:iam::123456789012:role/temp-role
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: AccessEntry
+              metadata:
+                name: delete-entry
+                namespace: eksaccessentry
+                annotations:
+                  services.k8s.aws/deletion-policy: delete

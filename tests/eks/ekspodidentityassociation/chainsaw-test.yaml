@@ -1,0 +1,190 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eks-07 Chainsaw tests — EKSPodIdentityAssociation RGD (naming exemption KRO-236).
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ekspodidentityassociation
+spec:
+  skipDelete: true
+  namespace: ekspodidentityassociation
+  steps:
+    # Seed: namespace, governance config, patch effectiveConfig.
+    - name: seed
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 00-eksconfig.yaml
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekspodidentityassociation \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"owner":"platform-team"}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # AC-7: basic association — namespace, serviceAccount, roleArn → ACK PodIdentityAssociation.
+    - name: ac7-basic-association
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSPodIdentityAssociation
+              metadata:
+                name: payments-processor-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                clusterName: prod-cluster
+                namespace: payments
+                serviceAccount: payment-processor
+                roleArn: arn:aws:iam::123456789012:role/payment-processor-role
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: payments-processor-assoc
+                namespace: ekspodidentityassociation
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: payments-processor-assoc
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                clusterName: prod-cluster
+                namespace: payments
+                serviceAccount: payment-processor
+                roleARN: arn:aws:iam::123456789012:role/payment-processor-role
+                disableSessionTags: false
+
+    # AC-8: targetRoleArn → ACK spec.targetRoleARN.
+    - name: ac8-target-role-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSPodIdentityAssociation
+              metadata:
+                name: cross-account-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                clusterName: prod-cluster
+                namespace: data
+                serviceAccount: data-reader
+                roleArn: arn:aws:iam::123456789012:role/data-reader-role
+                targetRoleArn: arn:aws:iam::987654321098:role/cross-account-data-role
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: cross-account-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                targetRoleARN: arn:aws:iam::987654321098:role/cross-account-data-role
+
+    # AC-10: disableSessionTags defaults to false.
+    - name: ac10-disable-session-tags-false-default
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: payments-processor-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                disableSessionTags: false
+
+    # AC-11: disableSessionTags true.
+    - name: ac11-disable-session-tags-true
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSPodIdentityAssociation
+              metadata:
+                name: no-session-tags-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                clusterName: prod-cluster
+                namespace: infra
+                serviceAccount: infra-sa
+                roleArn: arn:aws:iam::123456789012:role/infra-role
+                disableSessionTags: true
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: no-session-tags-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                disableSessionTags: true
+
+    # AC-12: policy JSON passthrough.
+    - name: ac12-inline-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSPodIdentityAssociation
+              metadata:
+                name: policy-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                clusterName: prod-cluster
+                namespace: ml
+                serviceAccount: ml-trainer
+                roleArn: arn:aws:iam::123456789012:role/ml-trainer-role
+                policy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}'
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: policy-assoc
+                namespace: ekspodidentityassociation
+              spec:
+                policy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}'
+
+    # AC-1: mandatory tags win; AC-2: syncedLabels on metadata.labels.
+    - name: ac1-ac2-ac3-governance-metadata
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: payments-processor-assoc
+                namespace: ekspodidentityassociation
+                labels:
+                  aws.kropath.run/environment: production
+              spec:
+                tags:
+                  cost-centre: platform
+
+    # AC-4: deletion-policy retain default.
+    - name: ac4-deletion-policy-retain
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: PodIdentityAssociation
+              metadata:
+                name: payments-processor-assoc
+                namespace: ekspodidentityassociation
+                annotations:
+                  services.k8s.aws/deletion-policy: retain

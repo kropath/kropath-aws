@@ -1,0 +1,482 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eks-01 Chainsaw tests — EKSCluster RGD (naming + predictedArn + full governance cascade).
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+# NOTE: effectiveConfig patch uses NESTED structure (what the controller writes):
+#   mandatory.accessConfig.authenticationMode (not mandatory.authenticationMode)
+#   mandatory.encryptionConfig.keyArn (not mandatory.encryptionKeyArn)
+#   mandatory.logging.types (not mandatory.loggingTypes)
+#   mandatory.upgradePolicy.supportType (not mandatory.supportType)
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ekscluster
+spec:
+  skipDelete: true
+  namespace: ekscluster
+  steps:
+    # Seed: namespace, governance config, patch effectiveConfig.
+    - name: seed
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 00-eksconfig.yaml
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"owner":"platform-team"}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # AC-1/AC-5: basic cluster; effectiveName = ekscluster-prod; predictedArn uses accountId+region.
+    - name: ac1-ac5-basic-cluster
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: prod
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+                    - subnet-4e5f6g7h
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: prod-naming
+                namespace: ekscluster
+              data:
+                effectiveName: ekscluster-prod
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: prod
+                namespace: ekscluster
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: prod
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                name: ekscluster-prod
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+                    - subnet-4e5f6g7h
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: prod
+                namespace: ekscluster
+              status:
+                resourceName: ekscluster-prod
+                predictedArn: arn:aws:eks:ap-southeast-2:123456789012:cluster/ekscluster-prod
+
+    # AC-4: version from defaults (1.31).
+    - name: ac4-version-from-defaults
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: prod
+                namespace: ekscluster
+              spec:
+                version: "1.31"
+
+    # AC-6: version in mandatory overrides defaults.
+    - name: ac6-mandatory-version
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"1.30","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: versioned
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: versioned
+                namespace: ekscluster
+              spec:
+                version: "1.30"
+
+    # AC-7: spec.version overrides defaults (no mandatory version set).
+    - name: ac7-spec-version
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: spec-version
+                namespace: ekscluster
+              spec:
+                version: "1.29"
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: spec-version
+                namespace: ekscluster
+              spec:
+                version: "1.29"
+
+    # AC-8: authenticationMode defaults to "API".
+    - name: ac8-auth-mode-defaults
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: prod
+                namespace: ekscluster
+              spec:
+                accessConfig:
+                  authenticationMode: API
+
+    # AC-9: authenticationMode in mandatory.
+    - name: ac9-mandatory-auth-mode
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":"API_AND_CONFIG_MAP"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: auth-mode
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: auth-mode
+                namespace: ekscluster
+              spec:
+                accessConfig:
+                  authenticationMode: API_AND_CONFIG_MAP
+
+    # AC-10: endpoint access — defaults: both true; spec can override each independently.
+    - name: ac10-endpoint-access-defaults
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: endpoint-defaults
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: endpoint-defaults
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  endpointPublicAccess: true
+                  endpointPrivateAccess: true
+
+    # AC-10: spec overrides endpoint access.
+    - name: ac10-endpoint-access-spec-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: endpoint-private-only
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+                  endpointPublicAccess: false
+                  endpointPrivateAccess: true
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: endpoint-private-only
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  endpointPublicAccess: false
+                  endpointPrivateAccess: true
+
+    # AC-11: upgradePolicy supportType defaults to "STANDARD".
+    - name: ac11-support-type-defaults
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: prod
+                namespace: ekscluster
+              spec:
+                upgradePolicy:
+                  supportType: STANDARD
+
+    # AC-12: upgradePolicy supportType "EXTENDED" in mandatory.
+    - name: ac12-support-type-mandatory
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":"EXTENDED"},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: extended-support
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: extended-support
+                namespace: ekscluster
+              spec:
+                upgradePolicy:
+                  supportType: EXTENDED
+
+    # AC-14: nameOverride.
+    - name: ac14-name-override
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: override-cluster
+                namespace: ekscluster
+              spec:
+                nameOverride: my-production-cluster
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: override-cluster-naming
+                namespace: ekscluster
+              data:
+                effectiveName: my-production-cluster
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: override-cluster
+                namespace: ekscluster
+              spec:
+                name: my-production-cluster
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: override-cluster
+                namespace: ekscluster
+              status:
+                predictedArn: arn:aws:eks:ap-southeast-2:123456789012:cluster/my-production-cluster
+
+    # AC-15: unresolved naming token.
+    - name: ac15-unresolved-naming-token
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: unresolved-cluster
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: unresolved-cluster-naming
+                namespace: ekscluster
+              data:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-17: mandatory tags win.
+    - name: ac17-tags-merge
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{"cost-centre":"platform","env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{"team":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: tagged-cluster
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+                tags:
+                  service: eks
+        - script:
+            content: |
+              kubectl get cluster.eks.services.k8s.aws tagged-cluster -n ekscluster \
+                -o json | jq -e '
+                (.spec.tags["cost-centre"] == "platform") and
+                (.spec.tags["env"] == "prod") and
+                (.spec.tags["service"] == "eks")
+              '
+
+    # AC-18: deletion-policy delete.
+    - name: ac18-deletion-policy-delete
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":false,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: delete-cluster
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: delete-cluster
+                namespace: ekscluster
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-19: endpointPublicAccess defaults true; AC-20: mandatory endpoint values govern.
+    - name: ac19-ac20-mandatory-endpoint-access
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n ekscluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"version":"","accessConfig":{"authenticationMode":""},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":false,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":""},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"version":"1.31","accessConfig":{"authenticationMode":"API"},"encryptionConfig":{"keyArn":""},"logging":{"types":[]},"endpointPublicAccess":true,"endpointPrivateAccess":true,"upgradePolicy":{"supportType":"STANDARD"},"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              metadata:
+                name: governed-endpoint
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  subnetIDs:
+                    - subnet-0a1b2c3d
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: governed-endpoint
+                namespace: ekscluster
+              spec:
+                resourcesVPCConfig:
+                  endpointPublicAccess: false
+                  endpointPrivateAccess: true

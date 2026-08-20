@@ -1,0 +1,215 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eks-08 Chainsaw tests — EKSIdentityProviderConfig RGD (naming exemption KRO-236).
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: eksidentityproviderconfig
+spec:
+  skipDelete: true
+  namespace: eksidentityproviderconfig
+  steps:
+    # Seed: namespace, governance config, patch effectiveConfig.
+    - name: seed
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 00-eksconfig.yaml
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksidentityproviderconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"owner":"security-team"}},"defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # AC-7: basic OIDC config — required fields clientId, issuerUrl; optional identityProviderConfigName.
+    - name: ac7-basic-oidc-config
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSIdentityProviderConfig
+              metadata:
+                name: corporate-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                clusterName: prod-cluster
+                oidc:
+                  clientId: my-app-client-id
+                  issuerUrl: https://login.example.com/oauth2
+                  identityProviderConfigName: corporate-sso
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: IdentityProviderConfig
+              metadata:
+                name: corporate-sso
+                namespace: eksidentityproviderconfig
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: corporate-sso
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                clusterName: prod-cluster
+                oidc:
+                  clientID: my-app-client-id
+                  issuerURL: https://login.example.com/oauth2
+                  identityProviderConfigName: corporate-sso
+
+    # AC-9: identityProviderConfigName omitted → empty string passthrough.
+    - name: ac9-no-idp-config-name
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSIdentityProviderConfig
+              metadata:
+                name: no-name-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                clusterName: prod-cluster
+                oidc:
+                  clientId: app-client-id
+                  issuerUrl: https://sso.example.org/oauth2
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: IdentityProviderConfig
+              metadata:
+                name: no-name-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                oidc:
+                  identityProviderConfigName: ""
+
+    # AC-10: usernameClaim and usernamePrefix passthrough.
+    - name: ac10-username-claim-prefix
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSIdentityProviderConfig
+              metadata:
+                name: username-claim-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                clusterName: prod-cluster
+                oidc:
+                  clientId: app-client-id
+                  issuerUrl: https://sso.example.org/oauth2
+                  usernameClaim: email
+                  usernamePrefix: "oidc:"
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: IdentityProviderConfig
+              metadata:
+                name: username-claim-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                oidc:
+                  usernameClaim: email
+                  usernamePrefix: "oidc:"
+
+    # AC-11: groupsClaim and groupsPrefix passthrough.
+    - name: ac11-groups-claim-prefix
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSIdentityProviderConfig
+              metadata:
+                name: groups-claim-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                clusterName: prod-cluster
+                oidc:
+                  clientId: app-client-id
+                  issuerUrl: https://sso.example.org/oauth2
+                  groupsClaim: groups
+                  groupsPrefix: "idp:"
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: IdentityProviderConfig
+              metadata:
+                name: groups-claim-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                oidc:
+                  groupsClaim: groups
+                  groupsPrefix: "idp:"
+
+    # AC-12: requiredClaims map passthrough.
+    - name: ac12-required-claims
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSIdentityProviderConfig
+              metadata:
+                name: required-claims-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                clusterName: prod-cluster
+                oidc:
+                  clientId: app-client-id
+                  issuerUrl: https://sso.example.org/oauth2
+                  requiredClaims:
+                    department: engineering
+                    tenant: acme
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: IdentityProviderConfig
+              metadata:
+                name: required-claims-sso
+                namespace: eksidentityproviderconfig
+              spec:
+                oidc:
+                  requiredClaims:
+                    department: engineering
+                    tenant: acme
+
+    # AC-1: mandatory tags win; AC-2: syncedLabels on ACK metadata.labels.
+    - name: ac1-ac2-ac3-governance-metadata
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: IdentityProviderConfig
+              metadata:
+                name: corporate-sso
+                namespace: eksidentityproviderconfig
+                labels:
+                  aws.kropath.run/environment: production
+              spec:
+                tags:
+                  cost-centre: platform
+
+    # AC-4: deletion-policy retain default.
+    - name: ac4-deletion-policy-retain
+      try:
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: IdentityProviderConfig
+              metadata:
+                name: corporate-sso
+                namespace: eksidentityproviderconfig
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
