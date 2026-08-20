@@ -94,24 +94,73 @@ kubectl apply "${non_lambda_args[@]}"
 # Without this wait, Lambda wave 1's 120s clock starts while kro is still processing
 # the non-lambda batch (90+ RGDs), and Lambda times out before kro drains the queue.
 # This became a problem when the EKS family (7 RGDs) was added (KRO-532).
+#
+# Caveat: some ACK chart versions are published to GitHub Releases before the ECR OCI
+# registry is updated. When hack/install-provider-crds.sh cannot pull a chart from ECR,
+# the affected RGDs permanently fail with GraphAccepted=False (schema not found). Those
+# RGDs are NOT in kro's processing queue (they were rejected at compile time) and will
+# never reach Ready, so `kubectl wait --all` would block for the full 300s. We
+# distinguish permanent compile-time failures from genuine graph errors: if ALL not-ready
+# RGDs have GraphAccepted=False, the queue IS drained and setup continues. If any
+# not-ready RGD does NOT have GraphAccepted=False, it is a real error that blocks setup.
 echo "==> Waiting for all non-lambda RGDs to become Ready (drains kro queue before Lambda waves)..."
 if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
   echo ""
   echo "======================================================================"
-  echo "Non-lambda RGD readiness FAILED. Broken RGDs:"
-  echo "======================================================================"
   not_ready=$(kubectl get rgd -o jsonpath='{range .items[?(@.status.state!="Active")]}{.metadata.name}{"\n"}{end}')
+
   if [ -z "${not_ready}" ]; then
-    echo "  (none are Inactive — slow-cluster timeout, not a broken graph.)"
-  else
-    for rgd in ${not_ready}; do
+    echo "Non-lambda RGD readiness TIMED OUT (slow cluster; all RGDs are now Active)."
+    echo "kro queue did not drain within the 300s budget; Lambda wave timing may be affected."
+    echo "======================================================================"
+    exit 1
+  fi
+
+  # Classify failures: permanent GraphAccepted=False (ACK CRDs missing from ECR) vs genuine
+  # graph compilation errors. Permanent failures do NOT consume kro queue capacity.
+  perm_failed_rgds=()
+  has_non_perm_failure=false
+  while IFS= read -r rgd; do
+    [ -z "${rgd}" ] && continue
+    ga_status=$(kubectl get rgd "${rgd}" \
+      -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].status}' 2>/dev/null || true)
+    if [ "${ga_status}" = "False" ]; then
+      perm_failed_rgds+=("${rgd}")
+    else
+      has_non_perm_failure=true
+    fi
+  done <<< "${not_ready}"
+
+  if [ "${#perm_failed_rgds[@]}" -gt 0 ]; then
+    echo "  WARNING: The following RGDs have permanent GraphAccepted=False (ACK CRDs not in ECR)."
+    echo "  kro queue IS drained for all valid RGDs; these are compile-time rejections."
+    echo "  Their individual test suites will surface the exact missing-CRD errors. Setup continues."
+    for rgd in "${perm_failed_rgds[@]}"; do
+      msg=$(kubectl get rgd "${rgd}" \
+        -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].message}' 2>/dev/null || true)
+      echo "    - ${rgd}: ${msg}"
+    done
+    echo ""
+  fi
+
+  if ${has_non_perm_failure}; then
+    echo "Non-lambda RGD readiness FAILED (genuine graph errors — fix these before proceeding):"
+    while IFS= read -r rgd; do
+      [ -z "${rgd}" ] && continue
+      ga_status=$(kubectl get rgd "${rgd}" \
+        -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].status}' 2>/dev/null || true)
+      [ "${ga_status}" = "False" ] && continue
       echo ""
       echo "--- ${rgd} ---"
-      kubectl get rgd "${rgd}" -o jsonpath='{range .status.conditions[*]}  {.type}={.status} :: {.message}{"\n"}{end}'
-    done
+      kubectl get rgd "${rgd}" \
+        -o jsonpath='{range .status.conditions[*]}  {.type}={.status} :: {.message}{"\n"}{end}'
+    done <<< "${not_ready}"
+    echo "======================================================================"
+    exit 1
   fi
+
   echo "======================================================================"
-  exit 1
+  # All not-ready RGDs have permanent GraphAccepted=False — queue is drained, proceeding.
 fi
 
 # Lambda RGDs reference each other's kro-generated kinds via externalRef.
@@ -158,32 +207,70 @@ echo "==> Waiting for all RGDs to become Ready (kro must generate CRDs before te
 # "first broken RGD + everything after it", NOT the set of broken RGDs — reading it literally
 # has twice sent someone chasing healthy RGDs (KRO-443). Always print the real diagnosis on
 # failure so CI logs name the actual offender and its validation error.
+# As with the non-lambda wait above: permanent GraphAccepted=False RGDs (missing ACK CRDs) are
+# skipped — they are not blocking tests for other services and will not become Active.
 if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
   echo ""
   echo "======================================================================"
-  echo "RGD readiness FAILED. Ignore the 'timed out' list above — it is mostly"
-  echo "collateral from kubectl wait's shared timeout budget."
-  echo "The RGDs below are the ones actually broken:"
-  echo "======================================================================"
   not_ready=$(kubectl get rgd -o jsonpath='{range .items[?(@.status.state!="Active")]}{.metadata.name}{"\n"}{end}')
+
   if [ -z "${not_ready}" ]; then
-    echo "  (none are Inactive — all RGDs reached Active after the deadline;"
-    echo "   this is a slow-cluster timeout, not a broken graph.)"
-  else
-    for rgd in ${not_ready}; do
+    echo "RGD readiness TIMED OUT (slow cluster; all RGDs reached Active after the deadline)."
+    echo "This is a slow-cluster timeout, not a broken graph."
+    echo "======================================================================"
+    exit 1
+  fi
+
+  perm_failed_rgds=()
+  has_non_perm_failure=false
+  while IFS= read -r rgd; do
+    [ -z "${rgd}" ] && continue
+    ga_status=$(kubectl get rgd "${rgd}" \
+      -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].status}' 2>/dev/null || true)
+    if [ "${ga_status}" = "False" ]; then
+      perm_failed_rgds+=("${rgd}")
+    else
+      has_non_perm_failure=true
+    fi
+  done <<< "${not_ready}"
+
+  if [ "${#perm_failed_rgds[@]}" -gt 0 ]; then
+    echo "  WARNING: The following RGDs have permanent GraphAccepted=False (ACK CRDs not in ECR)."
+    echo "  Their test suites will surface the exact missing-CRD errors."
+    for rgd in "${perm_failed_rgds[@]}"; do
+      msg=$(kubectl get rgd "${rgd}" \
+        -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].message}' 2>/dev/null || true)
+      echo "    - ${rgd}: ${msg}"
+    done
+    echo ""
+  fi
+
+  if ${has_non_perm_failure}; then
+    echo "RGD readiness FAILED. Ignore the 'timed out' list above — it is mostly"
+    echo "collateral from kubectl wait's shared timeout budget."
+    echo "The RGDs below are the ones actually broken:"
+    while IFS= read -r rgd; do
+      [ -z "${rgd}" ] && continue
+      ga_status=$(kubectl get rgd "${rgd}" \
+        -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].status}' 2>/dev/null || true)
+      [ "${ga_status}" = "False" ] && continue
       echo ""
       echo "--- ${rgd} ---"
-      kubectl get rgd "${rgd}" -o jsonpath='{range .status.conditions[*]}  {.type}={.status} :: {.message}{"\n"}{end}'
-    done
+      kubectl get rgd "${rgd}" \
+        -o jsonpath='{range .status.conditions[*]}  {.type}={.status} :: {.message}{"\n"}{end}'
+    done <<< "${not_ready}"
     echo ""
     echo "To reproduce and iterate locally (kro re-validates only on re-CREATE, never on re-apply):"
     echo "  kubectl delete rgd <name> && kubectl apply -f rgds/<name>.yaml"
     echo "  kubectl get rgd <name> -o jsonpath='{.status.conditions[?(@.type==\"GraphAccepted\")].message}'"
     echo "Errors surface ONE LAYER AT A TIME — repeat until the RGD reports Active."
     echo "See docs/frequent-rgd-errors.md §7 and §8."
+    echo "======================================================================"
+    exit 1
   fi
+
   echo "======================================================================"
-  exit 1
+  # All not-ready RGDs have permanent GraphAccepted=False — tests proceed.
 fi
 
 echo "==> Test environment ready."
