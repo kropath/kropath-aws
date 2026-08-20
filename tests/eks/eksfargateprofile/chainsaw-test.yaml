@@ -1,0 +1,299 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-eks-04 Chainsaw tests — EKSFargateProfile RGD (naming, no predictedArn).
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: eksfargateprofile
+spec:
+  skipDelete: true
+  namespace: eksfargateprofile
+  steps:
+    # Seed: namespace, governance config, patch effectiveConfig.
+    - name: seed
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 00-eksconfig.yaml
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksfargateprofile \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tags":{"cost-centre":"platform"},"syncedLabels":{"environment":"production"},"syncedAnnotations":{"owner":"platform-team"},"namingTemplate":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+
+    # AC-5/AC-1: basic fargate profile with defaults naming.
+    # Namespace = eksfargateprofile, name = core-fargate → effectiveName = eksfargateprofile-core-fargate.
+    - name: ac5-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSFargateProfile
+              metadata:
+                name: core-fargate
+                namespace: eksfargateprofile
+              spec:
+                clusterName: prod-cluster
+                podExecutionRoleArn: arn:aws:iam::123456789012:role/fargate-execution-role
+                subnets:
+                  - subnet-0a1b2c3d
+                  - subnet-4e5f6g7h
+                selectors:
+                  - namespace: kube-system
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: core-fargate-naming
+                namespace: eksfargateprofile
+              data:
+                effectiveName: eksfargateprofile-core-fargate
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: FargateProfile
+              metadata:
+                name: core-fargate
+                namespace: eksfargateprofile
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: core-fargate
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                name: eksfargateprofile-core-fargate
+                clusterName: prod-cluster
+                podExecutionRoleARN: arn:aws:iam::123456789012:role/fargate-execution-role
+                subnets:
+                  - subnet-0a1b2c3d
+                  - subnet-4e5f6g7h
+
+    # AC-2/AC-3: selectors with namespace only, and namespace + labels.
+    - name: ac2-ac3-selectors
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSFargateProfile
+              metadata:
+                name: app-fargate
+                namespace: eksfargateprofile
+              spec:
+                clusterName: prod-cluster
+                podExecutionRoleArn: arn:aws:iam::123456789012:role/fargate-execution-role
+                subnets:
+                  - subnet-0a1b2c3d
+                selectors:
+                  - namespace: kube-system
+                  - namespace: app-team
+                    labels:
+                      tier: frontend
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: FargateProfile
+              metadata:
+                name: app-fargate
+                namespace: eksfargateprofile
+              spec:
+                selectors:
+                  - namespace: kube-system
+                  - namespace: app-team
+                    labels:
+                      tier: frontend
+
+    # AC-6: mandatory namingTemplate overrides defaults.
+    - name: ac6-mandatory-naming-template
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksfargateprofile \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSFargateProfile
+              metadata:
+                name: mandatory-fargate
+                namespace: eksfargateprofile
+              spec:
+                clusterName: prod-cluster
+                podExecutionRoleArn: arn:aws:iam::123456789012:role/fargate-execution-role
+                subnets:
+                  - subnet-0a1b2c3d
+                selectors:
+                  - namespace: default
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: mandatory-fargate-naming
+                namespace: eksfargateprofile
+              data:
+                effectiveName: corp-eksfargateprofile-mandatory-fargate
+
+    # AC-7: spec.nameOverride bypasses all templates.
+    - name: ac7-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSFargateProfile
+              metadata:
+                name: override-fargate
+                namespace: eksfargateprofile
+              spec:
+                clusterName: prod-cluster
+                podExecutionRoleArn: arn:aws:iam::123456789012:role/fargate-execution-role
+                nameOverride: my-fargate-profile
+                subnets:
+                  - subnet-0a1b2c3d
+                selectors:
+                  - namespace: default
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: override-fargate-naming
+                namespace: eksfargateprofile
+              data:
+                effectiveName: my-fargate-profile
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: FargateProfile
+              metadata:
+                name: override-fargate
+                namespace: eksfargateprofile
+              spec:
+                name: my-fargate-profile
+
+    # AC-8: unresolved {tag.env} token → namingStatus: invalid-unresolved-tokens.
+    # ACK FargateProfile CR is NOT created (includeWhen guard).
+    - name: ac8-unresolved-naming-token
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksfargateprofile \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSFargateProfile
+              metadata:
+                name: unresolved-fargate
+                namespace: eksfargateprofile
+              spec:
+                clusterName: prod-cluster
+                podExecutionRoleArn: arn:aws:iam::123456789012:role/fargate-execution-role
+                subnets:
+                  - subnet-0a1b2c3d
+                selectors:
+                  - namespace: default
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: unresolved-fargate-naming
+                namespace: eksfargateprofile
+              data:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-9: no predictedArn in status (AC-9: status.predictedArn is absent for FargateProfile).
+    - name: ac9-no-predicted-arn
+      try:
+        - script:
+            content: |
+              STATUS=$(kubectl get eksfargateprofile core-fargate -n eksfargateprofile -o jsonpath='{.status.predictedArn}' 2>/dev/null)
+              test -z "$STATUS"
+
+    # AC-10: tags merge — reset config to clean state first.
+    - name: ac10-tags-merge
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksfargateprofile \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{"team":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSFargateProfile
+              metadata:
+                name: tagged-fargate
+                namespace: eksfargateprofile
+              spec:
+                clusterName: prod-cluster
+                podExecutionRoleArn: arn:aws:iam::123456789012:role/fargate-execution-role
+                subnets:
+                  - subnet-0a1b2c3d
+                selectors:
+                  - namespace: default
+                tags:
+                  service: fargate
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: FargateProfile
+              metadata:
+                name: tagged-fargate
+                namespace: eksfargateprofile
+              spec:
+                tags:
+                  cost-centre: platform
+                  service: fargate
+
+    # AC-14: deletion-policy delete.
+    - name: ac14-deletion-policy-delete
+      try:
+        - script:
+            content: |
+              kubectl patch eksconfig general-policy -n eksfargateprofile \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSFargateProfile
+              metadata:
+                name: delete-fargate
+                namespace: eksfargateprofile
+              spec:
+                clusterName: prod-cluster
+                podExecutionRoleArn: arn:aws:iam::123456789012:role/fargate-execution-role
+                subnets:
+                  - subnet-0a1b2c3d
+                selectors:
+                  - namespace: default
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: eks.services.k8s.aws/v1alpha1
+              kind: FargateProfile
+              metadata:
+                name: delete-fargate
+                namespace: eksfargateprofile
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
