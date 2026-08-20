@@ -90,6 +90,30 @@ for rgd in "${SCRIPT_DIR}/../rgds/"*.yaml; do
 done
 kubectl apply "${non_lambda_args[@]}"
 
+# Wait for all non-lambda RGDs to become Ready before starting Lambda waves.
+# Without this wait, Lambda wave 1's 120s clock starts while kro is still processing
+# the non-lambda batch (90+ RGDs), and Lambda times out before kro drains the queue.
+# This became a problem when the EKS family (7 RGDs) was added (KRO-532).
+echo "==> Waiting for all non-lambda RGDs to become Ready (drains kro queue before Lambda waves)..."
+if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
+  echo ""
+  echo "======================================================================"
+  echo "Non-lambda RGD readiness FAILED. Broken RGDs:"
+  echo "======================================================================"
+  not_ready=$(kubectl get rgd -o jsonpath='{range .items[?(@.status.state!="Active")]}{.metadata.name}{"\n"}{end}')
+  if [ -z "${not_ready}" ]; then
+    echo "  (none are Inactive — slow-cluster timeout, not a broken graph.)"
+  else
+    for rgd in ${not_ready}; do
+      echo ""
+      echo "--- ${rgd} ---"
+      kubectl get rgd "${rgd}" -o jsonpath='{range .status.conditions[*]}  {.type}={.status} :: {.message}{"\n"}{end}'
+    done
+  fi
+  echo "======================================================================"
+  exit 1
+fi
+
 # Lambda RGDs reference each other's kro-generated kinds via externalRef.
 # kro validates every referenced GVK against the live API server at compile time.
 # Applying all 7 simultaneously causes permanent Inactive state for those that
