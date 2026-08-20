@@ -1,0 +1,128 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+# aws-eks-06 — EKSAccessEntry RGD (naming exemption per KRO-236: resource identified by clusterName + principalARN)
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: eksaccessentry.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: EKSAccessEntry
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Cluster reference
+      clusterName: string | default=""
+      # Access entry configuration
+      principalArn: string | default=""
+      type: string | default=STANDARD
+      kubernetesGroups: "[]string | default=[]"
+      username: string | default=""
+      accessPolicies: "[]AccessPolicy | default=[]"
+    types:
+      AccessPolicy:
+        policyArn: string | default=""
+        accessScope: AccessScope | default={}
+      AccessScope:
+        type: string | default=cluster
+        namespaces: "[]string | default=[]"
+    status:
+      conditions: >-
+        ${ackAccessEntry.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: PrincipalArn
+        type: string
+        jsonPath: .spec.principalArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: EKSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACK EKS AccessEntry CR — primary cloud resource.
+    # Naming exemption (KRO-236): identified by clusterName + principalARN; no provider name field.
+    # Mandatory type governance: mandatory.accessConfig.type overrides instance type when set.
+    - id: ackAccessEntry
+      template:
+        apiVersion: eks.services.k8s.aws/v1alpha1
+        kind: AccessEntry
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSAccessEntry
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Required: IAM principal ARN — identifies this access entry at the AWS API level.
+          principalARN: ${schema.spec.principalArn}
+          # Cluster reference
+          clusterName: ${schema.spec.clusterName}
+          # Entry type — mandatory tier overrides instance; default STANDARD.
+          type: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?accessConfig.?accessEntryType.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.accessConfig.accessEntryType
+              : (schema.spec.type != "" ? schema.spec.type : "STANDARD")}
+          # Kubernetes RBAC groups — instance-only passthrough.
+          kubernetesGroups: ${schema.spec.kubernetesGroups}
+          # Username override — instance-only passthrough.
+          username: ${schema.spec.username}
+          # Access policies — instance-only passthrough with field name mapping.
+          accessPolicies: >-
+            ${schema.spec.accessPolicies.map(p, {
+              "policyARN": p.policyArn,
+              "accessScope": {
+                "type": p.accessScope.type,
+                "namespaces": p.accessScope.namespaces
+              }
+            })}
+          # Cloud resource tags — direct map<string,string> passthrough.
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
