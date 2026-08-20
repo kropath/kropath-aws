@@ -53,7 +53,10 @@ ACK_BARE_NAMES=(
   mounttarget
   openidconnectprovider
   parametergroup
+  pullthroughcacherule
   replicationgroup
+  repository
+  repositorycreationtemplate
   resource
   restapi
   role

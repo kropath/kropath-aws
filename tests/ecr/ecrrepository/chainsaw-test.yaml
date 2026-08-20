@@ -1,0 +1,1020 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ecr-02 Chainsaw tests — one scenario per acceptance criterion.
+# Namespace: ecrrepository (fixed; {namespace}/{name} template expands predictably).
+# accountId: 123456789012 | region: us-east-1
+# effectiveConfig is injected via kubectl patch --subresource=status to simulate
+# kropath-controller (which is not running in the local test cluster).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ecrrepository
+spec:
+  skipDelete: true
+  namespace: ecrrepository
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy ECRConfig with effectiveConfig patched in
+    # so the RGD can resolve governance values without a live controller.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-ecrrepository-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch ecrconfig general-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: Basic creation — default naming template {namespace}/{name}, no config.
+    # AC-2: Naming template {namespace}/{name} produces correct effectiveName.
+    # AC-19: predictedArn is computed correctly.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-basic-creation-default-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: my-repo
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: my-repo
+                namespace: ecrrepository
+              spec:
+                name: ecrrepository/my-repo
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: my-repo
+                namespace: ecrrepository
+              status:
+                resourceName: ecrrepository/my-repo
+                namingStatus: valid
+                predictedArn: "arn:aws:ecr:us-east-1:123456789012:repository/ecrrepository/my-repo"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: spec.nameOverride takes precedence over template.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: override-repo
+              spec:
+                nameOverride: "my-custom/repo-name"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: override-repo
+                namespace: ecrrepository
+              spec:
+                name: my-custom/repo-name
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: override-repo
+              status:
+                resourceName: my-custom/repo-name
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: defaults.namingTemplate from ECRConfig applied.
+    # AC-10: defaults.imageTagMutability applied when no mandatory setting.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-defaults-naming-and-image-tag-mutability
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: custom-defaults
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: custom-defaults
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: "IMMUTABLE"
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "shared/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig custom-defaults -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"IMMUTABLE","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"shared/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: shared-repo
+              spec:
+                configRef: custom-defaults
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: shared-repo
+                namespace: ecrrepository
+              spec:
+                name: shared/shared-repo
+                imageTagMutability: "IMMUTABLE"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: shared-repo
+              status:
+                resourceName: shared/shared-repo
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: mandatory.namingTemplate overrides defaults and spec.
+    # AC-9: mandatory.imageTagMutability overrides spec.
+    # AC-11: mandatory.encryptionType overrides defaults.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-mandatory-overrides
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: mandatory-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: mandatory-policy
+              spec:
+                mandatory:
+                  imageTagMutability: "IMMUTABLE"
+                  encryptionType: "KMS"
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "mandatory/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig mandatory-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"IMMUTABLE","encryptionType":"KMS","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"mandatory/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: governed-repo
+              spec:
+                configRef: mandatory-policy
+                imageTagMutability: "MUTABLE"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: governed-repo
+                namespace: ecrrepository
+              spec:
+                name: mandatory/governed-repo
+                imageTagMutability: "IMMUTABLE"
+                encryptionConfiguration:
+                  encryptionType: "KMS"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: governed-repo
+              status:
+                resourceName: mandatory/governed-repo
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: spec.kmsKeyArn wired to encryptionConfiguration.kmsKey directly.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-kms-arn-direct
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-kmsarn
+              spec:
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/mrk-direct"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-kmsarn
+                namespace: ecrrepository
+              spec:
+                encryptionConfiguration:
+                  kmsKey: "arn:aws:kms:us-east-1:123456789012:key/mrk-direct"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7 (negative): kmsKeyRef + kmsKeyArn both set → validationError set.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-negative-kms-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-kms-both
+              spec:
+                kmsKeyRef: "some-key"
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/another"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-kms-both
+              status:
+                (validationError != ""): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: spec.kmsKeyRef resolved to KMSKey.status.predictedArn.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-kms-keyref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSConfig
+              metadata:
+                name: ecr-kmsref-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: ecr-kmsref-policy
+              spec:
+                mandatory:
+                  enableKeyRotation: false
+                  keySpec: ""
+                  keyUsage: ""
+                  allowedKeySpecs: []
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  enableKeyRotation: false
+                  keySpec: SYMMETRIC_DEFAULT
+                  keyUsage: ENCRYPT_DECRYPT
+                  allowedKeySpecs: []
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kmsconfig ecr-kmsref-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"SYMMETRIC_DEFAULT","keyUsage":"ENCRYPT_DECRYPT","allowedKeySpecs":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: ecr-kms-key
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: ecr-kms-key
+              spec:
+                configRef: ecr-kmsref-policy
+                createAlias: false
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Key
+              metadata:
+                name: ecr-kms-key
+                namespace: ecrrepository
+        - script:
+            content: |
+              kubectl patch keys.kms.services.k8s.aws ecr-kms-key -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:kms:us-east-1:123456789012:key/mrk-ecr-ref","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: ecr-kms-key
+              status:
+                predictedArn: "arn:aws:kms:us-east-1:123456789012:key/mrk-ecr-ref"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-kmsref
+              spec:
+                kmsKeyRef: ecr-kms-key
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-kmsref
+                namespace: ecrrepository
+              spec:
+                encryptionConfiguration:
+                  kmsKey: "arn:aws:kms:us-east-1:123456789012:key/mrk-ecr-ref"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-20: mandatory.kmsKeyID overrides kmsKeyRef/kmsKeyArn.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac20-mandatory-kms-key-id
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: kms-mandatory-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: kms-mandatory-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: "KMS"
+                  kmsKeyID: "arn:aws:kms:us-east-1:123456789012:key/mrk-mandatory"
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig kms-mandatory-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"KMS","kmsKeyID":"arn:aws:kms:us-east-1:123456789012:key/mrk-mandatory","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-mandatory-kms
+              spec:
+                configRef: kms-mandatory-policy
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/mrk-instance"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-mandatory-kms
+                namespace: ecrrepository
+              spec:
+                encryptionConfiguration:
+                  kmsKey: "arn:aws:kms:us-east-1:123456789012:key/mrk-mandatory"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: lifecyclePolicy — three-tier cascade: mandatory → spec → defaults.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-lifecycle-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-lifecycle
+              spec:
+                lifecyclePolicy: '{"rules":[{"rulePriority":1,"description":"expire untagged","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-lifecycle
+                namespace: ecrrepository
+              spec:
+                (lifecyclePolicy != ""): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: scanOnPush wired to imageScanningConfiguration.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-scan-on-push
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-scanonpush
+              spec:
+                scanOnPush: true
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-scanonpush
+                namespace: ecrrepository
+              spec:
+                imageScanningConfiguration:
+                  scanOnPush: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: mandatory tags override spec tags (same key). Tags list order is
+    # non-deterministic (CEL map merge) — assert via script+jq.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-tags-merge-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: tags-mandatory-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: tags-mandatory-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags:
+                    env: "production"
+                    team: "platform"
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig tags-mandatory-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{"env":"production","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-tags
+              spec:
+                configRef: tags-mandatory-policy
+                tags:
+                  env: "staging"
+                  service: "api"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-tags
+                namespace: ecrrepository
+        - script:
+            content: |
+              TAGS=$(kubectl get repositories.ecr.services.k8s.aws repo-tags -n ecrrepository -o json | jq '.spec.tags')
+              echo "Tags: $TAGS"
+              # mandatory env=production must win over spec env=staging
+              echo "$TAGS" | jq -e 'map(select(.key=="env")) | .[0].value == "production"' || { echo "FAIL: env should be production (mandatory wins)"; exit 1; }
+              # team from mandatory
+              echo "$TAGS" | jq -e 'map(select(.key=="team")) | .[0].value == "platform"' || { echo "FAIL: team should be platform"; exit 1; }
+              # service from spec
+              echo "$TAGS" | jq -e 'map(select(.key=="service")) | .[0].value == "api"' || { echo "FAIL: service should be api"; exit 1; }
+              echo "PASS: tags merge mandatory-wins verified"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: syncedLabels appear in ACK CR labels with aws.kropath.run/ prefix.
+    # AC-17: deletion-policy: retain annotation present (default).
+    # ADR-015 §6.1 dual-write: syncedLabels also appear in ACK spec.tags (plain keys).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-synced-labels-and-retention
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-labels
+              spec:
+                syncedLabels:
+                  owner: "team-a"
+                  cost-center: "cc-12345"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-labels
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/owner: team-a
+                  aws.kropath.run/cost-center: cc-12345
+                  app.kubernetes.io/managed-by: kro
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              TAGS=$(kubectl get repositories.ecr.services.k8s.aws repo-labels -n ecrrepository -o json | jq '.spec.tags')
+              echo "spec.tags: $TAGS"
+              # ADR-015 §6.1: syncedLabels appear in spec.tags with plain (non-prefixed) keys
+              echo "$TAGS" | jq -e 'map(select(.key=="owner")) | .[0].value == "team-a"' || { echo "FAIL: spec.tags should contain owner=team-a (dual-write)"; exit 1; }
+              echo "$TAGS" | jq -e 'map(select(.key=="cost-center")) | .[0].value == "cc-12345"' || { echo "FAIL: spec.tags should contain cost-center=cc-12345 (dual-write)"; exit 1; }
+              echo "PASS: ADR-015 §6.1 dual-write verified — syncedLabels in both metadata.labels and spec.tags"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: syncedAnnotations appear in ACK CR annotations with aws.kropath.run/ prefix.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-annots
+              spec:
+                syncedAnnotations:
+                  policy-version: "v2"
+                  compliance: "hipaa"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-annots
+                namespace: ecrrepository
+                annotations:
+                  aws.kropath.run/policy-version: v2
+                  aws.kropath.run/compliance: hipaa
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: deletion-policy: delete annotation.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-delete-policy
+              spec:
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-delete-policy
+                namespace: ecrrepository
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: imageTagMutabilityExclusionFilters passthrough.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac21-image-tag-exclusion-filters
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-exclusion-filters
+              spec:
+                imageTagMutabilityExclusionFilters:
+                  - filter: "release-*"
+                    filterType: "WILDCARD"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-exclusion-filters
+                namespace: ecrrepository
+              spec:
+                imageTagMutabilityExclusionFilters:
+                  - filter: release-*
+                    filterType: WILDCARD
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22: registryID passthrough.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22-registry-id
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-registryid
+              spec:
+                registryID: "999888777666"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-registryid
+                namespace: ecrrepository
+              spec:
+                registryID: "999888777666"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-23: policy JSON string passed through to ACK spec.policy.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac23-policy-json
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-policy
+              spec:
+                policy: '{"Version":"2012-10-17","Statement":[{"Sid":"CrossAccount","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111222333444:root"},"Action":["ecr:GetDownloadUrlForLayer","ecr:BatchGetImage"]}]}'
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-policy
+                namespace: ecrrepository
+              spec:
+                (policy != ""): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5b: defaults.encryptionType applied when no mandatory setting.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5b-defaults-encryption
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: defaults-encryption-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: defaults-encryption-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: "AES256"
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig defaults-encryption-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"AES256","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-defaults-enc
+              spec:
+                configRef: defaults-encryption-policy
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-defaults-enc
+                namespace: ecrrepository
+              spec:
+                encryptionConfiguration:
+                  encryptionType: "AES256"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: mandatory.lifecyclePolicy overrides spec.lifecyclePolicy.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-mandatory-lifecycle-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: lifecycle-mandatory-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: lifecycle-mandatory-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: '{"rules":[{"rulePriority":1,"description":"mandatory-expire","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig lifecycle-mandatory-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"{\"rules\":[{\"rulePriority\":1,\"description\":\"mandatory-expire\",\"selection\":{\"tagStatus\":\"untagged\",\"countType\":\"imageCountMoreThan\",\"countNumber\":10},\"action\":{\"type\":\"expire\"}}]}","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-mandatory-lifecycle
+              spec:
+                configRef: lifecycle-mandatory-policy
+                lifecyclePolicy: '{"rules":[{"rulePriority":1,"description":"spec-expire","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":50},"action":{"type":"expire"}}]}'
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-mandatory-lifecycle
+                namespace: ecrrepository
+              spec:
+                (lifecyclePolicy != ""): true
+        - script:
+            content: |
+              POLICY=$(kubectl get repositories.ecr.services.k8s.aws repo-mandatory-lifecycle -n ecrrepository -o json | jq -r '.spec.lifecyclePolicy')
+              echo "lifecyclePolicy: $POLICY"
+              echo "$POLICY" | jq -e '.rules[0].description == "mandatory-expire"' || { echo "FAIL: mandatory lifecyclePolicy should win over spec"; exit 1; }
+              echo "PASS: mandatory.lifecyclePolicy overrides spec.lifecyclePolicy"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: defaults.lifecyclePolicy applied when no mandatory or spec setting.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-defaults-lifecycle-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: lifecycle-defaults-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: lifecycle-defaults-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: '{"rules":[{"rulePriority":1,"description":"defaults-expire","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":20},"action":{"type":"expire"}}]}'
+                  namingTemplate: "{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig lifecycle-defaults-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"{\"rules\":[{\"rulePriority\":1,\"description\":\"defaults-expire\",\"selection\":{\"tagStatus\":\"untagged\",\"countType\":\"imageCountMoreThan\",\"countNumber\":20},\"action\":{\"type\":\"expire\"}}]}","namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-defaults-lifecycle
+              spec:
+                configRef: lifecycle-defaults-policy
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-defaults-lifecycle
+                namespace: ecrrepository
+              spec:
+                (lifecyclePolicy != ""): true
+        - script:
+            content: |
+              POLICY=$(kubectl get repositories.ecr.services.k8s.aws repo-defaults-lifecycle -n ecrrepository -o json | jq -r '.spec.lifecyclePolicy')
+              echo "lifecyclePolicy: $POLICY"
+              echo "$POLICY" | jq -e '.rules[0].description == "defaults-expire"' || { echo "FAIL: defaults.lifecyclePolicy should be applied"; exit 1; }
+              echo "PASS: defaults.lifecyclePolicy applied when no mandatory or spec setting"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22b: {tag.missing-key} in namingTemplate → namingStatus: invalid-unresolved-tokens.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22b-unresolved-tag-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: unresolved-token-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: unresolved-token-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{tag.missing-key}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig unresolved-token-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{tag.missing-key}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-unresolved-token
+              spec:
+                configRef: unresolved-token-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: repo-unresolved-token
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: {tag.env} token resolved from merged tags.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-naming-tag-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRConfig
+              metadata:
+                name: tag-token-policy
+                namespace: ecrrepository
+                labels:
+                  aws.kropath.run/resource-name: tag-token-policy
+              spec:
+                mandatory:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: "{tag.env}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  imageTagMutability: ""
+                  encryptionType: ""
+                  kmsKeyID: ""
+                  lifecyclePolicy: ""
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrconfig tag-token-policy -n ecrrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{tag.env}/{name}","tags":{"env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: tag-token-repo
+              spec:
+                configRef: tag-token-policy
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: tag-token-repo
+                namespace: ecrrepository
+              spec:
+                name: prod/tag-token-repo
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              metadata:
+                name: tag-token-repo
+              status:
+                resourceName: prod/tag-token-repo
+                namingStatus: valid
