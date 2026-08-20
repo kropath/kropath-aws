@@ -139,10 +139,10 @@ merge.
 ```
 
 Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`. Prefix with the tracking
-ticket when there is one, matching the existing history:
+ticket when there is one:
 
 ```
-[KRO-633]: feat: add ApiGatewayV2ApiMapping kro RGD
+feat: add ApiGatewayV2ApiMapping kro RGD
 ```
 
 ## Code of Conduct

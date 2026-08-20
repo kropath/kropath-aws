@@ -1,8 +1,8 @@
 # kropath-aws Provider Standards
 
 Shared engineering standards (API group, kind naming, label/annotation conventions, CRD schema
-rules, naming, wiring) live in the canonical doc at
-`kropath-core/docs/standards/engineering-standards.md`.
+rules, naming, wiring) are documented in the public baseline:
+[`Engineering Standards`](https://github.com/kropath/kropath-docs/blob/main/docs/engineering-standards.md).
 This file contains **AWS-specific deltas only**.
 
 ---
