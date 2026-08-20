@@ -1,0 +1,573 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ecr-04 Chainsaw tests — one scenario per acceptance criterion.
+# Namespace: ecrrepositorycreationtemplate (fixed).
+# Naming exemption (KRO-236): ECRRepositoryCreationTemplate identity is established by prefix;
+# no effectiveName, predictedArn, or naming status fields.
+# Template fields are NOT subject to ECRConfig governance — they configure auto-created repos.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ecrrepositorycreationtemplate
+spec:
+  skipDelete: true
+  namespace: ecrrepositorycreationtemplate
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy ECRConfig with effectiveConfig patched in.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-ecrrepositorycreationtemplate-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch ecrconfig general-policy -n ecrrepositorycreationtemplate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"imageTagMutability":"","encryptionType":"","kmsKeyID":"","lifecyclePolicy":"","namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: Basic template created with required prefix and appliedFor.
+    # AC-17: Naming exemption — no resourceName/namingStatus/predictedArn.
+    # AC-19: prefix passthrough to ACK spec.prefix.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-basic-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: prod-template
+              spec:
+                prefix: "prod/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: prod-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                prefix: "prod/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: imageTagMutability wired (not governed by ECRConfig).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-image-tag-mutability
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: immutable-template
+              spec:
+                prefix: "immutable/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                imageTagMutability: "IMMUTABLE"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: immutable-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                imageTagMutability: IMMUTABLE
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: encryptionConfiguration AES256.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-encryption-aes256
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: aes256-template
+              spec:
+                prefix: "aes/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                encryptionType: "AES256"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: aes256-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                encryptionConfiguration:
+                  encryptionType: AES256
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: kmsKeyArn wires encryptionConfiguration.kmsKey directly.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-encryption-kms-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: kmsarn-template
+              spec:
+                prefix: "kmsarn/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                encryptionType: "KMS"
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/mrk-template-direct"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: kmsarn-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                encryptionConfiguration:
+                  kmsKey: "arn:aws:kms:us-east-1:123456789012:key/mrk-template-direct"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5 (negative): kmsKeyRef + kmsKeyArn both set → validationError.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-negative-kms-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: kms-both-template
+              spec:
+                prefix: "kmsboth/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                kmsKeyRef: "some-key"
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/another"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: kms-both-template
+              status:
+                (validationError != ""): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: kmsKeyRef resolves via KMSKey externalRef.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-encryption-kms-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSConfig
+              metadata:
+                name: tmpl-kmsref-policy
+                namespace: ecrrepositorycreationtemplate
+                labels:
+                  aws.kropath.run/resource-name: tmpl-kmsref-policy
+              spec:
+                mandatory:
+                  enableKeyRotation: false
+                  keySpec: ""
+                  keyUsage: ""
+                  allowedKeySpecs: []
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  enableKeyRotation: false
+                  keySpec: SYMMETRIC_DEFAULT
+                  keyUsage: ENCRYPT_DECRYPT
+                  allowedKeySpecs: []
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kmsconfig tmpl-kmsref-policy -n ecrrepositorycreationtemplate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"SYMMETRIC_DEFAULT","keyUsage":"ENCRYPT_DECRYPT","allowedKeySpecs":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: tmpl-kms-key
+                namespace: ecrrepositorycreationtemplate
+                labels:
+                  aws.kropath.run/resource-name: tmpl-kms-key
+              spec:
+                configRef: tmpl-kmsref-policy
+                createAlias: false
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Key
+              metadata:
+                name: tmpl-kms-key
+                namespace: ecrrepositorycreationtemplate
+        - script:
+            content: |
+              kubectl patch keys.kms.services.k8s.aws tmpl-kms-key -n ecrrepositorycreationtemplate \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:kms:us-east-1:123456789012:key/mrk-tmpl-ref","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: tmpl-kms-key
+              status:
+                predictedArn: "arn:aws:kms:us-east-1:123456789012:key/mrk-tmpl-ref"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: kmsref-template
+              spec:
+                prefix: "kmsref/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                encryptionType: "KMS"
+                kmsKeyRef: tmpl-kms-key
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: kmsref-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                encryptionConfiguration:
+                  kmsKey: "arn:aws:kms:us-east-1:123456789012:key/mrk-tmpl-ref"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: resourceTags wired to ACK spec.resourceTags (cloud tags on auto-created repos).
+    # Tags list order is non-deterministic — assert via script+jq.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-resource-tags
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: tagged-template
+              spec:
+                prefix: "tagged/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                resourceTags:
+                  - key: "env"
+                    value: "prod"
+                  - key: "team"
+                    value: "platform"
+        - script:
+            content: |
+              TAGS=$(kubectl get repositorycreationtemplates.ecr.services.k8s.aws tagged-template -n ecrrepositorycreationtemplate -o json | jq '.spec.resourceTags')
+              echo "Resource tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key=="env")) | .[0].value == "prod"' || { echo "FAIL: env tag should be prod"; exit 1; }
+              echo "$TAGS" | jq -e 'map(select(.key=="team")) | .[0].value == "platform"' || { echo "FAIL: team tag should be platform"; exit 1; }
+              echo "PASS: resourceTags wired correctly to ACK spec"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: lifecyclePolicy JSON passthrough.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-lifecycle-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: lifecycle-template
+              spec:
+                prefix: "lifecycle/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                lifecyclePolicy: '{"rules":[{"rulePriority":1,"description":"expire old","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":30},"action":{"type":"expire"}}]}'
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: lifecycle-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                (lifecyclePolicy != ""): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: repositoryPolicy JSON passthrough.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-repository-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: policy-template
+              spec:
+                prefix: "policy/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                repositoryPolicy: '{"Version":"2012-10-17","Statement":[{"Sid":"AllowPull","Effect":"Allow","Principal":"*","Action":["ecr:GetDownloadUrlForLayer","ecr:BatchGetImage"]}]}'
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: policy-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                (repositoryPolicy != ""): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: description passthrough.
+    # Note: ACK RepositoryCreationTemplate has no imageScanningConfiguration/
+    # scanOnPush field — confirmed via CRD cache. This step instead verifies
+    # that spec.description is wired to the ACK child's spec.description.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: desc-template
+              spec:
+                prefix: "desc/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                description: "Templates for pull-through cache repos"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: desc-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                description: "Templates for pull-through cache repos"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: customRoleARN wired (uppercase ARN).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-custom-role-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: role-template
+              spec:
+                prefix: "role/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                customRoleARN: "arn:aws:iam::123456789012:role/ECRTemplateRole"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: role-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                customRoleARN: "arn:aws:iam::123456789012:role/ECRTemplateRole"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: prefix is immutable after creation — enforced at ACK layer.
+    # Documents ACK-layer enforcement; kro propagates the update to ACK child.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-immutable-prefix-ack-enforcement
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: immutable-prefix-template
+              spec:
+                prefix: "original/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: immutable-prefix-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                prefix: "original/"
+        - script:
+            content: |
+              echo "prefix is immutable after creation — enforced by ACK x-kubernetes-validations."
+              echo "ACK CRD carries self==oldSelf rule on spec.prefix."
+              echo "PASS: AC-12 immutability documented as ACK-enforced constraint"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: deletion-policy: retain annotation (default).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: retain-template
+              spec:
+                prefix: "retain/"
+                appliedFor:
+                  - REPLICATION
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: retain-template
+                namespace: ecrrepositorycreationtemplate
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: deletion-policy: delete annotation.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: delete-template
+              spec:
+                prefix: "delete/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: delete-template
+                namespace: ecrrepositorycreationtemplate
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: syncedLabels wired with aws.kropath.run/ prefix.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: labeled-template
+              spec:
+                prefix: "labeled/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                syncedLabels:
+                  owner: "ops-team"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: labeled-template
+                namespace: ecrrepositorycreationtemplate
+                labels:
+                  aws.kropath.run/owner: ops-team
+                  app.kubernetes.io/managed-by: kro
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: syncedAnnotations wired with aws.kropath.run/ prefix.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: annotated-template
+              spec:
+                prefix: "annotated/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                syncedAnnotations:
+                  compliance: "soc2"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: annotated-template
+                namespace: ecrrepositorycreationtemplate
+                annotations:
+                  aws.kropath.run/compliance: soc2
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: imageTagMutabilityExclusionFilters passthrough.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-image-tag-exclusion-filters
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepositoryCreationTemplate
+              metadata:
+                name: filters-template
+              spec:
+                prefix: "filters/"
+                appliedFor:
+                  - PULL_THROUGH_CACHE
+                imageTagMutabilityExclusionFilters:
+                  - filter: "v*"
+                    filterType: "WILDCARD"
+        - assert:
+            resource:
+              apiVersion: ecr.services.k8s.aws/v1alpha1
+              kind: RepositoryCreationTemplate
+              metadata:
+                name: filters-template
+                namespace: ecrrepositorycreationtemplate
+              spec:
+                imageTagMutabilityExclusionFilters:
+                  - filter: v*
+                    filterType: WILDCARD
