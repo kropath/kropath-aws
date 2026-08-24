@@ -1,0 +1,305 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-acm-03 ACMPrivateCA Chainsaw tests.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+# Spec: kropath-core/docs/specs/aws/aws-acm-03-acmprivateca.md
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: acmprivateca
+spec:
+  skipDelete: true
+  namespace: acmprivateca
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    - name: preamble-apply-crds-and-rgds
+      try:
+        - script:
+            content: |
+              kubectl apply -f ../../fixtures/crds/acm/
+              kubectl apply -f ../../fixtures/crds/acmpca/
+              kubectl wait crd certificates.acm.services.k8s.aws acmeendpoints.acm.services.k8s.aws acmedomainvalidations.acm.services.k8s.aws certificateauthorities.acmpca.services.k8s.aws certificateauthorityactivations.acmpca.services.k8s.aws certificates.acmpca.services.k8s.aws --for=condition=Established --timeout=60s
+              kubectl delete rgd acmprivateca.aws.kropath.run --ignore-not-found=true
+              kubectl apply -f ../../../rgds/acmprivateca.aws.kropath.run.yaml
+              kubectl wait rgd acmprivateca.aws.kropath.run --for=condition=Ready --timeout=120s
+
+    # AC-1: ROOT CA created with governance defaults (RSA_2048, GENERAL_PURPOSE, FIPS_140_2_LEVEL_3_OR_HIGHER).
+    # No activation CR created (ROOT CA self-activates via AWS — no signingCertificateSecret).
+    - name: ac1-root-ca-default-governance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac1-cfg
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac1-cfg -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac1-ca
+                namespace: acmprivateca
+              spec:
+                configRef: ac1-cfg
+                caType: ROOT
+                subject:
+                  commonName: "My Root CA"
+                  organization: "ACME Corp"
+        - assert:
+            resource:
+              apiVersion: acmpca.services.k8s.aws/v1alpha1
+              kind: CertificateAuthority
+              metadata:
+                name: ac1-ca
+                namespace: acmprivateca
+              spec:
+                type_: ROOT
+                certificateAuthorityConfiguration:
+                  keyAlgorithm: RSA_2048
+                  signingAlgorithm: SHA256WITHRSA
+                usageMode: GENERAL_PURPOSE
+                keyStorageSecurityStandard: FIPS_140_2_LEVEL_3_OR_HIGHER
+
+    # AC-3: mandatory.keyAlgorithm overrides instance and defaults.
+    - name: ac3-mandatory-key-algorithm-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac3-cfg
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac3-cfg -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"EC_prime256v1","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac3-ca
+                namespace: acmprivateca
+              spec:
+                configRef: ac3-cfg
+                caType: ROOT
+                keyAlgorithm: RSA_4096
+                subject:
+                  commonName: "Override CA"
+        - assert:
+            resource:
+              apiVersion: acmpca.services.k8s.aws/v1alpha1
+              kind: CertificateAuthority
+              metadata:
+                name: ac3-ca
+                namespace: acmprivateca
+              spec:
+                certificateAuthorityConfiguration:
+                  keyAlgorithm: EC_prime256v1
+
+    # AC-7: signingAlgorithm falls through to instance spec value.
+    - name: ac7-instance-signing-algorithm
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac7-cfg
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac7-cfg -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac7-ca
+                namespace: acmprivateca
+              spec:
+                configRef: ac7-cfg
+                caType: ROOT
+                signingAlgorithm: SHA384WITHRSA
+                subject:
+                  commonName: "EC Root CA"
+        - assert:
+            resource:
+              apiVersion: acmpca.services.k8s.aws/v1alpha1
+              kind: CertificateAuthority
+              metadata:
+                name: ac7-ca
+                namespace: acmprivateca
+              spec:
+                certificateAuthorityConfiguration:
+                  signingAlgorithm: SHA384WITHRSA
+
+    # AC-10: deletion-policy=retain wired as ACK annotation.
+    - name: ac10-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac10-cfg
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac10-cfg -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac10-ca
+                namespace: acmprivateca
+              spec:
+                configRef: ac10-cfg
+                caType: ROOT
+                deletionPolicy: retain
+                subject:
+                  commonName: "Root CA retain"
+        - assert:
+            resource:
+              apiVersion: acmpca.services.k8s.aws/v1alpha1
+              kind: CertificateAuthority
+              metadata:
+                name: ac10-ca
+                namespace: acmprivateca
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-13: ackCA carries aws.kropath.run/resource-name label equal to metadata.name
+    # (used by ACMCertificate / ACMPrivateCertificate externalRef lookup).
+    - name: ac13-resource-name-label-on-ack-ca
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac13-cfg
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac13-cfg -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac13-ca
+                namespace: acmprivateca
+              spec:
+                configRef: ac13-cfg
+                caType: ROOT
+                subject:
+                  commonName: "Label CA"
+        - assert:
+            resource:
+              apiVersion: acmpca.services.k8s.aws/v1alpha1
+              kind: CertificateAuthority
+              metadata:
+                name: ac13-ca
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac13-ca
+
+    # AC-16 (negative): SUBORDINATE CA without signingCertificateSecret creates error ConfigMap.
+    - name: ac16-subordinate-missing-signing-cert
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac16-cfg
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac16-cfg -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac16-ca
+                namespace: acmprivateca
+              spec:
+                configRef: ac16-cfg
+                caType: SUBORDINATE
+                subject:
+                  commonName: "Subordinate CA no cert"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac16-ca-signing-cert-error
+                namespace: acmprivateca
+              data:
+                error: "signingCertificateSecret is required for SUBORDINATE CA type"

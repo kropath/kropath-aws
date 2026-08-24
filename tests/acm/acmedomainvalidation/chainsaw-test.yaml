@@ -1,0 +1,216 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-acm-06 ACMEDomainValidation Chainsaw tests.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+# Spec: kropath-core/docs/specs/aws/aws-acm-06-acmedomainvalidation.md
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: acmedomainvalidation
+spec:
+  skipDelete: true
+  namespace: acmedomainvalidation
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    - name: preamble-apply-crds-and-rgds
+      try:
+        - script:
+            content: |
+              kubectl apply -f ../../fixtures/crds/acm/
+              kubectl apply -f ../../fixtures/crds/acmpca/
+              kubectl wait crd certificates.acm.services.k8s.aws acmeendpoints.acm.services.k8s.aws acmedomainvalidations.acm.services.k8s.aws --for=condition=Established --timeout=60s
+              kubectl delete rgd acmedomainvalidation.aws.kropath.run acmeendpoint.aws.kropath.run --ignore-not-found=true
+              kubectl apply -f ../../../rgds/acmeendpoint.aws.kropath.run.yaml
+              kubectl apply -f ../../../rgds/acmedomainvalidation.aws.kropath.run.yaml
+              kubectl wait rgd acmedomainvalidation.aws.kropath.run acmeendpoint.aws.kropath.run --for=condition=Ready --timeout=120s
+
+    # AC-1: Domain validation with direct ACME endpoint ARN, no pre-validation.
+    - name: ac1-domain-validation-with-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac1-cfg
+                namespace: acmedomainvalidation
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac1-cfg -n acmedomainvalidation \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              metadata:
+                name: ac1-dv
+                namespace: acmedomainvalidation
+              spec:
+                configRef: ac1-cfg
+                domainName: "example.com"
+                acmeEndpointARN: "arn:aws:acm:us-east-1:123456789012:acme-endpoint/abc"
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: AcmeDomainValidation
+              metadata:
+                name: ac1-dv
+                namespace: acmedomainvalidation
+              spec:
+                domainName: "example.com"
+                acmeEndpointARN: "arn:aws:acm:us-east-1:123456789012:acme-endpoint/abc"
+
+    # AC-4: DNS pre-validation enabled — prevalidationOptions populated.
+    - name: ac4-dns-prevalidation-enabled
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac4-cfg
+                namespace: acmedomainvalidation
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac4-cfg -n acmedomainvalidation \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              metadata:
+                name: ac4-dv
+                namespace: acmedomainvalidation
+              spec:
+                configRef: ac4-cfg
+                domainName: "ac4.example.com"
+                acmeEndpointARN: "arn:aws:acm:us-east-1:123456789012:acme-endpoint/ac4"
+                dnsPrevalidationEnabled: true
+                dnsPrevalidationExactDomain: "ac4.example.com"
+                dnsPrevalidationSubdomains: true
+                dnsPrevalidationWildcards: false
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: AcmeDomainValidation
+              metadata:
+                name: ac4-dv
+                namespace: acmedomainvalidation
+              spec:
+                domainName: "ac4.example.com"
+                prevalidationOptions:
+                  dnsPrevalidation:
+                    domainScope:
+                      exactDomain: "ac4.example.com"
+                      subdomains: true
+                      wildcards: false
+
+    # AC-7 (negative): both acmeEndpointARN and acmeEndpointRef set — error ConfigMap.
+    - name: ac7-endpoint-arn-and-ref-mutually-exclusive
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac7-cfg
+                namespace: acmedomainvalidation
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac7-cfg -n acmedomainvalidation \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              metadata:
+                name: ac7-dv
+                namespace: acmedomainvalidation
+              spec:
+                configRef: ac7-cfg
+                domainName: "ac7.example.com"
+                acmeEndpointARN: "arn:aws:acm:us-east-1:123456789012:acme-endpoint/ac7"
+                acmeEndpointRef: my-endpoint
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac7-dv-endpoint-arn-ref-error
+                namespace: acmedomainvalidation
+              data:
+                error: "acmeEndpointARN and acmeEndpointRef are mutually exclusive"
+
+    # AC-9 (negative): neither acmeEndpointARN nor acmeEndpointRef set — error ConfigMap.
+    - name: ac9-missing-endpoint-source
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac9-cfg
+                namespace: acmedomainvalidation
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac9-cfg -n acmedomainvalidation \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              metadata:
+                name: ac9-dv
+                namespace: acmedomainvalidation
+              spec:
+                configRef: ac9-cfg
+                domainName: "ac9.example.com"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac9-dv-missing-endpoint-error
+                namespace: acmedomainvalidation
+              data:
+                error: "one of acmeEndpointARN or acmeEndpointRef is required"
