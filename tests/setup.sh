@@ -77,7 +77,24 @@ kubectl apply -f "${SCRIPT_DIR}/../crds/policy/policydocument.yaml"
 # registration (Established condition) before kro can find the schema.
 # Without this wait, RGDs applied within ~1s of a new CRD creation stay permanently
 # Inactive because kro's initial compilation fails and it does not retry.
-kubectl wait crd --all --for=condition=Established --timeout=300s
+#
+# Wait only for the kropath-native CRDs (*.aws.kropath.run) that this setup
+# actually applies — not --all 290+ CRDs. The --all form shares ONE deadline
+# across every CRD in the cluster: the heavy kropathconfigs.aws.kropath.run
+# (145KB, 92 CEL rules) consumes most of the budget while the API server
+# compiles its rules, and every alphabetically-later CRD is then reported as
+# "timed out" even though it was never given time (reproduced locally:
+# vpcs.ec2.services.k8s.aws appeared as timed-out but was Established=True
+# immediately after the wait exited). ACK CRD establishment is validated
+# indirectly: kro fails to compile any RGD that references a missing ACK CRD
+# GVK, and the RGD readiness check below classifies those as GraphAccepted=False.
+mapfile -t _kropath_crds < <(
+  grep -rh '^  name:.*\.aws\.kropath\.run' "${SCRIPT_DIR}/../crds/" --include='*.yaml' | awk '{print "crd/" $2}'
+)
+if [[ ${#_kropath_crds[@]} -gt 0 ]]; then
+  kubectl wait "${_kropath_crds[@]}" --for=condition=Established --timeout=120s
+fi
+unset _kropath_crds
 
 echo "==> Installing kropath.run RGD definitions (non-lambda)..."
 # Build arg list excluding lambda RGDs, which must be applied in dependency-ordered waves below.
