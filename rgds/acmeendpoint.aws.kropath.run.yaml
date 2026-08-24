@@ -14,7 +14,7 @@
 #
 # ACMEEndpoint RGD — wraps ACK acm.services.k8s.aws/AcmeEndpoint.
 # Naming exemption (KRO-236): ACME endpoints are identified by ARN, not name.
-# The aws.kropath.run/resource-name label is applied to the CR so that
+# The aws.kropath.run/resource-name label is applied to the ACK CR so that
 # ACMEDomainValidation instances can reference this endpoint via acmeEndpointRef.
 # Spec: kropath-core/docs/specs/aws/aws-acm-05-acmeendpoint.md
 ---
@@ -35,23 +35,33 @@ spec:
       tags: map[string]string | default={}
       syncedLabels: map[string]string | default={}
       syncedAnnotations: map[string]string | default={}
-      # Endpoint configuration
-      endpointURL: string | default=""
-      acmeCACertificateARN: string | default=""
+      # ACME endpoint configuration
+      authorizationBehavior: string | default=""
+      allowedKeyAlgorithms: "[]string | default=[]"
+      contact: string | default=""
+      certificateTags: "[]ACMECertificateTag | default=[]"
+    types:
+      ACMECertificateTag:
+        key: string | default=""
+        value: string | default=""
     status:
       conditions: >-
         ${ackAcmeEndpoint.?status.?conditions.orValue([])}
       acmeEndpointARN: >-
         ${ackAcmeEndpoint.?status.?acmeEndpointARN.orValue("")}
-      resolvedEndpointURL: >-
+      endpointURL: >-
         ${ackAcmeEndpoint.?status.?endpointURL.orValue("")}
+      endpointStatus: >-
+        ${ackAcmeEndpoint.?status.?status.orValue("")}
+      missingAuthorizationBehaviorError: >-
+        ${has(missingAuthorizationBehaviorError.data) ? missingAuthorizationBehaviorError.data.error : ""}
     additionalPrinterColumns:
       - name: EndpointARN
         type: string
         jsonPath: .status.acmeEndpointARN
       - name: EndpointURL
         type: string
-        jsonPath: .status.resolvedEndpointURL
+        jsonPath: .status.endpointURL
 
   resources:
     # Governance config lookup.
@@ -65,10 +75,35 @@ spec:
             matchLabels:
               aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
 
-    # ACK AcmeEndpoint CR.
+    # Advisory ConfigMap: authorizationBehavior is required.
+    # x-kubernetes-validations are discarded by kro v0.9.2 — use in-graph ConfigMap pattern.
+    - id: missingAuthorizationBehaviorError
+      includeWhen:
+        - >-
+          ${schema.spec.authorizationBehavior == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-missing-authorization-behavior-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEEndpoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "authorizationBehavior is required"
+
+    # ACK AcmeEndpoint CR — only when authorizationBehavior is provided.
     # Carries aws.kropath.run/resource-name label so ACMEDomainValidation can find it
     # via selector.matchLabels.
     - id: ackAcmeEndpoint
+      includeWhen:
+        - >-
+          ${schema.spec.authorizationBehavior != ""}
       template:
         apiVersion: acm.services.k8s.aws/v1alpha1
         kind: AcmeEndpoint
@@ -93,8 +128,12 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          endpointURL: "${schema.spec.endpointURL}"
-          acmeCACertificateARN: "${schema.spec.acmeCACertificateARN}"
+          authorizationBehavior: "${schema.spec.authorizationBehavior}"
+          certificateAuthority:
+            publicCertificateAuthority:
+              allowedKeyAlgorithms: ${schema.spec.allowedKeyAlgorithms}
+          contact: "${schema.spec.contact}"
+          certificateTags: ${schema.spec.certificateTags}
           tags: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
               .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
