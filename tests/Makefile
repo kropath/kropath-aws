@@ -23,7 +23,7 @@ CLUSTER_NAME ?= kropath-aws-test
 	test-acm test-apigateway test-apigatewayv2 test-autoscaling test-cloudfront \
 	test-cloudwatch test-cloudwatchlogs test-documentdb test-dynamodb test-ec2 test-ecr test-ecs test-efs \
 	test-eks test-elasticache test-elb test-eventbridge test-iam test-kms \
-	test-lambda test-memorydb test-msk test-policy test-rds test-s3 test-secretsmanager \
+	test-lambda test-memorydb test-msk test-pipes test-policy test-rds test-s3 test-secretsmanager \
 	test-sns test-sqs test-stepfunctions
 
 setup:
@@ -116,6 +116,9 @@ test-eks:
 
 test-msk:
 	chainsaw test msk/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-pipes:
+	chainsaw test pipes/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-ecr:
 	chainsaw test ecr/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
