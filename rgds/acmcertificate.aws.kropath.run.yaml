@@ -1,0 +1,273 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ACMCertificate RGD — wraps ACK acm.services.k8s.aws/Certificate.
+# Naming exemption (KRO-236): ACM certificates have no provider name field —
+# they are identified by AWS-assigned ARN. No effectiveName, predictedArn,
+# namingTemplate, or spec.nameOverride in this RGD.
+# Spec: kropath-core/docs/specs/aws/aws-acm-02-acmcertificate.md
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: acmcertificate.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ACMCertificate
+    scope: Namespaced
+    spec:
+      # Governance
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Public/private certificate fields
+      domainName: string | default=""
+      subjectAlternativeNames: "[]string | default=[]"
+      keyAlgorithm: string | default=""
+      certificateTransparencyLogging: string | default=""
+      domainValidationOptions: "[]ACMDomainValidationOption | default=[]"
+      # Private CA reference
+      certificateAuthorityARN: string | default=""
+      certificateAuthorityRef: string | default=""
+      # Import workflow
+      importCertificateSecret: string | default=""
+      importPrivateKeySecret: string | default=""
+      importCertificateChainSecret: string | default=""
+    types:
+      ACMDomainValidationOption:
+        domainName: string | default=""
+        validationDomain: string | default=""
+    status:
+      conditions: >-
+        ${ackCertificate.?status.?conditions.orValue([])}
+      certificateARN: >-
+        ${ackCertificate.?status.?ackResourceMetadata.?arn.orValue("")}
+      certificateStatus: >-
+        ${ackCertificate.?status.?status.orValue("")}
+      notAfter: >-
+        ${has(ackCertificate.status) && has(ackCertificate.status.notAfter) ? string(ackCertificate.status.notAfter) : ""}
+      domainValidations: >-
+        ${ackCertificate.?status.?domainValidations.orValue([])}
+      importAndPrivateError: >-
+        ${has(importAndPrivateError.data) ? importAndPrivateError.data.error : ""}
+      importWithDomainError: >-
+        ${has(importWithDomainError.data) ? importWithDomainError.data.error : ""}
+      caArnAndRefError: >-
+        ${has(caArnAndRefError.data) ? caArnAndRefError.data.error : ""}
+      importMissingKeyError: >-
+        ${has(importMissingKeyError.data) ? importMissingKeyError.data.error : ""}
+    additionalPrinterColumns:
+      - name: CertificateARN
+        type: string
+        jsonPath: .status.certificateARN
+      - name: Status
+        type: string
+        jsonPath: .status.certificateStatus
+
+  resources:
+    # Governance config lookup — single effCfg pattern (ADR-010).
+    # rsrcCfg is a list; always use rsrcCfg.size() > 0 guard before accessing rsrcCfg[0].
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ACMConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Private CA ref resolution — reads status.certificateAuthorityARN from ACMPrivateCA CR.
+    # Uses sentinel when certificateAuthorityRef is "" so selector returns empty list.
+    - id: caRefCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ACMPrivateCA
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: >-
+                ${schema.spec.certificateAuthorityRef != "" ? schema.spec.certificateAuthorityRef : "kro-empty-fallback-sentinel"}
+
+    # Advisory ConfigMap: import workflow + private CA workflow are mutually exclusive.
+    # x-kubernetes-validations are discarded by kro v0.9.2 — use in-graph ConfigMap pattern.
+    - id: importAndPrivateError
+      includeWhen:
+        - >-
+          ${schema.spec.importCertificateSecret != "" && (schema.spec.certificateAuthorityARN != "" || schema.spec.certificateAuthorityRef != "")}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-import-private-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "import workflow and private CA workflow are mutually exclusive"
+
+    # Advisory ConfigMap: import workflow does not use domainName.
+    - id: importWithDomainError
+      includeWhen:
+        - >-
+          ${schema.spec.importCertificateSecret != "" && schema.spec.domainName != ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-import-domain-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "import workflow does not use domainName (certificates are already issued)"
+
+    # Advisory ConfigMap: certificateAuthorityARN and certificateAuthorityRef are mutually exclusive.
+    - id: caArnAndRefError
+      includeWhen:
+        - >-
+          ${schema.spec.certificateAuthorityARN != "" && schema.spec.certificateAuthorityRef != ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-ca-arn-ref-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "certificateAuthorityARN and certificateAuthorityRef are mutually exclusive"
+
+    # Advisory ConfigMap: importPrivateKeySecret is required when importCertificateSecret is set.
+    - id: importMissingKeyError
+      includeWhen:
+        - >-
+          ${schema.spec.importCertificateSecret != "" && schema.spec.importPrivateKeySecret == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-import-key-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "importPrivateKeySecret is required when importCertificateSecret is set"
+
+    # ACK Certificate CR — only created when all validations pass.
+    - id: ackCertificate
+      includeWhen:
+        - >-
+          ${!(schema.spec.importCertificateSecret != "" && (schema.spec.certificateAuthorityARN != "" || schema.spec.certificateAuthorityRef != ""))
+            && !(schema.spec.importCertificateSecret != "" && schema.spec.domainName != "")
+            && !(schema.spec.certificateAuthorityARN != "" && schema.spec.certificateAuthorityRef != "")
+            && !(schema.spec.importCertificateSecret != "" && schema.spec.importPrivateKeySecret == "")}
+      template:
+        apiVersion: acm.services.k8s.aws/v1alpha1
+        kind: Certificate
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          domainName: "${schema.spec.domainName}"
+          subjectAlternativeNames: ${schema.spec.subjectAlternativeNames}
+          keyAlgorithm: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?keyAlgorithm.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.keyAlgorithm
+              : (schema.spec.keyAlgorithm != ""
+                  ? schema.spec.keyAlgorithm
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?keyAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.keyAlgorithm
+                      : "RSA_2048"))}
+          options:
+            certificateTransparencyLoggingPreference: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?certificateTransparencyLogging.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.certificateTransparencyLogging
+                : (schema.spec.certificateTransparencyLogging != ""
+                    ? schema.spec.certificateTransparencyLogging
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?certificateTransparencyLogging.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.certificateTransparencyLogging
+                        : "ENABLED"))}
+          domainValidationOptions: ${schema.spec.domainValidationOptions}
+          certificateAuthorityARN: >-
+            ${schema.spec.certificateAuthorityARN != ""
+              ? schema.spec.certificateAuthorityARN
+              : (schema.spec.certificateAuthorityRef != "" && caRefCr.size() > 0
+                  ? caRefCr[0].status.certificateAuthorityARN
+                  : "")}
+          certificate: >-
+            ${schema.spec.importCertificateSecret != ""
+              ? {"name": schema.spec.importCertificateSecret, "key": "tls.crt"}
+              : {}}
+          privateKey: >-
+            ${schema.spec.importPrivateKeySecret != ""
+              ? {"name": schema.spec.importPrivateKeySecret, "key": "tls.key"}
+              : {}}
+          certificateChain: >-
+            ${schema.spec.importCertificateChainSecret != ""
+              ? {"name": schema.spec.importCertificateChainSecret, "key": "ca.crt"}
+              : {}}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}

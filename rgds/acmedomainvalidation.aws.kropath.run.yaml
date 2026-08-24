@@ -1,0 +1,169 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ACMEDomainValidation RGD — wraps ACK acm.services.k8s.aws/AcmeDomainValidation.
+# Naming exemption (KRO-236): domain validations are identified by the ACME
+# endpoint ARN + domain, not a name field.
+# Spec: kropath-core/docs/specs/aws/aws-acm-06-acmedomainvalidation.md
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: acmedomainvalidation.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ACMEDomainValidation
+    scope: Namespaced
+    spec:
+      # Governance
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Domain validation fields
+      domainName: string | default=""
+      # ACME endpoint reference — one of ARN or ref
+      acmeEndpointARN: string | default=""
+      acmeEndpointRef: string | default=""
+      # DNS pre-validation scope
+      dnsPrevalidationEnabled: boolean
+      dnsPrevalidationExactDomain: string | default=""
+      dnsPrevalidationSubdomains: boolean
+      dnsPrevalidationWildcards: boolean
+    status:
+      conditions: >-
+        ${ackDomainValidation.?status.?conditions.orValue([])}
+      validationStatus: >-
+        ${ackDomainValidation.?status.?validationStatus.orValue("")}
+      endpointArnAndRefError: >-
+        ${has(endpointArnAndRefError.data) ? endpointArnAndRefError.data.error : ""}
+      missingEndpointError: >-
+        ${has(missingEndpointError.data) ? missingEndpointError.data.error : ""}
+    additionalPrinterColumns:
+      - name: DomainName
+        type: string
+        jsonPath: .spec.domainName
+      - name: ValidationStatus
+        type: string
+        jsonPath: .status.validationStatus
+
+  resources:
+    # Governance config lookup.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ACMConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACME endpoint ref resolution — reads status.acmeEndpointARN from ACMEEndpoint CR.
+    - id: acmeEndpointRefCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ACMEEndpoint
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: >-
+                ${schema.spec.acmeEndpointRef != "" ? schema.spec.acmeEndpointRef : "kro-empty-fallback-sentinel"}
+
+    # Advisory ConfigMap: acmeEndpointARN and acmeEndpointRef are mutually exclusive.
+    - id: endpointArnAndRefError
+      includeWhen:
+        - >-
+          ${schema.spec.acmeEndpointARN != "" && schema.spec.acmeEndpointRef != ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-endpoint-arn-ref-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "acmeEndpointARN and acmeEndpointRef are mutually exclusive"
+
+    # Advisory ConfigMap: at least one endpoint source is required.
+    - id: missingEndpointError
+      includeWhen:
+        - >-
+          ${schema.spec.acmeEndpointARN == "" && schema.spec.acmeEndpointRef == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-missing-endpoint-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "one of acmeEndpointARN or acmeEndpointRef is required"
+
+    # ACK AcmeDomainValidation CR — only when validations pass.
+    - id: ackDomainValidation
+      includeWhen:
+        - >-
+          ${!(schema.spec.acmeEndpointARN != "" && schema.spec.acmeEndpointRef != "")
+            && !(schema.spec.acmeEndpointARN == "" && schema.spec.acmeEndpointRef == "")}
+      template:
+        apiVersion: acm.services.k8s.aws/v1alpha1
+        kind: AcmeDomainValidation
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          domainName: "${schema.spec.domainName}"
+          acmeEndpointARN: >-
+            ${schema.spec.acmeEndpointARN != ""
+              ? schema.spec.acmeEndpointARN
+              : (acmeEndpointRefCr.size() > 0
+                  ? acmeEndpointRefCr[0].status.acmeEndpointARN
+                  : "")}
+          prevalidationOptions: >-
+            ${has(schema.spec.dnsPrevalidationEnabled) && schema.spec.dnsPrevalidationEnabled
+              ? {"dnsPrevalidation": {"domainScope": {"exactDomain": schema.spec.dnsPrevalidationExactDomain, "subdomains": has(schema.spec.dnsPrevalidationSubdomains) && schema.spec.dnsPrevalidationSubdomains, "wildcards": has(schema.spec.dnsPrevalidationWildcards) && schema.spec.dnsPrevalidationWildcards}}}
+              : {}}
