@@ -1,0 +1,943 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-acm-02 ACMCertificate Chainsaw tests.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+# Spec: kropath-core/docs/specs/aws/aws-acm-02-acmcertificate.md
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: acmcertificate
+spec:
+  skipDelete: true
+  namespace: acmcertificate
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    - name: preamble-apply-crds-and-rgds
+      try:
+        - script:
+            content: |
+              kubectl apply -f ../../fixtures/crds/acm/
+              kubectl apply -f ../../fixtures/crds/acmpca/
+              kubectl wait crd certificates.acm.services.k8s.aws acmeendpoints.acm.services.k8s.aws acmedomainvalidations.acm.services.k8s.aws certificateauthorities.acmpca.services.k8s.aws certificateauthorityactivations.acmpca.services.k8s.aws certificates.acmpca.services.k8s.aws --for=condition=Established --timeout=60s
+              kubectl delete rgd acmcertificate.aws.kropath.run --ignore-not-found=true
+              kubectl apply -f ../../../rgds/acmcertificate.aws.kropath.run.yaml
+              kubectl apply -f ../../../rgds/acmprivateca.aws.kropath.run.yaml
+              kubectl wait rgd acmcertificate.aws.kropath.run --for=condition=Ready --timeout=120s
+
+    # AC-1: Public certificate with no governance overrides uses RSA_2048 key algorithm from defaults.
+    - name: ac1-default-key-algorithm
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac1-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac1-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac1-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac1-cfg
+                domainName: example.com
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac1-cert
+                namespace: acmcertificate
+              spec:
+                domainName: example.com
+                keyAlgorithm: RSA_2048
+                options:
+                  certificateTransparencyLoggingPreference: ENABLED
+
+    # AC-2: Instance overrides defaults — EC_prime256v1 key algorithm, DISABLED CT logging.
+    - name: ac2-instance-overrides-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac2-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac2-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac2-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac2-cfg
+                domainName: ac2.example.com
+                keyAlgorithm: EC_prime256v1
+                certificateTransparencyLogging: DISABLED
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac2-cert
+                namespace: acmcertificate
+              spec:
+                keyAlgorithm: EC_prime256v1
+                options:
+                  certificateTransparencyLoggingPreference: DISABLED
+
+    # AC-3: Subject alternative names wired to ACK Certificate.
+    - name: ac3-subject-alternative-names
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac3-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac3-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac3-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac3-cfg
+                domainName: example.com
+                subjectAlternativeNames:
+                  - www.example.com
+                  - api.example.com
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac3-cert
+                namespace: acmcertificate
+              spec:
+                domainName: example.com
+                subjectAlternativeNames:
+                  - www.example.com
+                  - api.example.com
+
+    # AC-4: Wildcard domain name wired correctly.
+    - name: ac4-wildcard-domain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac4-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac4-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac4-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac4-cfg
+                domainName: "*.example.com"
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac4-cert
+                namespace: acmcertificate
+              spec:
+                domainName: "*.example.com"
+
+    # AC-5: mandatory.keyAlgorithm overrides instance and defaults.
+    - name: ac5-mandatory-key-algorithm-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac5-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac5-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"EC_prime256v1","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac5-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac5-cfg
+                domainName: ac5.example.com
+                keyAlgorithm: RSA_4096
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac5-cert
+                namespace: acmcertificate
+              spec:
+                keyAlgorithm: EC_prime256v1
+
+    # AC-6: mandatory.certificateTransparencyLogging overrides DISABLED instance setting.
+    - name: ac6-mandatory-ct-logging-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac6-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac6-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"ENABLED","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac6-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac6-cfg
+                domainName: ac6.example.com
+                certificateTransparencyLogging: DISABLED
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac6-cert
+                namespace: acmcertificate
+              spec:
+                options:
+                  certificateTransparencyLoggingPreference: ENABLED
+
+    # AC-7: Private certificate via direct CA ARN.
+    - name: ac7-private-cert-via-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac7-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac7-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac7-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac7-cfg
+                domainName: internal.corp.com
+                certificateAuthorityARN: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac7"
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac7-cert
+                namespace: acmcertificate
+              spec:
+                domainName: internal.corp.com
+                certificateAuthorityARN: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac7"
+
+    # AC-9: Import certificate — cert and private key secrets wired to ACK Certificate.
+    - name: ac9-import-cert
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac9-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac9-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac9-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac9-cfg
+                importCertificateSecret: my-tls-cert
+                importPrivateKeySecret: my-tls-key
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac9-cert
+                namespace: acmcertificate
+              spec:
+                certificate:
+                  name: my-tls-cert
+                  key: tls.crt
+                privateKey:
+                  name: my-tls-key
+                  key: tls.key
+
+    # AC-10: Import certificate with chain — all three secrets wired to ACK Certificate.
+    - name: ac10-import-cert-with-chain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac10-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac10-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac10-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac10-cfg
+                importCertificateSecret: my-chain-cert
+                importPrivateKeySecret: my-chain-key
+                importCertificateChainSecret: my-ca-chain
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac10-cert
+                namespace: acmcertificate
+              spec:
+                certificate:
+                  name: my-chain-cert
+                  key: tls.crt
+                privateKey:
+                  name: my-chain-key
+                  key: tls.key
+                certificateChain:
+                  name: my-ca-chain
+                  key: ca.crt
+
+    # AC-11 (negative): Import workflow and private CA workflow are mutually exclusive.
+    # Error ConfigMap is created; ACK Certificate is NOT created.
+    - name: ac11-import-and-privateca-mutually-exclusive
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac11-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac11-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac11-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac11-cfg
+                importCertificateSecret: my-tls-secret
+                importPrivateKeySecret: my-key-secret
+                certificateAuthorityARN: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac11-cert-import-private-error
+                namespace: acmcertificate
+              data:
+                error: "import workflow and private CA workflow are mutually exclusive"
+
+    # AC-12 (negative): Import workflow does not use domainName.
+    - name: ac12-import-with-domain-name-error
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac12-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac12-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac12-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac12-cfg
+                importCertificateSecret: my-cert
+                importPrivateKeySecret: my-key
+                domainName: ac12.example.com
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac12-cert-import-domain-error
+                namespace: acmcertificate
+              data:
+                error: "import workflow does not use domainName (certificates are already issued)"
+
+    # AC-13 (negative): certificateAuthorityARN and certificateAuthorityRef are mutually exclusive.
+    - name: ac13-ca-arn-and-ref-mutually-exclusive
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac13-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac13-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac13-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac13-cfg
+                domainName: ac13.example.com
+                certificateAuthorityARN: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc"
+                certificateAuthorityRef: my-private-ca
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac13-cert-ca-arn-ref-error
+                namespace: acmcertificate
+              data:
+                error: "certificateAuthorityARN and certificateAuthorityRef are mutually exclusive"
+
+    # AC-14 (negative): importPrivateKeySecret is required when importCertificateSecret is set.
+    - name: ac14-import-missing-private-key-error
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac14-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac14-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac14-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac14-cfg
+                importCertificateSecret: my-cert-only
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac14-cert-import-key-error
+                namespace: acmcertificate
+              data:
+                error: "importPrivateKeySecret is required when importCertificateSecret is set"
+
+    # AC-15: Tag merge — mandatory > spec > defaults; order-independent verification via jq.
+    - name: ac15-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac15-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac15-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{"cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac15-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac15-cfg
+                domainName: ac15.example.com
+                tags:
+                  app: web
+        - script:
+            content: |
+              for i in $(seq 1 30); do
+                TAGS=$(kubectl get certificate ac15-cert -n acmcertificate -o json | jq -r '.spec.tags // []')
+                HAS_PLATFORM=$(echo "$TAGS" | jq -e 'map(select(.key=="cost-centre" and .value=="platform")) | length > 0')
+                HAS_APP=$(echo "$TAGS" | jq -e 'map(select(.key=="app" and .value=="web")) | length > 0')
+                if [ "$HAS_PLATFORM" = "true" ] && [ "$HAS_APP" = "true" ]; then
+                  echo "Tag merge verified: cost-centre=platform and app=web both present"
+                  exit 0
+                fi
+                sleep 5
+              done
+              echo "FAIL: expected tags not found"
+              exit 1
+
+    # AC-17: Standard metadata — managed-by and instance labels on ACK Certificate.
+    - name: ac17-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac17-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac17-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac17-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac17-cfg
+                domainName: ac17.example.com
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac17-cert
+                namespace: acmcertificate
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac17-cert
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-18: deletion-policy=delete wired as ACK annotation.
+    - name: ac18-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac18-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac18-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac18-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac18-cfg
+                domainName: ac18.example.com
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac18-cert
+                namespace: acmcertificate
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-19: deletion-policy=retain (default) wired as ACK annotation.
+    - name: ac19-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac19-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac19-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac19-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac19-cfg
+                domainName: ac19.example.com
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac19-cert
+                namespace: acmcertificate
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-16: mandatory.syncedLabels propagated to ACK Certificate labels.
+    - name: ac16-mandatory-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac16-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac16-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","syncedLabels":{"environment":"production"},"syncedAnnotations":{},"tags":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"","syncedLabels":{},"syncedAnnotations":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac16-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac16-cfg
+                domainName: ac16.example.com
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac16-cert
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            # ADR-015 §6.1: syncedLabels must also appear in spec.tags (without the aws.kropath.run/ prefix).
+            content: |
+              kubectl get certificate.acm.services.k8s.aws ac16-cert -n acmcertificate \
+                -o json | jq -e '.spec.tags // [] | map(select(.key == "environment" and .value == "production")) | length > 0'
+
+    # AC-20: status outputs — certificateARN and conditions reflected from ACK Certificate status.
+    - name: ac20-status-outputs
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac20-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac1-cfg
+                domainName: ac20.example.com
+        - script:
+            content: |
+              for i in $(seq 1 30); do
+                kubectl get certificate.acm.services.k8s.aws ac20-cert -n acmcertificate 2>/dev/null && break
+                sleep 5
+              done
+              kubectl patch certificate.acm.services.k8s.aws ac20-cert -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:acm:us-east-1:123456789012:certificate/ac20","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac20-cert
+                namespace: acmcertificate
+              status:
+                certificateARN: "arn:aws:acm:us-east-1:123456789012:certificate/ac20"
+
+    # AC-8: private cert via cross-RGD CA ref — ACMCertificate.spec.certificateAuthorityRef
+    # is resolved via the caRefCr externalRef to ACMPrivateCA status.certificateAuthorityARN.
+    # We seed the ARN by patching the ACK CertificateAuthority child status directly.
+    - name: ac8-private-cert-via-ca-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac8-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac8-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        # Ensure acmprivateca RGD is Active before creating the ACMPrivateCA CR.
+        # The preamble applies it but does not wait — the acmprivateca suite owns that RGD.
+        - script:
+            content: |
+              kubectl wait rgd acmprivateca.aws.kropath.run --for=condition=Ready --timeout=120s
+        # Create the ACMPrivateCA that the ref will look up. kro creates its ACK child.
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac8-ca
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac8-ca
+              spec:
+                configRef: ac8-cfg
+                caType: ROOT
+                subject:
+                  commonName: "AC-8 Test CA"
+        - script:
+            content: |
+              # Wait for kro to create the ACK CertificateAuthority child, then patch its
+              # status ARN so ACMPrivateCA.status.certificateAuthorityARN gets populated.
+              for i in $(seq 1 30); do
+                kubectl get certificateauthorities.acmpca.services.k8s.aws ac8-ca -n acmcertificate --request-timeout=10s 2>/dev/null && break
+                sleep 3
+              done
+              kubectl patch certificateauthorities.acmpca.services.k8s.aws ac8-ca -n acmcertificate \
+                --subresource=status --type=merge --request-timeout=10s \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac8","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+              # Wait for kro to propagate the ARN into ACMPrivateCA.status
+              for i in $(seq 1 30); do
+                ARN=$(kubectl get acmprivatecas.aws.kropath.run ac8-ca -n acmcertificate --request-timeout=10s \
+                  -o jsonpath='{.status.certificateAuthorityARN}' 2>/dev/null)
+                if [ "$ARN" = "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac8" ]; then
+                  echo "ACMPrivateCA status ARN populated: $ARN"
+                  exit 0
+                fi
+                sleep 3
+              done
+              echo "FAIL: ACMPrivateCA status.certificateAuthorityARN not propagated"
+              exit 1
+        # Create the ACMCertificate using certificateAuthorityRef.
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac8-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac8-cfg
+                domainName: "internal.corp.com"
+                certificateAuthorityRef: ac8-ca
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac8-cert
+                namespace: acmcertificate
+              spec:
+                certificateAuthorityARN: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac8"
+
+    # AC-21 / AC-22 (immutability — spec.domainName, spec.keyAlgorithm): kro v0.9.2
+    # silently discards x-kubernetes-validations, so immutability enforcement is not
+    # available via the CRD layer. These ACs are intentionally omitted pending kro
+    # support for CEL validation rules. See kropath-core/docs/specs/aws/aws-acm-02-acmcertificate.md.

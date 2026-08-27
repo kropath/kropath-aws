@@ -67,6 +67,7 @@ echo "==> Installing ACK CRD definitions..."
 # name to ACK_SERVICES in that script so kro can compile the RGDs.
 # Installed services: s3 iam kms ec2 dynamodb rds sns sqs secretsmanager
 #                     eks ecr cloudwatch cloudwatchlogs elbv2 eventbridge autoscaling lambda elasticache efs sfn
+#                     acm acmpca
 source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 
 echo "==> Installing kropath CRD definitions..."

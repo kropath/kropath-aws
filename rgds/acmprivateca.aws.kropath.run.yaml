@@ -1,0 +1,319 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ACMPrivateCA RGD — wraps ACK acmpca.services.k8s.aws/CertificateAuthority +
+# CertificateAuthorityActivation.
+# Naming exemption (KRO-236): Private CAs are identified by AWS-assigned ARN —
+# no name field in the provider resource.
+# Spec: kropath-core/docs/specs/aws/aws-acm-03-acmprivateca.md
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: acmprivateca.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ACMPrivateCA
+    scope: Namespaced
+    spec:
+      # Governance
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # CA configuration
+      caType: string | default=ROOT
+      keyAlgorithm: string | default=""
+      signingAlgorithm: string | default=SHA256WITHRSA
+      usageMode: string | default=""
+      keyStorageSecurityStandard: string | default=""
+      # CA subject
+      subject: ACMSubject | default={}
+      # CA lifecycle
+      signingCertificateSecret: string | default=""
+      certificateChainSecret: string | default=""
+      # CRL revocation configuration (optional)
+      crlEnabled: boolean | default=false
+      crlS3BucketName: string | default=""
+      crlExpirationInDays: integer | default=0
+    types:
+      ACMSubject:
+        commonName: string | default=""
+        country: string | default=""
+        organization: string | default=""
+        organizationalUnit: string | default=""
+        state: string | default=""
+        locality: string | default=""
+    status:
+      conditions: >-
+        ${ackCA.?status.?conditions.orValue([])}
+      certificateAuthorityARN: >-
+        ${ackCA.?status.?ackResourceMetadata.?arn.orValue("")}
+      caStatus: >-
+        ${ackCA.?status.?status.orValue("")}
+      certificateSigningRequest: >-
+        ${ackCA.?status.?certificateSigningRequest.orValue("")}
+      missingTypeError: >-
+        ${has(missingTypeError.data) ? missingTypeError.data.error : ""}
+      missingCommonNameError: >-
+        ${has(missingCommonNameError.data) ? missingCommonNameError.data.error : ""}
+      missingSigningCertError: >-
+        ${has(missingSigningCertError.data) ? missingSigningCertError.data.error : ""}
+      missingChainSecretError: >-
+        ${has(missingChainSecretError.data) ? missingChainSecretError.data.error : ""}
+    additionalPrinterColumns:
+      - name: CertificateAuthorityARN
+        type: string
+        jsonPath: .status.certificateAuthorityARN
+      - name: Status
+        type: string
+        jsonPath: .status.caStatus
+
+  resources:
+    # Governance config lookup — single effCfg pattern (ADR-010).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ACMConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Advisory ConfigMap: caType is required (explicit empty value rejected).
+    # x-kubernetes-validations are discarded by kro v0.9.2; use in-graph ConfigMap pattern.
+    - id: missingTypeError
+      includeWhen:
+        - >-
+          ${schema.spec.caType == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-missing-type-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "caType is required"
+
+    # Advisory ConfigMap: subject.commonName is required.
+    - id: missingCommonNameError
+      includeWhen:
+        - >-
+          ${schema.spec.subject.commonName == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-missing-common-name-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "subject.commonName is required"
+
+    # Advisory ConfigMap: SUBORDINATE CA requires signing cert; ROOT CA should not provide one.
+    - id: missingSigningCertError
+      includeWhen:
+        - >-
+          ${schema.spec.caType == "SUBORDINATE" && schema.spec.signingCertificateSecret == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-signing-cert-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "signingCertificateSecret is required for SUBORDINATE CA type"
+
+    # Advisory ConfigMap: SUBORDINATE CA activation requires a certificate chain secret.
+    # Fires when type=SUBORDINATE, signingCertificateSecret is set, but certificateChainSecret is empty.
+    - id: missingChainSecretError
+      includeWhen:
+        - >-
+          ${schema.spec.caType == "SUBORDINATE" && schema.spec.signingCertificateSecret != "" && schema.spec.certificateChainSecret == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-missing-chain-secret-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "certificateChainSecret is required for SUBORDINATE CA activation"
+
+    # ACK CertificateAuthority CR.
+    - id: ackCA
+      template:
+        apiVersion: acmpca.services.k8s.aws/v1alpha1
+        kind: CertificateAuthority
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name, "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          type: "${schema.spec.caType}"
+          certificateAuthorityConfiguration:
+            keyAlgorithm: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?keyAlgorithm.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.keyAlgorithm
+                : (schema.spec.keyAlgorithm != ""
+                    ? schema.spec.keyAlgorithm
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?keyAlgorithm.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.keyAlgorithm
+                        : "RSA_2048"))}
+            signingAlgorithm: >-
+              ${schema.spec.signingAlgorithm != "" ? schema.spec.signingAlgorithm : "SHA256WITHRSA"}
+            subject:
+              commonName: "${schema.spec.subject.commonName}"
+              country: "${schema.spec.subject.country}"
+              organization: "${schema.spec.subject.organization}"
+              organizationalUnit: "${schema.spec.subject.organizationalUnit}"
+              state: "${schema.spec.subject.state}"
+              locality: "${schema.spec.subject.locality}"
+          usageMode: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?usageMode.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.usageMode
+              : (schema.spec.usageMode != ""
+                  ? schema.spec.usageMode
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?usageMode.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.usageMode
+                      : "GENERAL_PURPOSE"))}
+          keyStorageSecurityStandard: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?keyStorageSecurityStandard.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.keyStorageSecurityStandard
+              : (schema.spec.keyStorageSecurityStandard != ""
+                  ? schema.spec.keyStorageSecurityStandard
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?keyStorageSecurityStandard.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.keyStorageSecurityStandard
+                      : "FIPS_140_2_LEVEL_3_OR_HIGHER"))}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
+          revocationConfiguration:
+            crlConfiguration:
+              enabled: ${schema.spec.crlEnabled}
+              s3BucketName: "${schema.spec.crlS3BucketName}"
+              expirationInDays: ${schema.spec.crlExpirationInDays}
+
+    # ACK CertificateAuthorityActivation CR — signing cert set, with certificate chain.
+    # Used for SUBORDINATE CA activation where certificateChainSecret is required.
+    - id: ackCAActivationWithChain
+      includeWhen:
+        - >-
+          ${schema.spec.signingCertificateSecret != "" && schema.spec.certificateChainSecret != ""}
+      template:
+        apiVersion: acmpca.services.k8s.aws/v1alpha1
+        kind: CertificateAuthorityActivation
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          certificateAuthorityARN: "${ackCA.status.ackResourceMetadata.arn}"
+          certificate:
+            name: "${schema.spec.signingCertificateSecret}"
+            key: "tls.crt"
+          certificateChain:
+            name: "${schema.spec.certificateChainSecret}"
+            key: "ca.crt"
+          status: ACTIVE
+
+    # ACK CertificateAuthorityActivation CR — signing cert set, no certificate chain.
+    # Used for ROOT CA activation (chain is optional for root CAs per the ACMPCA API).
+    - id: ackCAActivationWithoutChain
+      includeWhen:
+        - >-
+          ${schema.spec.signingCertificateSecret != "" && schema.spec.certificateChainSecret == ""}
+      template:
+        apiVersion: acmpca.services.k8s.aws/v1alpha1
+        kind: CertificateAuthorityActivation
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          certificateAuthorityARN: "${ackCA.status.ackResourceMetadata.arn}"
+          certificate:
+            name: "${schema.spec.signingCertificateSecret}"
+            key: "tls.crt"
+          status: ACTIVE
