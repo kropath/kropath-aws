@@ -380,10 +380,85 @@ spec:
     # (covered by the existing ac7-ca-arn-and-ref-mutually-exclusive scenario above,
     # which asserts the caArnAndRefError advisory ConfigMap).
 
-    # AC-2 (cert via cross-RGD ref): requires a live ACMPrivateCA CR with
-    # status.certificateAuthorityARN populated by the ACK controller. The ACK controller
-    # is not available in this test environment. This AC is intentionally omitted and
-    # tracked for integration-test coverage.
+    # AC-2: Private cert via cross-RGD CA ref — certificateAuthorityRef resolves to
+    # ACMPrivateCA.status.certificateAuthorityARN. We seed the ARN by patching the
+    # ACK CertificateAuthority child status directly (no real ACK controller needed).
+    - name: ac2-issue-cert-via-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac2-cfg
+                namespace: acmprivatecertificate
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac2-cfg -n acmprivatecertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac2-ca
+                namespace: acmprivatecertificate
+                labels:
+                  aws.kropath.run/resource-name: ac2-ca
+              spec:
+                configRef: ac2-cfg
+                caType: ROOT
+                subject:
+                  commonName: "AC-2 Test CA"
+        - script:
+            content: |
+              # Wait for kro to create the ACK CertificateAuthority child, then patch its
+              # status ARN so ACMPrivateCA.status.certificateAuthorityARN gets populated.
+              for i in $(seq 1 30); do
+                kubectl get certificateauthorities.acmpca.services.k8s.aws ac2-ca -n acmprivatecertificate 2>/dev/null && break
+                sleep 3
+              done
+              kubectl patch certificateauthorities.acmpca.services.k8s.aws ac2-ca -n acmprivatecertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac2","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+              # Wait for kro to propagate the ARN into ACMPrivateCA.status
+              for i in $(seq 1 30); do
+                ARN=$(kubectl get acmprivatecas.aws.kropath.run ac2-ca -n acmprivatecertificate \
+                  -o jsonpath='{.status.certificateAuthorityARN}' 2>/dev/null)
+                if [ "$ARN" = "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac2" ]; then
+                  echo "ACMPrivateCA status ARN populated: $ARN"
+                  exit 0
+                fi
+                sleep 3
+              done
+              echo "FAIL: ACMPrivateCA status.certificateAuthorityARN not propagated"
+              exit 1
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCertificate
+              metadata:
+                name: ac2-cert
+                namespace: acmprivatecertificate
+              spec:
+                configRef: ac2-cfg
+                certificateAuthorityRef: ac2-ca
+                certificateSigningRequest: "-----BEGIN CERTIFICATE REQUEST-----"
+        - assert:
+            resource:
+              apiVersion: acmpca.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac2-cert
+                namespace: acmprivatecertificate
+              spec:
+                certificateAuthorityARN: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac2"
 
     # AC-6 (negative): certificateSigningRequest empty — advisory ConfigMap created.
     # Note: acmpca.services.k8s.aws/Certificate has no certificateSigningRequest field in

@@ -681,11 +681,72 @@ spec:
               data:
                 error: "certificateChainSecret is required for SUBORDINATE CA activation"
 
-    # AC-6 (CA lifecycle — root CA activation): requires a live ACK CertificateAuthority
-    # to reach PENDING_CERTIFICATE status before the CertificateAuthorityActivation CR
-    # can be applied. The ACK controller is not available in this test environment, so
-    # this scenario cannot be exercised end-to-end. It is intentionally omitted and
-    # tracked for integration-test coverage.
+    # AC-6: Root CA activation — kro creates CertificateAuthorityActivation when signingCertificateSecret is set.
+    # kro blocks ackCAActivation on ackCA.status.ackResourceMetadata.arn, so we seed
+    # the ACK CertificateAuthority status (the same pattern as acmcertificate ac8).
+    - name: ac6-root-ca-activation
+      try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: ac6-root-signed
+                namespace: acmprivateca
+              data:
+                tls.crt: dGVzdA==
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac6-cfg
+                namespace: acmprivateca
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac6-cfg -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac6-ca
+                namespace: acmprivateca
+              spec:
+                configRef: ac6-cfg
+                caType: ROOT
+                subject:
+                  commonName: "AC-6 Root CA"
+                signingCertificateSecret: "ac6-root-signed"
+        - script:
+            content: |
+              # Wait for kro to create the ACK CertificateAuthority child, then seed its ARN so
+              # kro unblocks the ackCAActivation dependency and creates the CertificateAuthorityActivation.
+              for i in $(seq 1 30); do
+                kubectl get certificateauthorities.acmpca.services.k8s.aws ac6-ca -n acmprivateca 2>/dev/null && break
+                sleep 3
+              done
+              kubectl patch certificateauthorities.acmpca.services.k8s.aws ac6-ca -n acmprivateca \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac6","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+        - assert:
+            resource:
+              apiVersion: acmpca.services.k8s.aws/v1alpha1
+              kind: CertificateAuthorityActivation
+              metadata:
+                name: ac6-ca
+                namespace: acmprivateca
+              spec:
+                certificate:
+                  name: "ac6-root-signed"
+                  key: "tls.crt"
 
     # AC-17 / AC-18 (immutability — spec.type, spec.keyAlgorithm): kro v0.9.2 silently
     # discards x-kubernetes-validations, so immutability enforcement is not available
