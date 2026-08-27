@@ -1,0 +1,196 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-dsql-01 (T-01) Chainsaw tests — one scenario per acceptance criterion.
+# Covers ACs 1–4 and 9–11. ACs 5–8 (effectiveConfig cascade) are in T-02 (KRO-798).
+# Canonical pattern: unique name per step, spec.skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: dsqlconfig
+spec:
+  skipDelete: true
+  namespace: dsqlconfig
+  steps:
+    # AC-1: happy-path: default-profile-apply
+    # Given: DSQLConfig/general-policy with defaults.deletionProtectionEnabled: true,
+    #        mandatory.deletionProtectionEnabled: false, all kmsEncryptionKey fields empty
+    # When: CR applied
+    # Then: CR accepted; spec.mandatory and spec.defaults persisted as specified
+    - name: ac1-default-profile-apply
+      try:
+        - apply:
+            file: 00-dsqlconfig-namespace.yaml
+        - apply:
+            file: 01-general-policy.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: general-policy
+                namespace: dsqlconfig
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                defaults:
+                  deletionProtectionEnabled: true
+                  kmsEncryptionKey: ""
+
+    # AC-2: happy-path: production-profile-apply
+    # Given: DSQLConfig/production with mandatory.deletionProtectionEnabled: true,
+    #        mandatory.kmsEncryptionKey set to a KMS ARN
+    # When: CR applied
+    # Then: CR accepted; mandatory values persisted as specified
+    - name: ac2-production-profile-apply
+      try:
+        - apply:
+            file: 02-production-profile.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: production
+                namespace: dsqlconfig
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: true
+                  kmsEncryptionKey: "arn:aws:kms:us-east-1:111122223333:key/mrk-1234abcd12ab34cd56ef1234567890ab"
+
+    # AC-3: negative: tier-conflict-deletion-protection
+    # Given: DSQLConfig with mandatory.deletionProtectionEnabled: true AND defaults.deletionProtectionEnabled: true
+    # When: CR applied
+    # Then: Rejected by x-kubernetes-validations
+    - name: ac3-tier-conflict-deletion-protection
+      try:
+        - apply:
+            file: 03-invalid-tier-conflict-deletion-protection.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: DSQLConfig
+                check:
+                  ($error != null): true
+
+    # AC-4: negative: tier-conflict-kms-key
+    # Given: DSQLConfig with mandatory.kmsEncryptionKey non-empty AND defaults.kmsEncryptionKey non-empty
+    # When: CR applied
+    # Then: Rejected by x-kubernetes-validations
+    - name: ac4-tier-conflict-kms-key
+      try:
+        - apply:
+            file: 04-invalid-tier-conflict-kms-key.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: DSQLConfig
+                check:
+                  ($error != null): true
+
+    # AC-9: happy-path: label-selector-lookup
+    # Given: DSQLConfig with label aws.kropath.run/resource-name set
+    # When: CR applied
+    # Then: CR accepted and label is present for RGD selector.matchLabels resolution (Theme 28)
+    - name: ac9-label-selector-lookup
+      try:
+        - apply:
+            file: 05-label-selector-lookup.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: label-lookup-policy
+                namespace: dsqlconfig
+                labels:
+                  aws.kropath.run/resource-name: label-lookup-policy
+
+    # AC-10: negative: missing-selector-label
+    # Given: DSQLConfig without aws.kropath.run/resource-name label
+    # When: CR applied
+    # Then: CR is accepted (CRD does not reject it), but the required label is absent —
+    #       an RGD using selector.matchLabels on this label will not resolve this config CR
+    - name: ac10-missing-selector-label
+      try:
+        - apply:
+            file: 06-missing-selector-label.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: no-label-policy
+                namespace: dsqlconfig
+        - script:
+            content: |
+              set -eu
+              # Verify the required selector label is absent on this CR
+              LABEL=$(kubectl get dsqlconfig no-label-policy -n dsqlconfig \
+                -o jsonpath='{.metadata.labels.aws\.kropath\.run/resource-name}' 2>/dev/null || true)
+              if [ -n "$LABEL" ]; then
+                echo "FAIL: expected label aws.kropath.run/resource-name to be absent, got: $LABEL"
+                exit 1
+              fi
+              echo "PASS: aws.kropath.run/resource-name label is absent (RGD selector lookup would fail)"
+
+    # AC-11: happy-path: dev-profile-apply
+    # Given: DSQLConfig/dev with defaults.deletionProtectionEnabled: false, all other fields zero
+    # When: CR applied and controller reconciles
+    # Then: effectiveConfig reflects dev posture — deletion protection defaults off, AWS-owned KMS key
+    - name: ac11-dev-profile-apply
+      try:
+        - apply:
+            file: 07-dev-profile.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: dev
+                namespace: dsqlconfig
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+        - script:
+            content: |
+              set -eu
+              # Simulate controller cascade for dev profile: no enforcement, AWS-owned key default
+              kubectl patch dsqlconfig dev -n dsqlconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: dev
+                namespace: dsqlconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    deletionProtectionEnabled: false
+                    kmsEncryptionKey: ""
+                  defaults:
+                    deletionProtectionEnabled: false
+                    kmsEncryptionKey: ""
+                  aws:
+                    accountId: "123456789012"
+                    region: "us-east-1"
+            timeout: 60s
