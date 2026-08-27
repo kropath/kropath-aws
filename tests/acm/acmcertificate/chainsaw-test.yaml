@@ -845,10 +845,87 @@ spec:
               status:
                 certificateARN: "arn:aws:acm:us-east-1:123456789012:certificate/ac20"
 
-    # AC-8 (CA via ref / cross-RGD): requires a live ACMPrivateCA CR with
-    # status.certificateAuthorityARN populated by the ACK controller. The ACK controller
-    # is not available in this test environment. This AC is intentionally omitted and
-    # tracked for integration-test coverage.
+    # AC-8: private cert via cross-RGD CA ref — ACMCertificate.spec.certificateAuthorityRef
+    # is resolved via the caRefCr externalRef to ACMPrivateCA status.certificateAuthorityARN.
+    # We seed the ARN by patching the ACK CertificateAuthority child status directly.
+    - name: ac8-private-cert-via-ca-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMConfig
+              metadata:
+                name: ac8-cfg
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch acmconfig ac8-cfg -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"keyAlgorithm":"","certificateTransparencyLogging":"","usageMode":"","keyStorageSecurityStandard":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"keyAlgorithm":"RSA_2048","certificateTransparencyLogging":"ENABLED","usageMode":"GENERAL_PURPOSE","keyStorageSecurityStandard":"FIPS_140_2_LEVEL_3_OR_HIGHER","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        # Create the ACMPrivateCA that the ref will look up. kro creates its ACK child.
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMPrivateCA
+              metadata:
+                name: ac8-ca
+                namespace: acmcertificate
+                labels:
+                  aws.kropath.run/resource-name: ac8-ca
+              spec:
+                configRef: ac8-cfg
+                caType: ROOT
+                subject:
+                  commonName: "AC-8 Test CA"
+        - script:
+            content: |
+              # Wait for kro to create the ACK CertificateAuthority child, then patch its
+              # status ARN so ACMPrivateCA.status.certificateAuthorityARN gets populated.
+              for i in $(seq 1 30); do
+                kubectl get certificateauthorities.acmpca.services.k8s.aws ac8-ca -n acmcertificate 2>/dev/null && break
+                sleep 3
+              done
+              kubectl patch certificateauthorities.acmpca.services.k8s.aws ac8-ca -n acmcertificate \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac8","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+              # Wait for kro to propagate the ARN into ACMPrivateCA.status
+              for i in $(seq 1 30); do
+                ARN=$(kubectl get acmprivatecas.aws.kropath.run ac8-ca -n acmcertificate \
+                  -o jsonpath='{.status.certificateAuthorityARN}' 2>/dev/null)
+                if [ "$ARN" = "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac8" ]; then
+                  echo "ACMPrivateCA status ARN populated: $ARN"
+                  exit 0
+                fi
+                sleep 3
+              done
+              echo "FAIL: ACMPrivateCA status.certificateAuthorityARN not propagated"
+              exit 1
+        # Create the ACMCertificate using certificateAuthorityRef.
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              metadata:
+                name: ac8-cert
+                namespace: acmcertificate
+              spec:
+                configRef: ac8-cfg
+                domainName: "internal.corp.com"
+                certificateAuthorityRef: ac8-ca
+        - assert:
+            resource:
+              apiVersion: acm.services.k8s.aws/v1alpha1
+              kind: Certificate
+              metadata:
+                name: ac8-cert
+                namespace: acmcertificate
+              spec:
+                certificateAuthorityARN: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/ac8"
 
     # AC-21 / AC-22 (immutability — spec.domainName, spec.keyAlgorithm): kro v0.9.2
     # silently discards x-kubernetes-validations, so immutability enforcement is not
