@@ -78,12 +78,11 @@ spec:
       conditions: >-
         ${cluster.?status.?conditions.orValue([])}
       # Mutual-exclusion validation error (empty when no conflict).
+      # Reads from always-bound validationMsg CM — schema.spec.* is not accessible in the
+      # status block, and has() on an excluded includeWhen CM variable silently returns ""
+      # for the whole field (frequent-rgd-errors.md §"The Unbound Variable Freeze").
       validationError: >-
-        ${has(kmsKeyMutualExclusionError.data) && has(kmsKeyMutualExclusionError.data.error)
-          ? kmsKeyMutualExclusionError.data.error
-          : (has(policyMutualExclusionError.data) && has(policyMutualExclusionError.data.error)
-              ? policyMutualExclusionError.data.error
-              : "")}
+        ${validationMsg.data.error}
     additionalPrinterColumns:
       - name: Identifier
         type: string
@@ -134,8 +133,38 @@ spec:
             matchLabels:
               aws.kropath.run/resource-name: '${schema.spec.clusterPolicyRef != "" ? schema.spec.clusterPolicyRef : "kro-empty-fallback-sentinel"}'
 
+    # Always-included CM that materialises the mutual-exclusion error message for
+    # status.validationError. schema.spec.* is valid inside template blocks but NOT in the
+    # status block; and has() on an excluded includeWhen CM silently swallows the whole
+    # status expression (frequent-rgd-errors.md §"The Unbound Variable Freeze"). Using an
+    # always-bound CM mirrors the naming-CM pattern in eventbridgearchive.
+    - id: validationMsg
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-msg
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${(schema.spec.kmsKeyArn != "" && schema.spec.kmsKeyRef != "")
+              ? "spec.kmsKeyArn and spec.kmsKeyRef are mutually exclusive — set exactly one"
+              : ((schema.spec.policy != "" && schema.spec.clusterPolicyRef != "")
+                  ? "spec.policy and spec.clusterPolicyRef are mutually exclusive — set exactly one"
+                  : "")}
+
     # Mutual exclusion guard: spec.kmsKeyArn and spec.kmsKeyRef cannot both be set.
     # In-graph ConfigMap advisory pattern — kro v0.9.2 does not preserve x-kubernetes-validations.
+    # Kept alongside validationMsg so Chainsaw can assert this CM's existence as a negative signal.
     - id: kmsKeyMutualExclusionError
       includeWhen:
         - '${schema.spec.kmsKeyArn != "" && schema.spec.kmsKeyRef != ""}'
