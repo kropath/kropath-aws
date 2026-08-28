@@ -53,7 +53,7 @@ the controllers.
 ```bash
 # Prerequisites: docker, kind, kubectl, helm, chainsaw
 cd tests
-make setup        # kind cluster + kro v0.9.2 + ACK CRDs + kropath CRDs and RGDs
+make setup        # kind cluster + kro v0.9.3 + ACK CRDs + kropath CRDs and RGDs
 make test-iam     # run one service suite
 make teardown     # tear the cluster down
 ```

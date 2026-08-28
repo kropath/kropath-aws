@@ -151,7 +151,7 @@ No AWS account or credentials are required for the local and CI test flows — o
 
 ```bash
 cd tests
-make setup        # creates the kind cluster, installs kro v0.9.2 + ACK CRDs + kropath CRDs/RGDs
+make setup        # creates the kind cluster, installs kro v0.9.3 + ACK CRDs + kropath CRDs/RGDs
 ```
 
 Then apply a governance profile and a resource:

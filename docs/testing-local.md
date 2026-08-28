@@ -63,7 +63,7 @@ variables, but `./setup.sh my-cluster` does not.
    `tests/fixtures/kind-config.yaml`, skipping creation if the cluster already exists, then
    switches the kubectl context to `kind-$CLUSTER_NAME`.
 2. **Creates the `kro-system` namespace** (skipped if it exists).
-3. **Installs kro v0.9.2** from the pinned release manifest
+3. **Installs kro v0.9.3** from the pinned release manifest
    (`kro-core-install-manifests.yaml`), applies `tests/fixtures/rbac/kro-controller.yaml`,
    and waits for the `kro` deployment rollout.
 4. **Tunes the kro dynamic-controller rate limiter** for test-suite churn, by setting these
@@ -266,7 +266,7 @@ BASE_SHA=$(git merge-base origin/main HEAD) HEAD_SHA=HEAD tests/select-tests.sh
 |---|---|
 | `hack/install-provider-crds.sh` | sourced by `tests/setup.sh` (step 5) |
 | `hack/check-crd-classification.sh` | root `Makefile` → `make lint-crds`, and the `crd-classification-check` workflow |
-| `hack/kro/` | vendored kro manifests, currently unreferenced (`tests/setup.sh` fetches the v0.9.2 release manifest from GitHub instead) |
+| `hack/kro/` | vendored kro manifests, currently unreferenced (`tests/setup.sh` fetches the v0.9.3 release manifest from GitHub instead) |
 
 > `hack/setup-local.sh` and `hack/kind-config.yaml` were removed — they predated the lambda
 > dependency waves, the CRD `Established` wait, and the rate-limiter tuning in `tests/setup.sh`,
