@@ -1,0 +1,252 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: dsqlcluster.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: DSQLCluster
+    scope: Namespaced
+    spec:
+      # Standard governance fields
+      configRef: string | default=general-policy
+      # Naming exemption (KRO-236): Aurora DSQL has no provider name field. The cluster is
+      # identified by an auto-generated 26-char identifier. effectiveName, nameOverride,
+      # namingTemplate, and predictedArn do NOT apply to this resource.
+      # Reference: crd-cache/aws/dsql-v1.1.1.md.
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Boolean sentinel — no default so has() / .orValue(false) correctly detects "not set"
+      # vs explicit false. kro v0.9.2 strips zero-value booleans (see frequent-rgd-errors.md).
+      # Cascade: mandatory (forced) OR instance OR defaults via OR-logic.
+      deletionProtectionEnabled: boolean
+      # KMS — exactly one of kmsKeyArn (direct ARN) or kmsKeyRef (KMSKey CR name), or empty
+      # (→ AWS-owned key). Setting both is a mutual-exclusion error; see status.validationError.
+      kmsKeyArn: string | default=""
+      kmsKeyRef: string | default=""
+      # Policy — exactly one of policy (raw JSON string) or clusterPolicyRef (PolicyDocument
+      # CR name), or empty (no policy). Setting both is a mutual-exclusion error.
+      policy: string | default=""
+      clusterPolicyRef: string | default=""
+      # Multi-Region — omit for single-region clusters. kro v0.9.2 always writes this block
+      # (cannot conditionally omit inline spec fields); ACK DSQL treats empty witnessRegion
+      # as single-region configuration.
+      multiRegionProperties:
+        witnessRegion: string | default=""
+        clusters: "[]string | default=[]"
+    status:
+      # DSQL cluster auto-generated identifier (26 lowercase alphanumeric chars). Read-only.
+      identifier: >-
+        ${cluster.?status.?identifier.orValue("")}
+      # Connection endpoint hostname.
+      endpoint: >-
+        ${cluster.?status.?endpoint.orValue("")}
+      # Cluster ARN from ACK resource metadata.
+      arn: >-
+        ${cluster.?status.?ackResourceMetadata.?arn.orValue("")}
+      # Lifecycle state (ACTIVE, CREATING, DELETING, etc.).
+      clusterStatus: >-
+        ${cluster.?status.?status.orValue("")}
+      # creationTime omitted: kro v0.9.2 cannot coerce optional_type(timestamp) to string
+      # via orValue(""). The field is available directly on the ACK Cluster CR.
+      # Encryption state — flattened from ACK encryptionDetails (kro v0.9.2 does not support
+      # nested status objects; fields are promoted to top-level status).
+      encryptionStatus: >-
+        ${cluster.?status.?encryptionDetails.?encryptionStatus.orValue("")}
+      encryptionType: >-
+        ${cluster.?status.?encryptionDetails.?encryptionType.orValue("")}
+      encryptionKmsKeyArn: >-
+        ${cluster.?status.?encryptionDetails.?kmsKeyARN.orValue("")}
+      # Standard ACK conditions array.
+      conditions: >-
+        ${cluster.?status.?conditions.orValue([])}
+      # Mutual-exclusion validation error (empty when no conflict).
+      validationError: >-
+        ${has(kmsKeyMutualExclusionError.data) && has(kmsKeyMutualExclusionError.data.error)
+          ? kmsKeyMutualExclusionError.data.error
+          : (has(policyMutualExclusionError.data) && has(policyMutualExclusionError.data.error)
+              ? policyMutualExclusionError.data.error
+              : "")}
+    additionalPrinterColumns:
+      - name: Identifier
+        type: string
+        jsonPath: .status.identifier
+      - name: Endpoint
+        type: string
+        jsonPath: .status.endpoint
+      - name: ClusterStatus
+        type: string
+        jsonPath: .status.clusterStatus
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: DSQLConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # KMSKey lookup via sentinel label selector — variable always bound as [] when
+    # kmsKeyRef is empty (sentinel label never matches a real resource).
+    - id: kmsKey
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KMSKey
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.kmsKeyRef != "" ? schema.spec.kmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # PolicyDocument lookup via sentinel label selector — variable always bound as [] when
+    # clusterPolicyRef is empty.
+    - id: policyDoc
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: PolicyDocument
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.clusterPolicyRef != "" ? schema.spec.clusterPolicyRef : "kro-empty-fallback-sentinel"}'
+
+    # Mutual exclusion guard: spec.kmsKeyArn and spec.kmsKeyRef cannot both be set.
+    # In-graph ConfigMap advisory pattern — kro v0.9.2 does not preserve x-kubernetes-validations.
+    - id: kmsKeyMutualExclusionError
+      includeWhen:
+        - '${schema.spec.kmsKeyArn != "" && schema.spec.kmsKeyRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-kms-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "spec.kmsKeyArn and spec.kmsKeyRef are mutually exclusive — set exactly one"
+
+    # Mutual exclusion guard: spec.policy and spec.clusterPolicyRef cannot both be set.
+    - id: policyMutualExclusionError
+      includeWhen:
+        - '${schema.spec.policy != "" && schema.spec.clusterPolicyRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-policy-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "spec.policy and spec.clusterPolicyRef are mutually exclusive — set exactly one"
+
+    # ACK Aurora DSQL Cluster CR — primary cloud resource.
+    # Naming exemption (KRO-236): DSQL has no provider name field; metadata.name is used for
+    # the K8s object only. The cluster is identified by status.identifier set by AWS on creation.
+    - id: cluster
+      template:
+        apiVersion: dsql.services.k8s.aws/v1alpha1
+        kind: Cluster
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Deletion protection — boolean OR-logic sentinel cascade (mandatory OR instance OR defaults).
+          # kro v0.9.2 strips zero-value booleans; only the enabling direction is reliable.
+          # See docs/frequent-rgd-errors.md §"Boolean Cascade Cannot Disable a Default-True Flag".
+          deletionProtectionEnabled: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.deletionProtectionEnabled)
+              || schema.spec.?deletionProtectionEnabled.orValue(false)
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.deletionProtectionEnabled)}
+          # KMS key — mandatory wins → kmsKeyRef (resolved to ARN via KMSKey CR status.keyArn)
+          # → kmsKeyArn (direct ARN) → defaults → "" (→ AWS-owned key).
+          kmsEncryptionKey: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.kmsEncryptionKey != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsEncryptionKey
+              : (schema.spec.kmsKeyRef != "" && kmsKey.size() > 0
+                  ? kmsKey[0].status.?keyArn.orValue("")
+                  : (schema.spec.kmsKeyArn != ""
+                      ? schema.spec.kmsKeyArn
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.kmsEncryptionKey != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.kmsEncryptionKey
+                          : "")))}
+          # Policy — clusterPolicyRef resolved from PolicyDocument CR spec.documentJSON → policy → "".
+          policy: >-
+            ${schema.spec.clusterPolicyRef != "" && policyDoc.size() > 0
+              ? policyDoc[0].spec.documentJSON
+              : schema.spec.policy}
+          # Tags — DSQL uses map[string]string (not []{ key, value } array).
+          # Cascade order: defaults → instance spec → mandatory (last-writer-wins via .merge()).
+          # No .transformList() — DSQL tags field is a map, not an array.
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+          # Multi-Region — populated from spec; empty values indicate single-region.
+          multiRegionProperties:
+            witnessRegion: >-
+              ${schema.spec.?multiRegionProperties.?witnessRegion.orValue("")}
+            clusters: >-
+              ${schema.spec.?multiRegionProperties.?clusters.orValue([])}
