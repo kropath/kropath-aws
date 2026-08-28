@@ -24,7 +24,7 @@ CLUSTER_NAME ?= kropath-aws-test
 	test-cloudwatch test-cloudwatchlogs test-documentdb test-dsql test-dynamodb test-ec2 test-ecr test-ecs test-efs \
 	test-eks test-elasticache test-elb test-eventbridge test-glue test-iam test-keyspaces test-kms \
 	test-lambda test-memorydb test-mq test-msk test-opensearch test-pipes test-policy test-rds test-route53 test-s3 test-secretsmanager \
-	test-sns test-sqs test-stepfunctions
+	test-sns test-sqs test-ssm test-stepfunctions
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -155,6 +155,9 @@ test-acm:
 
 test-opensearch:
 	chainsaw test opensearch/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-ssm:
+	chainsaw test ssm/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-stepfunctions:
 	chainsaw test stepfunctions/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
