@@ -1,0 +1,1355 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-dsql-02 (KRO-799) Chainsaw tests — one scenario per acceptance criterion.
+# Covers all 22 ACs for the DSQLCluster RGD.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named DSQLConfig + DSQLCluster and deletes
+# nothing between steps. skipDelete: true stops chainsaw's end-of-test cascade delete (the
+# test cluster runs kro but no ACK controllers, so ACK finalizers are never removed and any
+# delete would hang). The ephemeral kind cluster is discarded after the suite.
+#
+# Notes on kro v0.9.2 limitations documented in tests:
+#   - AC-2/boolean: OR-logic; only the enabling direction (instance true > defaults false) is testable.
+#   - AC-13/multiRegionProperties: kro always writes the field; test asserts empty values.
+#   - AC-19/20/status: ACK status is simulated via kubectl patch --subresource=status.
+#   - creationTime: omitted from DSQLCluster status (kro cannot coerce timestamp to string).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: dsqlcluster
+spec:
+  skipDelete: true
+  namespace: dsqlcluster
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: dsqlcluster
+
+    # AC-1: defaults-apply
+    # Given: DSQLConfig/ac1-cfg with defaults.deletionProtectionEnabled: true,
+    #        defaults.kmsEncryptionKey: "", instance spec has no overrides
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.deletionProtectionEnabled: true (from defaults)
+    - name: ac1-defaults-apply
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac1-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac1-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":true,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac1-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac1-cluster
+                namespace: dsqlcluster
+              spec:
+                deletionProtectionEnabled: true
+
+    # AC-2: instance-override-deletion-protection
+    # kro v0.9.2 limitation: zero-value booleans are stripped; OR-logic only reliably tests
+    # the enabling direction. This test verifies: instance true overrides defaults false.
+    # (The spec's "instance false overrides defaults true" direction is not achievable in v0.9.2.)
+    - name: ac2-instance-override-deletion-protection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac2-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac2-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac2-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac2-cfg
+                deletionProtectionEnabled: true
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac2-cluster
+                namespace: dsqlcluster
+              spec:
+                deletionProtectionEnabled: true
+
+    # AC-3: mandatory-override-deletion-protection
+    # Given: mandatory.deletionProtectionEnabled: true, instance does not set the field
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.deletionProtectionEnabled: true (mandatory wins via OR-logic)
+    - name: ac3-mandatory-override-deletion-protection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac3-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: true
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac3-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":true,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac3-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac3-cfg
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac3-cluster
+                namespace: dsqlcluster
+              spec:
+                deletionProtectionEnabled: true
+
+    # AC-4: mandatory-override-kms-key
+    # Given: mandatory.kmsEncryptionKey set; instance also sets kmsKeyArn
+    # When: DSQLCluster applied
+    # Then: ACK Cluster uses mandatory.kmsEncryptionKey (governance wins)
+    - name: ac4-mandatory-override-kms-key
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac4-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: "arn:aws:kms:us-east-1:111122223333:key/mandatory-key"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac4-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"arn:aws:kms:us-east-1:111122223333:key/mandatory-key","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac4-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac4-cfg
+                kmsKeyArn: "arn:aws:kms:us-east-1:111122223333:key/instance-key"
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac4-cluster
+                namespace: dsqlcluster
+              spec:
+                kmsEncryptionKey: "arn:aws:kms:us-east-1:111122223333:key/mandatory-key"
+
+    # AC-5: kms-key-arn-direct
+    # Given: instance spec.kmsKeyArn set; no mandatory/defaults KMS key
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.kmsEncryptionKey equals spec.kmsKeyArn
+    - name: ac5-kms-key-arn-direct
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac5-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac5-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac5-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac5-cfg
+                kmsKeyArn: "arn:aws:kms:us-east-1:111122223333:key/direct-key"
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac5-cluster
+                namespace: dsqlcluster
+              spec:
+                kmsEncryptionKey: "arn:aws:kms:us-east-1:111122223333:key/direct-key"
+
+    # AC-6: kms-key-ref-resolved
+    # Given: KMSKey CR with status.keyArn set; instance spec.kmsKeyRef = KMSKey CR name
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.kmsEncryptionKey = KMSKey status.keyArn
+    - name: ac6-kms-key-ref-resolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac6-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac6-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: ac6-key
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac6-key
+              spec:
+                configRef: general-policy
+        - script:
+            content: |
+              kubectl patch kmskey ac6-key -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"keyArn":"arn:aws:kms:us-east-1:111122223333:key/ref-key","predictedArn":"arn:aws:kms:us-east-1:111122223333:key/ref-key","resourceName":"ac6-key","namingStatus":"valid","keyID":"ref-key"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac6-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac6-cfg
+                kmsKeyRef: ac6-key
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac6-cluster
+                namespace: dsqlcluster
+              spec:
+                kmsEncryptionKey: "arn:aws:kms:us-east-1:111122223333:key/ref-key"
+
+    # AC-7: kms-key-mutual-exclusion (negative)
+    # Given: instance sets both kmsKeyArn AND kmsKeyRef
+    # When: DSQLCluster applied
+    # Then: status.validationError is non-empty; kmsKeyMutualExclusionError ConfigMap created
+    - name: ac7-kms-key-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac7-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac7-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac7-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac7-cfg
+                kmsKeyArn: "arn:aws:kms:us-east-1:111122223333:key/some-key"
+                kmsKeyRef: "some-kms-key-cr"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac7-cluster
+                namespace: dsqlcluster
+              status:
+                validationError: "spec.kmsKeyArn and spec.kmsKeyRef are mutually exclusive — set exactly one"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac7-cluster-kms-validation-error
+                namespace: dsqlcluster
+
+    # AC-8: aws-owned-kms-default
+    # Given: no KMS config anywhere (no mandatory.kmsEncryptionKey, no kmsKeyArn, no kmsKeyRef,
+    #        no defaults.kmsEncryptionKey)
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.kmsEncryptionKey is empty (AWS uses AWS-owned key)
+    - name: ac8-aws-owned-kms-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac8-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac8-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac8-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac8-cfg
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac8-cluster
+                namespace: dsqlcluster
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac8-cluster
+        - script:
+            content: |
+              set -eu
+              # kmsEncryptionKey should be empty (kro omits empty-string fields from status,
+              # but spec fields with empty values are written; the ACK Cluster spec field is empty)
+              VAL=$(kubectl get clusters.dsql.services.k8s.aws ac8-cluster -n dsqlcluster \
+                -o jsonpath='{.spec.kmsEncryptionKey}' 2>/dev/null || true)
+              if [ -n "$VAL" ]; then
+                echo "FAIL: expected kmsEncryptionKey to be empty, got: $VAL"
+                exit 1
+              fi
+              echo "PASS: kmsEncryptionKey is empty (AWS-owned KMS key will be used)"
+
+    # AC-9: policy-raw-json
+    # Given: instance spec.policy set to a JSON string
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.policy matches the raw JSON
+    - name: ac9-policy-raw-json
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac9-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac9-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac9-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac9-cfg
+                policy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"dsql:*","Resource":"*"}]}'
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac9-cluster
+                namespace: dsqlcluster
+              spec:
+                policy: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"dsql:*","Resource":"*"}]}'
+
+    # AC-10: policy-ref-resolved
+    # Given: PolicyDocument CR with spec.documentJSON set; instance spec.clusterPolicyRef references it
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.policy = PolicyDocument spec.documentJSON
+    - name: ac10-policy-ref-resolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac10-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac10-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PolicyDocument
+              metadata:
+                name: ac10-policy
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac10-policy
+              spec:
+                documentJSON: '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"dsql:*","Resource":"*"}]}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac10-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac10-cfg
+                clusterPolicyRef: ac10-policy
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac10-cluster
+                namespace: dsqlcluster
+              spec:
+                policy: '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"dsql:*","Resource":"*"}]}'
+
+    # AC-11: policy-mutual-exclusion (negative)
+    # Given: instance sets both spec.policy AND spec.clusterPolicyRef
+    # When: DSQLCluster applied
+    # Then: status.validationError is non-empty; policyMutualExclusionError ConfigMap created
+    - name: ac11-policy-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac11-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac11-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac11-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac11-cfg
+                policy: '{"Version":"2012-10-17"}'
+                clusterPolicyRef: some-policy-cr
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac11-cluster
+                namespace: dsqlcluster
+              status:
+                validationError: "spec.policy and spec.clusterPolicyRef are mutually exclusive — set exactly one"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac11-cluster-policy-validation-error
+                namespace: dsqlcluster
+
+    # AC-12: multi-region-config
+    # Given: instance spec.multiRegionProperties.witnessRegion and clusters set
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.multiRegionProperties populated with provided values
+    - name: ac12-multi-region-config
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac12-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac12-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac12-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac12-cfg
+                multiRegionProperties:
+                  witnessRegion: us-east-2
+                  clusters:
+                    - "arn:aws:dsql:us-east-1:111122223333:cluster/peer1aaaaabbbbbbbbbbbbbbbbbb"
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac12-cluster
+                namespace: dsqlcluster
+              spec:
+                multiRegionProperties:
+                  witnessRegion: us-east-2
+                  clusters:
+                    - "arn:aws:dsql:us-east-1:111122223333:cluster/peer1aaaaabbbbbbbbbbbbbbbbbb"
+
+    # AC-13: single-region-default
+    # Given: instance spec does not set multiRegionProperties
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.multiRegionProperties.witnessRegion is "" and clusters is []
+    # Note: kro v0.9.2 cannot omit inline spec fields; the object is always written with empty values.
+    - name: ac13-single-region-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac13-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac13-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac13-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac13-cfg
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac13-cluster
+                namespace: dsqlcluster
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac13-cluster
+        - script:
+            content: |
+              set -eu
+              # kro v0.9.2 always writes multiRegionProperties; assert it has empty values.
+              WR=$(kubectl get clusters.dsql.services.k8s.aws ac13-cluster -n dsqlcluster \
+                -o jsonpath='{.spec.multiRegionProperties.witnessRegion}' 2>/dev/null || true)
+              CL=$(kubectl get clusters.dsql.services.k8s.aws ac13-cluster -n dsqlcluster \
+                -o jsonpath='{.spec.multiRegionProperties.clusters}' 2>/dev/null || true)
+              if [ -n "$WR" ]; then
+                echo "FAIL: expected empty witnessRegion for single-region cluster, got: $WR"
+                exit 1
+              fi
+              if [ -n "$CL" ] && [ "$CL" != "[]" ]; then
+                echo "FAIL: expected empty clusters for single-region cluster, got: $CL"
+                exit 1
+              fi
+              echo "PASS: single-region cluster has empty multiRegionProperties values"
+
+    # AC-14: tag-merge-three-sources
+    # Given: defaults.tags, instance spec.tags, and mandatory.tags all set
+    # When: DSQLCluster applied
+    # Then: ACK Cluster spec.tags = last-writer-wins map (mandatory wins over instance, instance over defaults)
+    - name: ac14-tag-merge-three-sources
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac14-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac14-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{"env":"prod","tier":"mandatory-only"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{"env":"dev","region":"us-east-1"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac14-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac14-cfg
+                tags:
+                  env: staging
+                  app: myapp
+        - script:
+            content: |
+              set -eu
+              # DSQL tags are map[string]string — use jq for order-independent assertion.
+              TAGS=$(kubectl get clusters.dsql.services.k8s.aws ac14-cluster -n dsqlcluster \
+                -o json | jq -r '.spec.tags')
+              # mandatory.tags.env="prod" wins over instance.tags.env="staging" and defaults.tags.env="dev"
+              ENV_VAL=$(echo "$TAGS" | jq -r '.env')
+              # mandatory-only key should be present
+              TIER_VAL=$(echo "$TAGS" | jq -r '.tier')
+              # instance-only key should be present
+              APP_VAL=$(echo "$TAGS" | jq -r '.app')
+              # defaults-only key should be present
+              REGION_VAL=$(echo "$TAGS" | jq -r '.region')
+              FAIL=0
+              [ "$ENV_VAL" = "prod" ]    || { echo "FAIL: env expected 'prod', got '$ENV_VAL'"; FAIL=1; }
+              [ "$TIER_VAL" = "mandatory-only" ] || { echo "FAIL: tier expected 'mandatory-only', got '$TIER_VAL'"; FAIL=1; }
+              [ "$APP_VAL" = "myapp" ]   || { echo "FAIL: app expected 'myapp', got '$APP_VAL'"; FAIL=1; }
+              [ "$REGION_VAL" = "us-east-1" ] || { echo "FAIL: region expected 'us-east-1', got '$REGION_VAL'"; FAIL=1; }
+              [ "$FAIL" -eq 0 ] && echo "PASS: tag merge correct (mandatory wins, all sources merged)"
+              exit $FAIL
+
+    # AC-15: synced-labels-dual-write
+    # Given: instance spec.syncedLabels set
+    # When: DSQLCluster applied
+    # Then: ACK Cluster metadata.labels has kropath.run/-prefixed keys;
+    #       ACK Cluster spec.tags has the same values without prefix
+    - name: ac15-synced-labels-dual-write
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac15-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac15-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac15-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac15-cfg
+                syncedLabels:
+                  team: backend
+                  service: dsql
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac15-cluster
+                namespace: dsqlcluster
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac15-cluster
+        - script:
+            content: |
+              set -eu
+              # Check kropath.run/-prefixed labels on the ACK Cluster K8s metadata
+              TEAM_LABEL=$(kubectl get clusters.dsql.services.k8s.aws ac15-cluster -n dsqlcluster \
+                -o jsonpath='{.metadata.labels.kropath\.run/team}' 2>/dev/null || true)
+              SVC_LABEL=$(kubectl get clusters.dsql.services.k8s.aws ac15-cluster -n dsqlcluster \
+                -o jsonpath='{.metadata.labels.kropath\.run/service}' 2>/dev/null || true)
+              # Check cloud tags (plain keys, no prefix)
+              TEAM_TAG=$(kubectl get clusters.dsql.services.k8s.aws ac15-cluster -n dsqlcluster \
+                -o jsonpath='{.spec.tags.team}' 2>/dev/null || true)
+              SVC_TAG=$(kubectl get clusters.dsql.services.k8s.aws ac15-cluster -n dsqlcluster \
+                -o jsonpath='{.spec.tags.service}' 2>/dev/null || true)
+              FAIL=0
+              [ "$TEAM_LABEL" = "backend" ] || { echo "FAIL: kropath.run/team label expected 'backend', got '$TEAM_LABEL'"; FAIL=1; }
+              [ "$SVC_LABEL" = "dsql" ]    || { echo "FAIL: kropath.run/service label expected 'dsql', got '$SVC_LABEL'"; FAIL=1; }
+              [ "$TEAM_TAG" = "backend" ]  || { echo "FAIL: tags.team expected 'backend', got '$TEAM_TAG'"; FAIL=1; }
+              [ "$SVC_TAG" = "dsql" ]      || { echo "FAIL: tags.service expected 'dsql', got '$SVC_TAG'"; FAIL=1; }
+              [ "$FAIL" -eq 0 ] && echo "PASS: syncedLabels dual-write correct (K8s labels and cloud tags)"
+              exit $FAIL
+
+    # AC-16: standard-metadata-wiring
+    # Given: standard DSQLCluster with deletionPolicy=retain
+    # When: DSQLCluster applied
+    # Then: ACK Cluster has managed-by/instance labels, services.k8s.aws/deletion-policy annotation,
+    #       and ownerReference pointing to the DSQLCluster
+    - name: ac16-standard-metadata-wiring
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac16-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac16-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac16-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac16-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac16-cluster
+                namespace: dsqlcluster
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac16-cluster
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: DSQLCluster
+                    name: ac16-cluster
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # AC-17: deletion-policy-delete
+    # Given: instance spec.deletionPolicy=delete
+    # When: DSQLCluster applied
+    # Then: ACK Cluster annotation services.k8s.aws/deletion-policy=delete
+    - name: ac17-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac17-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac17-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac17-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac17-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac17-cluster
+                namespace: dsqlcluster
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-18: deletion-policy-retain
+    # Given: instance spec.deletionPolicy=retain (default)
+    # When: DSQLCluster applied
+    # Then: ACK Cluster annotation services.k8s.aws/deletion-policy=retain
+    - name: ac18-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac18-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac18-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac18-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac18-cfg
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac18-cluster
+                namespace: dsqlcluster
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-19: status-fields-propagation
+    # Given: ACK Cluster status is patched (simulating AWS reconciliation)
+    # When: kro reconciles
+    # Then: DSQLCluster status.identifier, endpoint, arn, clusterStatus reflect ACK status
+    - name: ac19-status-fields-propagation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac19-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac19-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac19-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac19-cfg
+        - script:
+            content: |
+              set -eu
+              # Simulate AWS reconciliation by patching the ACK Cluster status
+              kubectl patch clusters.dsql.services.k8s.aws ac19-cluster -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"identifier":"abc123def456ghi789jklmno12","endpoint":"abc123def456ghi789jklmno12.dsql.us-east-1.on.aws","status":"ACTIVE","ackResourceMetadata":{"arn":"arn:aws:dsql:us-east-1:123456789012:cluster/abc123def456ghi789jklmno12","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac19-cluster
+                namespace: dsqlcluster
+              status:
+                identifier: "abc123def456ghi789jklmno12"
+                endpoint: "abc123def456ghi789jklmno12.dsql.us-east-1.on.aws"
+                clusterStatus: "ACTIVE"
+                arn: "arn:aws:dsql:us-east-1:123456789012:cluster/abc123def456ghi789jklmno12"
+            timeout: 30s
+
+    # AC-20: encryption-details-status
+    # Given: ACK Cluster status.encryptionDetails patched (simulating AWS reconciliation)
+    # When: kro reconciles
+    # Then: DSQLCluster status.encryptionStatus, encryptionType, encryptionKmsKeyArn set
+    #       (flattened from ACK encryptionDetails — kro v0.9.2 does not support nested status objects)
+    - name: ac20-encryption-details-status
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: ac20-cfg
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig ac20-cfg -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac20-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: ac20-cfg
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/enc-key"
+        - script:
+            content: |
+              set -eu
+              # Simulate AWS setting encryptionDetails after KMS cluster creation
+              kubectl patch clusters.dsql.services.k8s.aws ac20-cluster -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"encryptionDetails":{"encryptionStatus":"ENABLED","encryptionType":"CUSTOMER_MANAGED_KMS_KEY","kmsKeyARN":"arn:aws:kms:us-east-1:123456789012:key/enc-key"}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac20-cluster
+                namespace: dsqlcluster
+              status:
+                encryptionStatus: "ENABLED"
+                encryptionType: "CUSTOMER_MANAGED_KMS_KEY"
+                encryptionKmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/enc-key"
+            timeout: 30s
+
+    # AC-21: configref-fallback-general-policy
+    # Given: instance spec has no configRef (defaults to "general-policy")
+    # When: DSQLCluster applied
+    # Then: kro resolves the general-policy DSQLConfig via label selector
+    - name: ac21-configref-fallback-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: general-policy
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: true
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig general-policy -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":true,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac21-cluster
+                namespace: dsqlcluster
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac21-cluster
+                namespace: dsqlcluster
+              spec:
+                deletionProtectionEnabled: true
+
+    # AC-22: configref-explicit-production
+    # Given: instance spec.configRef=production; production DSQLConfig with mandatory.kmsEncryptionKey set
+    # When: DSQLCluster applied
+    # Then: kro resolves the production DSQLConfig; ACK Cluster uses production governance values
+    - name: ac22-configref-explicit-production
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLConfig
+              metadata:
+                name: production
+                namespace: dsqlcluster
+                labels:
+                  aws.kropath.run/resource-name: production
+              spec:
+                mandatory:
+                  deletionProtectionEnabled: true
+                  kmsEncryptionKey: "arn:aws:kms:us-east-1:111122223333:key/prod-key"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  deletionProtectionEnabled: false
+                  kmsEncryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch dsqlconfig production -n dsqlcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"deletionProtectionEnabled":true,"kmsEncryptionKey":"arn:aws:kms:us-east-1:111122223333:key/prod-key","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"deletionProtectionEnabled":false,"kmsEncryptionKey":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: DSQLCluster
+              metadata:
+                name: ac22-cluster
+                namespace: dsqlcluster
+              spec:
+                configRef: production
+        - assert:
+            resource:
+              apiVersion: dsql.services.k8s.aws/v1alpha1
+              kind: Cluster
+              metadata:
+                name: ac22-cluster
+                namespace: dsqlcluster
+              spec:
+                deletionProtectionEnabled: true
+                kmsEncryptionKey: "arn:aws:kms:us-east-1:111122223333:key/prod-key"
