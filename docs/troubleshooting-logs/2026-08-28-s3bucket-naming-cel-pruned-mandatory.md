@@ -19,7 +19,17 @@ stuck in `IN_PROGRESS, Ready=False`:
 node "naming": failed to evaluate expression: ... no such key: namingTemplate (data pending)
 ```
 
-All other resource types (SQSQueue, SNSTopic) reconciled correctly.
+⚠️ **Corrected cluster-health framing (2026-08-28):** The original issue description claimed
+"SQSQueue and SNSTopic reconcile fine and resolve real ARNs." That was wrong — those values
+were kro's CEL-computed `predictedArn`/`queueUrl` fields, not AWS state. At the time: zero
+ACK `Queue` resources existed, ACK `Topic` resources were in `SYNCED=False/ACK.Terminal`,
+and 40 RGDs (including `snstopics` and `sqsqueues`) were `Inactive` due to a v0.9.3→v0.9.2
+rollback leaving stale CRDs. **Those are separate issues tracked elsewhere.** This fix
+addresses only the `s3bucket.aws.kropath.run` CEL fault, which is orthogonal to the
+cluster-wide CRD guard blockage.
+
+**Correct validation target:** confirm the `naming` ConfigMap resolves and the ACK `Bucket`
+child is created — not cluster-wide readiness.
 
 ---
 
