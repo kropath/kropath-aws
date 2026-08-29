@@ -1,0 +1,2240 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named GlueConfig + GlueJob and deletes
+# nothing between steps, so no ACK finalizer ever blocks a delete and kro's per-object
+# backoff never compounds. Test-level skipDelete: true stops chainsaw's end-of-test
+# cascade delete; the ephemeral kind cluster is discarded after the suite.
+#
+# Resource naming convention:
+#   GlueConfig CR name: gc-NN  (label aws.kropath.run/resource-name: gc-NN)
+#   GlueJob CR name:    jb-NN  (spec.configRef: gc-NN)
+#   Cloud resource name via {namespace}-{name}: gluejob-jb-NN
+#   ACK Job K8s name: jb-NN  (spec.name: gluejob-jb-NN)
+#
+# effectiveConfig patches always include ALL mandatory and defaults fields so that
+# no CEL "no such key" error occurs for missing intermediate keys.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: gluejob
+spec:
+  skipDelete: true
+  namespace: gluejob
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: defaults.glueVersion "4.0"; instance empty → ACK glueVersion "4.0"
+    - name: ac1-glue-version-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-01
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-01
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-01 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-01
+                namespace: gluejob
+              spec:
+                configRef: gc-01
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-01
+                namespace: gluejob
+              spec:
+                glueVersion: "4.0"
+
+    # AC-2: mandatory.glueVersion "4.0"; instance "3.0" → mandatory wins
+    - name: ac2-glue-version-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-02
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-02
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-02 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"4.0","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-02
+                namespace: gluejob
+              spec:
+                configRef: gc-02
+                glueVersion: "3.0"
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-02
+                namespace: gluejob
+              spec:
+                glueVersion: "4.0"
+
+    # AC-3: defaults.glueVersion "3.0"; instance "4.0" → instance wins
+    - name: ac3-glue-version-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-03
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-03
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-03 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"3.0","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-03
+                namespace: gluejob
+              spec:
+                configRef: gc-03
+                glueVersion: "4.0"
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-03
+                namespace: gluejob
+              spec:
+                glueVersion: "4.0"
+
+    # AC-4: defaults workerType "G.1X"/2; instance empty/zero → defaults applied
+    - name: ac4-worker-config-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-04
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-04
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-04 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-04
+                namespace: gluejob
+              spec:
+                configRef: gc-04
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-04
+                namespace: gluejob
+              spec:
+                workerType: G.1X
+                numberOfWorkers: 2
+
+    # AC-5: mandatory workerType "G.2X"/10; instance "G.4X"/5 → mandatory wins
+    - name: ac5-worker-config-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-05
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-05
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-05 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"G.2X","numberOfWorkers":10,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-05
+                namespace: gluejob
+              spec:
+                configRef: gc-05
+                workerType: G.4X
+                numberOfWorkers: 5
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-05
+                namespace: gluejob
+              spec:
+                workerType: G.2X
+                numberOfWorkers: 10
+
+    # AC-6: defaults "G.1X"/2; instance "G.4X"/20 → instance wins
+    - name: ac6-worker-config-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-06
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-06
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-06 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-06
+                namespace: gluejob
+              spec:
+                configRef: gc-06
+                workerType: G.4X
+                numberOfWorkers: 20
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-06
+                namespace: gluejob
+              spec:
+                workerType: G.4X
+                numberOfWorkers: 20
+
+    # AC-7: maxCapacity 10.0 → maxCapacity mode; workerType/numberOfWorkers suppressed
+    - name: ac7-maxcapacity-legacy-dpu
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-07
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-07
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-07 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-07
+                namespace: gluejob
+              spec:
+                configRef: gc-07
+                maxCapacity: 10.0
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-07
+                namespace: gluejob
+        - script:
+            content: |
+              JOB=$(kubectl get jobs.glue.services.k8s.aws jb-07 -n gluejob -o json)
+              MAX_CAP=$(echo "$JOB" | jq '.spec.maxCapacity // 0')
+              if [ "$(echo "$MAX_CAP == 10" | bc -l)" != "1" ] && [ "$MAX_CAP" != "10" ] && [ "$MAX_CAP" != "10.0" ]; then
+                echo "ERROR: expected maxCapacity 10 but got $MAX_CAP"
+                exit 1
+              fi
+              WORKER=$(echo "$JOB" | jq -r '.spec.workerType // ""')
+              if [ -n "$WORKER" ]; then
+                echo "ERROR: expected workerType absent/empty but got '$WORKER'"
+                exit 1
+              fi
+              echo "PASS: maxCapacity=$MAX_CAP, workerType='$WORKER'"
+
+    # AC-8: workerType "G.2X"/5; maxCapacity 0 → workerType+numberOfWorkers mode
+    - name: ac8-worker-type-over-maxcapacity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-08
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-08
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-08 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-08
+                namespace: gluejob
+              spec:
+                configRef: gc-08
+                workerType: G.2X
+                numberOfWorkers: 5
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-08
+                namespace: gluejob
+              spec:
+                workerType: G.2X
+                numberOfWorkers: 5
+
+    # AC-9: mandatory.executionClass "STANDARD"; instance "FLEX" → mandatory wins
+    - name: ac9-execution-class-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-09
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-09
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-09 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"STANDARD","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-09
+                namespace: gluejob
+              spec:
+                configRef: gc-09
+                executionClass: FLEX
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-09
+                namespace: gluejob
+              spec:
+                executionClass: STANDARD
+
+    # AC-10: defaults executionClass ""; instance "FLEX" → instance wins
+    - name: ac10-execution-class-instance-flex
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-10
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-10
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-10 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-10
+                namespace: gluejob
+              spec:
+                configRef: gc-10
+                executionClass: FLEX
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-10
+                namespace: gluejob
+              spec:
+                executionClass: FLEX
+
+    # AC-11: all executionClass sources empty → ACK Job created; executionClass absent
+    - name: ac11-execution-class-omitted
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-11
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-11
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-11 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-11
+                namespace: gluejob
+              spec:
+                configRef: gc-11
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-11
+                namespace: gluejob
+        - script:
+            content: |
+              EC=$(kubectl get jobs.glue.services.k8s.aws jb-11 -n gluejob -o json | jq -r '.spec.executionClass // ""')
+              if [ -n "$EC" ]; then
+                echo "ERROR: expected executionClass absent/empty but got '$EC'"
+                exit 1
+              fi
+              echo "PASS: executionClass='$EC' (absent)"
+
+    # AC-12: mandatory.timeout 120; instance 600 → mandatory wins
+    - name: ac12-timeout-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-12
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-12
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-12 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":120,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-12
+                namespace: gluejob
+              spec:
+                configRef: gc-12
+                timeout: 600
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-12
+                namespace: gluejob
+              spec:
+                timeout: 120
+
+    # AC-13: defaults.timeout 0; instance 0 → ACK timeout 0 (Glue service default)
+    - name: ac13-timeout-service-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-13
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-13
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-13 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-13
+                namespace: gluejob
+              spec:
+                configRef: gc-13
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-13
+                namespace: gluejob
+
+    # AC-14: defaults.timeout 480; instance 0 → defaults applied
+    - name: ac14-timeout-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-14
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-14
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-14 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":480,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-14
+                namespace: gluejob
+              spec:
+                configRef: gc-14
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-14
+                namespace: gluejob
+              spec:
+                timeout: 480
+
+    # AC-15: mandatory.maxRetries 3; instance 0 → mandatory wins
+    - name: ac15-retries-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-15
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-15
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-15 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":3,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-15
+                namespace: gluejob
+              spec:
+                configRef: gc-15
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-15
+                namespace: gluejob
+              spec:
+                maxRetries: 3
+
+    # AC-16: defaults.maxRetries 0; instance 5 → instance wins
+    - name: ac16-retries-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-16
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-16
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-16 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-16
+                namespace: gluejob
+              spec:
+                configRef: gc-16
+                maxRetries: 5
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-16
+                namespace: gluejob
+              spec:
+                maxRetries: 5
+
+    # AC-17: mandatory.maxConcurrentRuns 1; instance 5 → mandatory wins
+    - name: ac17-concurrency-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-17
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-17
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-17 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":1,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-17
+                namespace: gluejob
+              spec:
+                configRef: gc-17
+                maxConcurrentRuns: 5
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-17
+                namespace: gluejob
+              spec:
+                executionProperty:
+                  maxConcurrentRuns: 1
+
+    # AC-18: defaults.maxConcurrentRuns 1; instance 0 → defaults applied
+    - name: ac18-concurrency-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-18
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-18
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-18 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":1,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-18
+                namespace: gluejob
+              spec:
+                configRef: gc-18
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-18
+                namespace: gluejob
+              spec:
+                executionProperty:
+                  maxConcurrentRuns: 1
+
+    # AC-19: maxConcurrentRuns 3; jobRunQueuingEnabled true → ACK both set
+    - name: ac19-concurrency-with-queuing
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-19
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-19
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-19 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-19
+                namespace: gluejob
+              spec:
+                configRef: gc-19
+                maxConcurrentRuns: 3
+                jobRunQueuingEnabled: true
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-19
+                namespace: gluejob
+              spec:
+                executionProperty:
+                  maxConcurrentRuns: 3
+                jobRunQueuingEnabled: true
+
+    # AC-20: mandatory.securityConfiguration "org-sec-config"; instance "team-sec-config" → mandatory wins
+    - name: ac20-security-config-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-20
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-20
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-20 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"org-sec-config","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-20
+                namespace: gluejob
+              spec:
+                configRef: gc-20
+                securityConfiguration: team-sec-config
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-20
+                namespace: gluejob
+              spec:
+                securityConfiguration: org-sec-config
+
+    # AC-21: defaults.securityConfiguration "default-sec"; instance empty → defaults applied
+    - name: ac21-security-config-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-21
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-21
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-21 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"default-sec","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-21
+                namespace: gluejob
+              spec:
+                configRef: gc-21
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-21
+                namespace: gluejob
+              spec:
+                securityConfiguration: default-sec
+
+    # AC-22: all securityConfiguration sources empty → ACK securityConfiguration absent
+    - name: ac22-security-config-omitted
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-22
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-22
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-22 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-22
+                namespace: gluejob
+              spec:
+                configRef: gc-22
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-22
+                namespace: gluejob
+        - script:
+            content: |
+              SC=$(kubectl get jobs.glue.services.k8s.aws jb-22 -n gluejob -o json | jq -r '.spec.securityConfiguration // ""')
+              if [ -n "$SC" ]; then
+                echo "ERROR: expected securityConfiguration absent/empty but got '$SC'"
+                exit 1
+              fi
+              echo "PASS: securityConfiguration='$SC' (absent)"
+
+    # AC-23: mandatory.notifyDelayAfter 30; instance 60 → mandatory wins
+    - name: ac23-notify-delay-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-23
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-23
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-23 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":30,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-23
+                namespace: gluejob
+              spec:
+                configRef: gc-23
+                notifyDelayAfter: 60
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-23
+                namespace: gluejob
+              spec:
+                notificationProperty:
+                  notifyDelayAfter: 30
+
+    # AC-24: defaults.notifyDelayAfter 0; instance 0 → ACK Job created (notifyDelayAfter 0 or absent)
+    - name: ac24-notify-delay-omitted
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-24
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-24
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-24 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-24
+                namespace: gluejob
+              spec:
+                configRef: gc-24
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-24
+                namespace: gluejob
+
+    # AC-25: command.name "glueetl"; scriptLocation "s3://bucket/script.py" → ACK command fields set
+    - name: ac25-command-spark-etl
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-25
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-25
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-25 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-25
+                namespace: gluejob
+              spec:
+                configRef: gc-25
+                command:
+                  name: glueetl
+                  scriptLocation: s3://bucket/etl/transform.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-25
+                namespace: gluejob
+              spec:
+                command:
+                  name: glueetl
+                  scriptLocation: s3://bucket/etl/transform.py
+
+    # AC-26: command.name "pythonshell"; pythonVersion "3" → ACK command.name + pythonVersion
+    - name: ac26-command-python-shell
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-26
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-26
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-26 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-26
+                namespace: gluejob
+              spec:
+                configRef: gc-26
+                command:
+                  name: pythonshell
+                  scriptLocation: s3://bucket/scripts/job.py
+                  pythonVersion: "3"
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-26
+                namespace: gluejob
+              spec:
+                command:
+                  name: pythonshell
+                  pythonVersion: "3"
+
+    # AC-27: command.name "glueray"; runtime "Ray2.4" → ACK command.name + runtime
+    - name: ac27-command-ray
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-27
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-27
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-27 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-27
+                namespace: gluejob
+              spec:
+                configRef: gc-27
+                command:
+                  name: glueray
+                  scriptLocation: s3://bucket/scripts/ray-job.py
+                  runtime: Ray2.4
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-27
+                namespace: gluejob
+              spec:
+                command:
+                  name: glueray
+                  runtime: Ray2.4
+
+    # AC-28: defaultArguments {"--TempDir": ..., "--job-language": python} → ACK defaultArguments both entries
+    - name: ac28-default-arguments
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-28
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-28
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-28 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-28
+                namespace: gluejob
+              spec:
+                configRef: gc-28
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+                defaultArguments:
+                  "--TempDir": s3://temp-bucket/tmp/
+                  "--job-language": python
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-28
+                namespace: gluejob
+        - script:
+            content: |
+              ARGS=$(kubectl get jobs.glue.services.k8s.aws jb-28 -n gluejob -o json | jq '.spec.defaultArguments')
+              TEMP=$(echo "$ARGS" | jq -r '.["--TempDir"]')
+              LANG=$(echo "$ARGS" | jq -r '.["--job-language"]')
+              if [ "$TEMP" != "s3://temp-bucket/tmp/" ]; then
+                echo "ERROR: expected --TempDir 's3://temp-bucket/tmp/' but got '$TEMP'"
+                exit 1
+              fi
+              if [ "$LANG" != "python" ]; then
+                echo "ERROR: expected --job-language 'python' but got '$LANG'"
+                exit 1
+              fi
+              echo "PASS: defaultArguments --TempDir=$TEMP --job-language=$LANG"
+
+    # AC-29: nonOverridableArguments {"--enable-metrics": "true"} → ACK nonOverridableArguments set
+    - name: ac29-non-overridable-arguments
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-29
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-29
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-29 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-29
+                namespace: gluejob
+              spec:
+                configRef: gc-29
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+                nonOverridableArguments:
+                  "--enable-metrics": "true"
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-29
+                namespace: gluejob
+        - script:
+            content: |
+              VAL=$(kubectl get jobs.glue.services.k8s.aws jb-29 -n gluejob -o json | jq -r '.spec.nonOverridableArguments["--enable-metrics"]')
+              if [ "$VAL" != "true" ]; then
+                echo "ERROR: expected --enable-metrics 'true' but got '$VAL'"
+                exit 1
+              fi
+              echo "PASS: nonOverridableArguments[--enable-metrics]=$VAL"
+
+    # AC-30: ns gluejob, name jb-30; template {namespace}-{name} → resourceName + predictedArn
+    - name: ac30-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-30
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-30
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-30 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-30
+                namespace: gluejob
+              spec:
+                configRef: gc-30
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-30
+                namespace: gluejob
+              status:
+                resourceName: gluejob-jb-30
+                namingStatus: valid
+                predictedArn: arn:aws:glue:us-east-1:123456789012:job/gluejob-jb-30
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-30
+                namespace: gluejob
+              spec:
+                name: gluejob-jb-30
+
+    # AC-31: mandatory.namingTemplate "corp-{namespace}-{name}" → resourceName corp-gluejob-jb-31
+    - name: ac31-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-31
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-31
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-31 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"corp-{namespace}-{name}","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-31
+                namespace: gluejob
+              spec:
+                configRef: gc-31
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-31
+                namespace: gluejob
+              status:
+                resourceName: corp-gluejob-jb-31
+                namingStatus: valid
+
+    # AC-32: spec.nameOverride "my-custom-job" → resourceName my-custom-job; template bypassed
+    - name: ac32-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-32
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-32
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-32 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"corp-{namespace}-{name}","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-32
+                namespace: gluejob
+              spec:
+                configRef: gc-32
+                nameOverride: my-custom-job
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-32
+                namespace: gluejob
+              status:
+                resourceName: my-custom-job
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-32
+                namespace: gluejob
+              spec:
+                name: my-custom-job
+
+    # AC-33: namingTemplate {tag.env}-{name}; tag env absent → namingStatus invalid-unresolved-tokens; ACK Job not created
+    - name: ac33-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-33
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-33
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-33 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{tag.env}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-33
+                namespace: gluejob
+              spec:
+                configRef: gc-33
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-33
+                namespace: gluejob
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              COUNT=$(kubectl get jobs.glue.services.k8s.aws jb-33 -n gluejob --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" != "0" ]; then
+                echo "ERROR: ACK Job jb-33 should not exist when naming has unresolved tokens, but found $COUNT instance(s)"
+                exit 1
+              fi
+              echo "PASS: ACK Job jb-33 not created (naming blocked by includeWhen)"
+
+    # AC-34: tags merged — defaults < spec < mandatory; mandatory wins on collision
+    - name: ac34-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-34
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-34
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-34 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{"env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{"env":"dev","owner":"team"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-34
+                namespace: gluejob
+              spec:
+                configRef: gc-34
+                tags:
+                  cost-center: "123"
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-34
+                namespace: gluejob
+        - script:
+            content: |
+              TAGS=$(kubectl get jobs.glue.services.k8s.aws jb-34 -n gluejob -o json | jq '.spec.tags')
+              ENV=$(echo "$TAGS" | jq -r '.env')
+              OWNER=$(echo "$TAGS" | jq -r '.owner')
+              COST=$(echo "$TAGS" | jq -r '.["cost-center"]')
+              if [ "$ENV" != "prod" ]; then
+                echo "ERROR: expected env=prod (mandatory wins) but got '$ENV'"
+                exit 1
+              fi
+              if [ "$OWNER" != "team" ]; then
+                echo "ERROR: expected owner=team (from defaults) but got '$OWNER'"
+                exit 1
+              fi
+              if [ "$COST" != "123" ]; then
+                echo "ERROR: expected cost-center=123 (from spec) but got '$COST'"
+                exit 1
+              fi
+              echo "PASS: env=$ENV, owner=$OWNER, cost-center=$COST"
+
+    # AC-35: syncedLabels in ACK metadata.labels (aws.kropath.run/ prefix) AND in spec.tags (dual-write)
+    - name: ac35-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-35
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-35
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-35 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-35
+                namespace: gluejob
+              spec:
+                configRef: gc-35
+                syncedLabels:
+                  team: data
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-35
+                namespace: gluejob
+        - script:
+            content: |
+              JOB=$(kubectl get jobs.glue.services.k8s.aws jb-35 -n gluejob -o json)
+              # Check label with aws.kropath.run/ prefix in metadata.labels
+              LABEL=$(echo "$JOB" | jq -r '.metadata.labels["aws.kropath.run/team"]')
+              if [ "$LABEL" != "data" ]; then
+                echo "ERROR: expected metadata.labels[aws.kropath.run/team]=data but got '$LABEL'"
+                exit 1
+              fi
+              # Check dual-write: syncedLabels also appear in spec.tags (plain key, no prefix)
+              TAG=$(echo "$JOB" | jq -r '.spec.tags.team')
+              if [ "$TAG" != "data" ]; then
+                echo "ERROR: expected spec.tags[team]=data (dual-write) but got '$TAG'"
+                exit 1
+              fi
+              echo "PASS: metadata.labels[aws.kropath.run/team]=$LABEL, spec.tags[team]=$TAG"
+
+    # AC-36: syncedAnnotations in ACK metadata.annotations (aws.kropath.run/ prefix)
+    - name: ac36-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-36
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-36
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-36 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-36
+                namespace: gluejob
+              spec:
+                configRef: gc-36
+                syncedAnnotations:
+                  cost-center: "456"
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-36
+                namespace: gluejob
+        - script:
+            content: |
+              JOB=$(kubectl get jobs.glue.services.k8s.aws jb-36 -n gluejob -o json)
+              ANN=$(echo "$JOB" | jq -r '.metadata.annotations["aws.kropath.run/cost-center"]')
+              if [ "$ANN" != "456" ]; then
+                echo "ERROR: expected annotations[aws.kropath.run/cost-center]=456 but got '$ANN'"
+                exit 1
+              fi
+              echo "PASS: annotations[aws.kropath.run/cost-center]=$ANN"
+
+    # AC-37: ACK Job has managed-by, instance, deletion-policy, ownerRef
+    - name: ac37-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-37
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-37
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-37 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-37
+                namespace: gluejob
+              spec:
+                configRef: gc-37
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-37
+                namespace: gluejob
+        - script:
+            content: |
+              JOB=$(kubectl get jobs.glue.services.k8s.aws jb-37 -n gluejob -o json)
+              MANAGED_BY=$(echo "$JOB" | jq -r '.metadata.labels["app.kubernetes.io/managed-by"]')
+              INSTANCE=$(echo "$JOB" | jq -r '.metadata.labels["app.kubernetes.io/instance"]')
+              DEL_POLICY=$(echo "$JOB" | jq -r '.metadata.annotations["services.k8s.aws/deletion-policy"]')
+              OWNER=$(echo "$JOB" | jq -r '.metadata.ownerReferences[0].name')
+              if [ "$MANAGED_BY" != "kro" ]; then
+                echo "ERROR: expected managed-by=kro but got '$MANAGED_BY'"; exit 1
+              fi
+              if [ "$INSTANCE" != "jb-37" ]; then
+                echo "ERROR: expected instance=jb-37 but got '$INSTANCE'"; exit 1
+              fi
+              if [ "$DEL_POLICY" != "retain" ]; then
+                echo "ERROR: expected deletion-policy=retain but got '$DEL_POLICY'"; exit 1
+              fi
+              if [ "$OWNER" != "jb-37" ]; then
+                echo "ERROR: expected ownerRef.name=jb-37 but got '$OWNER'"; exit 1
+              fi
+              echo "PASS: managed-by=$MANAGED_BY, instance=$INSTANCE, deletion-policy=$DEL_POLICY, owner=$OWNER"
+
+    # AC-38: spec.deletionPolicy "delete" → ACK annotation deletion-policy: delete
+    - name: ac38-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-38
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-38
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-38 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-38
+                namespace: gluejob
+              spec:
+                configRef: gc-38
+                deletionPolicy: delete
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-38
+                namespace: gluejob
+        - script:
+            content: |
+              VAL=$(kubectl get jobs.glue.services.k8s.aws jb-38 -n gluejob -o json | jq -r '.metadata.annotations["services.k8s.aws/deletion-policy"]')
+              if [ "$VAL" != "delete" ]; then
+                echo "ERROR: expected deletion-policy=delete but got '$VAL'"
+                exit 1
+              fi
+              echo "PASS: deletion-policy=$VAL"
+
+    # AC-39: spec.deletionPolicy "retain" → ACK annotation deletion-policy: retain
+    - name: ac39-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-39
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-39
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-39 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-39
+                namespace: gluejob
+              spec:
+                configRef: gc-39
+                deletionPolicy: retain
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-39
+                namespace: gluejob
+        - script:
+            content: |
+              VAL=$(kubectl get jobs.glue.services.k8s.aws jb-39 -n gluejob -o json | jq -r '.metadata.annotations["services.k8s.aws/deletion-policy"]')
+              if [ "$VAL" != "retain" ]; then
+                echo "ERROR: expected deletion-policy=retain but got '$VAL'"
+                exit 1
+              fi
+              echo "PASS: deletion-policy=$VAL"
+
+    # AC-40: spec.description "Daily ETL transform job" → ACK description set
+    - name: ac40-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-40
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-40
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-40 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-40
+                namespace: gluejob
+              spec:
+                configRef: gc-40
+                description: "Daily ETL transform job"
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-40
+                namespace: gluejob
+              spec:
+                description: "Daily ETL transform job"
+
+    # AC-41: spec.connections ["jdbc-conn-1", "jdbc-conn-2"] → ACK connections.connections array
+    - name: ac41-connections
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-41
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-41
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-41 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-41
+                namespace: gluejob
+              spec:
+                configRef: gc-41
+                connections:
+                  - jdbc-conn-1
+                  - jdbc-conn-2
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-41
+                namespace: gluejob
+              spec:
+                connections:
+                  connections:
+                    - jdbc-conn-1
+                    - jdbc-conn-2
+
+    # AC-42: spec.jobMode "VISUAL" → ACK jobMode: VISUAL
+    - name: ac42-job-mode-visual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-42
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-42
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-42 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-42
+                namespace: gluejob
+              spec:
+                configRef: gc-42
+                jobMode: VISUAL
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-42
+                namespace: gluejob
+              spec:
+                jobMode: VISUAL
+
+    # AC-43: spec.maintenanceWindow "Sun:02" → ACK maintenanceWindow: Sun:02
+    - name: ac43-maintenance-window
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-43
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-43
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-43 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-43
+                namespace: gluejob
+              spec:
+                configRef: gc-43
+                maintenanceWindow: "Sun:02"
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-43
+                namespace: gluejob
+              spec:
+                maintenanceWindow: "Sun:02"
+
+    # AC-44: sourceControlDetails provider GITHUB + fields → ACK sourceControlDetails set
+    - name: ac44-source-control-github
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-44
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-44
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-44 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-44
+                namespace: gluejob
+              spec:
+                configRef: gc-44
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+                sourceControlDetails:
+                  provider: GITHUB
+                  repository: my-repo
+                  owner: my-org
+                  branch: main
+                  folder: etl/
+                  authStrategy: PERSONAL_ACCESS_TOKEN
+                  authToken: token123
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-44
+                namespace: gluejob
+              spec:
+                sourceControlDetails:
+                  provider: GITHUB
+                  repository: my-repo
+                  owner: my-org
+                  branch: main
+                  folder: etl/
+                  authStrategy: PERSONAL_ACCESS_TOKEN
+                  authToken: token123
+
+    # AC-45: sourceControlDetails empty → ACK Job created; provider absent or empty
+    - name: ac45-no-source-control
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-45
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-45
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-45 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-45
+                namespace: gluejob
+              spec:
+                configRef: gc-45
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-45
+                namespace: gluejob
+        - script:
+            content: |
+              PROVIDER=$(kubectl get jobs.glue.services.k8s.aws jb-45 -n gluejob -o json | jq -r '.spec.sourceControlDetails.provider // ""')
+              if [ -n "$PROVIDER" ]; then
+                echo "ERROR: expected provider absent/empty but got '$PROVIDER'"
+                exit 1
+              fi
+              echo "PASS: sourceControlDetails.provider='$PROVIDER' (absent)"
+
+    # AC-46: ACK Job spec.sourceControlDetails.lastCommitID "abc123" → GlueJob status.lastCommitID "abc123"
+    - name: ac46-status-last-commit-id
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-46
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: gc-46
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-46 -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-46
+                namespace: gluejob
+              spec:
+                configRef: gc-46
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+                sourceControlDetails:
+                  provider: GITHUB
+                  repository: etl-repo
+                  owner: my-org
+                  branch: main
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-46
+                namespace: gluejob
+        - script:
+            content: |
+              # Simulate ACK writing lastCommitID to the ACK Job spec (as ACK would after a source-control sync)
+              kubectl patch jobs.glue.services.k8s.aws jb-46 -n gluejob \
+                --type=merge \
+                -p '{"spec":{"sourceControlDetails":{"lastCommitID":"abc123"}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-46
+                namespace: gluejob
+              status:
+                lastCommitID: abc123
+
+    # AC-47: spec.configRef "etl-standard"; GlueConfig/etl-standard defaults.glueVersion "3.0" → ACK "3.0"
+    - name: ac47-config-ref-custom-profile
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-47-etl-standard
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: etl-standard
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-47-etl-standard -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"3.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-47
+                namespace: gluejob
+              spec:
+                configRef: etl-standard
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-47
+                namespace: gluejob
+              spec:
+                glueVersion: "3.0"
+
+    # AC-48: spec.configRef empty (default "general-policy") → falls through to general-policy
+    - name: ac48-config-ref-default-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueConfig
+              metadata:
+                name: gc-48-general-policy
+                namespace: gluejob
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec: {}
+        - script:
+            content: |
+              kubectl patch glueconfigs.aws.kropath.run gc-48-general-policy -n gluejob \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","glueVersion":"","workerType":"","numberOfWorkers":0,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","glueVersion":"4.0","workerType":"G.1X","numberOfWorkers":2,"executionClass":"","timeout":0,"maxRetries":0,"maxConcurrentRuns":0,"securityConfiguration":"","notifyDelayAfter":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              metadata:
+                name: jb-48
+                namespace: gluejob
+              spec:
+                command:
+                  name: glueetl
+                  scriptLocation: s3://test-bucket/script.py
+                role: arn:aws:iam::123456789012:role/GlueRole
+        - assert:
+            resource:
+              apiVersion: glue.services.k8s.aws/v1alpha1
+              kind: Job
+              metadata:
+                name: jb-48
+                namespace: gluejob
+              spec:
+                glueVersion: "4.0"

@@ -1,0 +1,368 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: gluejob.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: GlueJob
+    scope: Namespaced
+    spec:
+      # Standard governance fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Command — defines the ETL script and runtime (required)
+      command:
+        name: string | default=""
+        scriptLocation: string | default=""
+        pythonVersion: string | default=""
+        runtime: string | default=""
+      # IAM role ARN for job execution
+      role: string | default=""
+      # Glue runtime version — "" defers to governance cascade (default: 4.0)
+      glueVersion: string | default=""
+      # Worker configuration — workerType+numberOfWorkers OR maxCapacity (mutually exclusive)
+      # Zero sentinel: 0 means "not set"; use maxCapacity > 0 to switch to legacy DPU mode.
+      workerType: string | default=""
+      numberOfWorkers: integer | default=0
+      maxCapacity: float | default=0
+      # Execution settings — 0 defers to governance cascade or Glue service default
+      executionClass: string | default=""
+      timeout: integer | default=0
+      maxRetries: integer | default=0
+      maxConcurrentRuns: integer | default=0
+      # Job run queuing — enabled when maxConcurrentRuns is reached
+      jobRunQueuingEnabled: boolean | default=false
+      # Job arguments — passed through verbatim; both maps merged separately
+      defaultArguments: map[string]string | default={}
+      nonOverridableArguments: map[string]string | default={}
+      # Notification — 0 means no notification
+      notifyDelayAfter: integer | default=0
+      # Optional fields — all "" defers to no-op / service default
+      description: string | default=""
+      connections: "[]string | default=[]"
+      securityConfiguration: string | default=""
+      jobMode: string | default=""
+      maintenanceWindow: string | default=""
+      # Source control (optional) — all "" means no source control integration
+      sourceControlDetails:
+        provider: string | default=""
+        repository: string | default=""
+        owner: string | default=""
+        branch: string | default=""
+        folder: string | default=""
+        authStrategy: string | default=""
+        authToken: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{")
+          ? "arn:aws:glue:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":job/" + naming.data.resourceName
+          : ""}
+      lastCommitID: >-
+        ${ackJob.?spec.?sourceControlDetails.?lastCommitID.orValue("")}
+      conditions: >-
+        ${ackJob.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # Returns a list — all accesses use rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: GlueConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap to materialise resourceName and namingStatus.
+    # Computed here so the status block can reference naming.data.* without requiring schema.* access
+    # (schema is out of scope in the status block — see frequent-rgd-errors.md section 3).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: gluejob-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # resourceName: base name with full {tag.X} dynamic substitution support.
+          # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+          # Any {tag.X} token whose key is absent in all tiers is kept verbatim so namingStatus
+          # (computed below from resourceName) reports "invalid-unresolved-tokens".
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK Glue Job CR — primary cloud resource.
+    # Only created when resourceName has no unresolved {tag.X} tokens.
+    - id: ackJob
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+      template:
+        apiVersion: glue.services.k8s.aws/v1alpha1
+        kind: Job
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          # Command — required fields for job execution
+          command:
+            name: ${schema.spec.command.name}
+            scriptLocation: ${schema.spec.command.scriptLocation}
+            pythonVersion: ${schema.spec.command.pythonVersion}
+            runtime: ${schema.spec.command.runtime}
+          # IAM role ARN
+          role: ${schema.spec.role}
+          # Glue version — mandatory -> instance -> defaults -> built-in fallback (4.0)
+          glueVersion: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?glueVersion.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?glueVersion.orValue("")
+              : (schema.spec.glueVersion != ""
+                  ? schema.spec.glueVersion
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?glueVersion.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?glueVersion.orValue("")
+                      : "4.0"))}
+          # Worker type — mandatory -> instance -> defaults -> G.1X; set "" when maxCapacity > 0
+          workerType: >-
+            ${schema.spec.maxCapacity > 0.0 ? "" :
+              (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?workerType.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?workerType.orValue("")
+                : (schema.spec.workerType != ""
+                    ? schema.spec.workerType
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?workerType.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?workerType.orValue("")
+                        : "G.1X")))}
+          # Number of workers — mandatory -> instance -> defaults -> 2; 0 when maxCapacity > 0
+          numberOfWorkers: >-
+            ${schema.spec.maxCapacity > 0.0 ? 0 :
+              (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?numberOfWorkers.orValue(0) > 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?numberOfWorkers.orValue(0)
+                : (schema.spec.numberOfWorkers > 0
+                    ? schema.spec.numberOfWorkers
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?numberOfWorkers.orValue(0) > 0
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?numberOfWorkers.orValue(0)
+                        : 2)))}
+          # Max DPU capacity (legacy Glue v1.0) — 0 means not set; mutually exclusive with workerType+numberOfWorkers
+          maxCapacity: >-
+            ${schema.spec.maxCapacity > 0.0 ? schema.spec.maxCapacity : 0.0}
+          # Execution class — mandatory -> instance -> defaults; "" = Glue service default (STANDARD)
+          executionClass: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?executionClass.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?executionClass.orValue("")
+              : (schema.spec.executionClass != ""
+                  ? schema.spec.executionClass
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?executionClass.orValue("") : ""))}
+          # Timeout in minutes — mandatory -> instance -> defaults; 0 = Glue service default (2880)
+          timeout: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?timeout.orValue(0) > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?timeout.orValue(0)
+              : (schema.spec.timeout > 0
+                  ? schema.spec.timeout
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?timeout.orValue(0) : 0))}
+          # Max retries — mandatory -> instance -> defaults; 0 = no retries
+          maxRetries: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?maxRetries.orValue(0) > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?maxRetries.orValue(0)
+              : (schema.spec.maxRetries > 0
+                  ? schema.spec.maxRetries
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?maxRetries.orValue(0) : 0))}
+          # Execution property — concurrency limit (mandatory -> instance -> defaults -> 1)
+          executionProperty:
+            maxConcurrentRuns: >-
+              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?maxConcurrentRuns.orValue(0) > 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?maxConcurrentRuns.orValue(0)
+                : (schema.spec.maxConcurrentRuns > 0
+                    ? schema.spec.maxConcurrentRuns
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?maxConcurrentRuns.orValue(0) > 0
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?maxConcurrentRuns.orValue(0)
+                        : 1))}
+          # Job run queuing — passed through from instance spec
+          jobRunQueuingEnabled: ${schema.spec.jobRunQueuingEnabled}
+          # Security configuration — mandatory -> instance -> defaults; "" = no security config
+          securityConfiguration: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?securityConfiguration.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?securityConfiguration.orValue("")
+              : (schema.spec.securityConfiguration != ""
+                  ? schema.spec.securityConfiguration
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?securityConfiguration.orValue("") : ""))}
+          # Notification property — 0 means no notification
+          notificationProperty:
+            notifyDelayAfter: >-
+              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?notifyDelayAfter.orValue(0) > 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?notifyDelayAfter.orValue(0)
+                : (schema.spec.notifyDelayAfter > 0
+                    ? schema.spec.notifyDelayAfter
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?notifyDelayAfter.orValue(0) : 0))}
+          # Optional fields — passed through verbatim; "" = not set (ACK omits empty strings)
+          description: ${schema.spec.description}
+          connections:
+            connections: ${schema.spec.connections}
+          jobMode: ${schema.spec.jobMode}
+          maintenanceWindow: ${schema.spec.maintenanceWindow}
+          # Job arguments — passed through verbatim from instance spec
+          defaultArguments: ${schema.spec.defaultArguments}
+          nonOverridableArguments: ${schema.spec.nonOverridableArguments}
+          # Source control (optional) — all "" when not used; ACK omits empty optional strings
+          sourceControlDetails:
+            provider: ${schema.spec.sourceControlDetails.provider}
+            repository: ${schema.spec.sourceControlDetails.repository}
+            owner: ${schema.spec.sourceControlDetails.owner}
+            branch: ${schema.spec.sourceControlDetails.branch}
+            folder: ${schema.spec.sourceControlDetails.folder}
+            authStrategy: ${schema.spec.sourceControlDetails.authStrategy}
+            authToken: ${schema.spec.sourceControlDetails.authToken}
+          # Cloud resource tags — ACK Glue Job spec.tags is map[string]string (not array).
+          # Merge order: defaults -> instance spec -> mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          # No transformList needed — Glue tags are already a map type.
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
