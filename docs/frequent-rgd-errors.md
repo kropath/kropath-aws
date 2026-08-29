@@ -131,6 +131,25 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **What Works Instead:** * To safely inspect an index element, use safe-navigation chained to a default value: `trustDoc[0].?spec.orValue(null) != null`
     * To inspect the creation state of an `externalRef` collection list, look at the size of the array directly: `trustDoc.size() > 0`
 
+### `has(parent)` Does Not Guarantee `parent.child` — Guard the Leaf You Actually Index
+
+* **What Fails:** A guard proves the *parent* map exists, then the expression indexes a *child* key that does not:
+    ```cel
+    has(rsrcCfg[0].status.effectiveConfig.mandatory)
+      && part in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+    ```
+    ```log
+    node "naming": failed to evaluate expression: ... no such key: syncedLabels (data pending)
+    ```
+    The instance stalls in `IN_PROGRESS` forever — no child resource is ever created, and the RGD itself stays `Active`, so nothing in `kubectl get rgd` points at the problem.
+* **Why:** `has()` is a *presence* check on exactly the path it is given. `has(x.mandatory)` says nothing about `x.mandatory.syncedLabels`. The `in` operator then evaluates its right-hand side eagerly, and indexing an absent key on a present map is a hard CEL error, not a false. This is especially treacherous in a fall-through chain: the guard reads as if it protects the whole branch, but it only protects the first hop.
+* **What Works Instead:** Guard the leaf with safe navigation and a typed default, so a missing key degrades to an empty map instead of throwing:
+    ```cel
+    part in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+    ```
+    **Audit every branch, not just the one that fired.** In KRO-903 the same construct appeared four times per RGD — `mandatory.syncedLabels`, `mandatory.syncedAnnotations`, `defaults.syncedLabels`, `defaults.syncedAnnotations` — and was copy-pasted into **66 RGDs**. Only one branch failed in the field; the other three were live landmines waiting on a different tenant config.
+* **Why it stayed hidden:** The failure needs *both* a `{tag.X}` token whose key misses the earlier `mandatory.tags` branch *and* a config tier lacking `syncedLabels`. A tenant whose `namingTemplate` has no `{tag.}` token (e.g. `{namespace}-{name}-{account_id}`) never enters the branch and looks perfectly healthy — so a single passing tenant is not evidence the expression is safe. When a governance chain has fall-through tiers, test a config that omits an intermediate tier, not only fully-populated ones.
+
 ### The Unbound Variable Freeze
 * **What Fails:** Referencing a conditionally excluded task variable name inside a shared resource template block:
     ```yaml
@@ -1027,6 +1046,45 @@ Real drift found in the CloudFront family (KRO-443), every instance of which blo
     ```
 
 ---
+
+### ACK Wrapper Objects — a Correct Element Shape Attached One Level Too High
+
+* **What Fails:** A tag/list expression produces the right *element* shape but is bound to the container field rather than its inner array:
+    ```yaml
+    tagging: ${( ...merge chain... ).transformList(k, v, {"key": k, "value": v})}
+    ```
+    ```log
+    failed to create typed patch object (ns/name; s3.services.k8s.aws/v1alpha1, Kind=Bucket):
+    .spec.tagging: expected map, got &{[map[key:provisioner value:argocd] ...]}
+    ```
+    **No child resource is created at all** — the instance goes straight to `ERROR`, so an empty `kubectl get buckets.s3...` is the symptom, not a slow reconcile.
+* **Why:** Several ACK types wrap a list in a single-property container object. S3's `Bucket` is the canonical case: `spec.tagging` is an **object** whose only property is `tagSet` (the array). `transformList` emits `[{key,value},...]`, which is exactly what `tagSet` wants and exactly what `tagging` does not. The error text is easy to misread as "your tags are the wrong shape" when the shape is fine and only the nesting is wrong.
+* **What Works Instead:** Bind the expression to the inner field:
+    ```yaml
+    tagging:
+      tagSet: ${( ...same merge chain... ).transformList(k, v, {"key": k, "value": v})}
+    ```
+    Before writing any list-valued ACK field, dump the container to see whether it is the array or wraps one — per the section intro above:
+    ```bash
+    kubectl get crd buckets.s3.services.k8s.aws -o json \
+      | jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.tagging'
+    ```
+    `"type": "object"` with a single array property means you need the extra level. `"type": "array"` means bind directly.
+
+### Attribute-Passthrough Resources (SNS/SQS) — Omitting a Field Is Not the Same as Sending `""`
+
+* **What Fails:** Emitting an empty string for "no value", or sending a field that only applies in another mode:
+    ```yaml
+    policy: ${ref != "" && cr.size() > 0 ? cr[0].spec.documentJSON : ""}   # SNS
+    deduplicationScope: '${schema.spec.deduplicationScope}'                # SQS, always present
+    ```
+    ```log
+    InvalidParameter: Invalid parameter: Policy is empty
+    InvalidAttributeName: You can specify the DeduplicationScope only when FifoQueue is set to true.
+    ```
+* **Why:** For SNS `Topic` and SQS `Queue`, ACK forwards `spec` fields to AWS as **Attributes**, a flat string map. AWS validates every attribute it receives: an empty value is a malformed attribute rather than an absent one, and a mode-specific attribute is rejected outright when the mode is off. A CEL ternary always yields *something*, so the usual `: ""` fallback silently produces an invalid request.
+* **What Works Instead:** Make the field's *presence* conditional rather than its value — split the template on `includeWhen` (KRO-905, KRO-906) so the key is absent entirely when it does not apply. Guard **every** field in a mode-gated family: SQS ships four FIFO attributes, and gating only `fifoQueue` and `contentBasedDeduplication` still leaves `deduplicationScope` and `fifoThroughputLimit` flowing from their schema defaults (`queue`, `perQueue`) onto standard queues.
+* **Operational note — these do not self-heal:** Both failures land as `ACK.Terminal=True`. **ACK stops retrying a terminal condition**, so the resource sits failed indefinitely and a GitOps re-sync of an unchanged manifest will not clear it. The spec must actually change. When verifying a fix, confirm `ACK.ResourceSynced=True` rather than assuming a re-sync recovered it.
 
 ## 8. Diagnosing RGD Failures — Two Traps in the Tooling Itself
 
