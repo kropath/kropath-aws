@@ -1,0 +1,866 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ssm-02 Chainsaw tests — one scenario per acceptance criterion (18 total).
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step + skipDelete"):
+# every step creates a uniquely-named SSMConfig + SSMDocument; nothing is deleted between steps,
+# so no ACK finalizer ever blocks deletion and kro's per-object-key backoff never compounds.
+# spec.skipDelete: true stops chainsaw's end-of-test cascade; the ephemeral cluster is discarded.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ssmdocument
+spec:
+  skipDelete: true
+  namespace: ssmdocument
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: Default documentType — when no governance config sets documentType and the instance
+    # spec.documentType is empty, the built-in default "Command" is used.
+    - name: ac1-create-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac1-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac1-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac1-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac1-cfg
+                content: '{"schemaVersion":"2.2","description":"AC-1 default type","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac1-doc
+                namespace: ssmdocument
+              spec:
+                documentType: Command
+                documentFormat: JSON
+                name: ssmdocument-ac1-doc
+
+    # AC-2: Defaults documentType — when defaults.documentType is set and instance spec.documentType
+    # is empty, the defaults value is used.
+    - name: ac2-defaults-type
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac2-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  documentType: Automation
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac2-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"Automation","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac2-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac2-cfg
+                content: '{"schemaVersion":"2.2","description":"AC-2 defaults type","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac2-doc
+                namespace: ssmdocument
+              spec:
+                documentType: Automation
+
+    # AC-3: Mandatory override — when mandatory.documentType is set it wins over instance spec.documentType.
+    - name: ac3-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac3-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  documentType: Command
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac3-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"Command","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac3-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac3-cfg
+                documentType: Automation
+                content: '{"schemaVersion":"2.2","description":"AC-3 mandatory override","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac3-doc
+                namespace: ssmdocument
+              spec:
+                documentType: Command
+
+    # AC-4: Allowed documentType — when allowedDocumentTypes contains the resolved type, ACK Document is created.
+    - name: ac4-allowed-type
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac4-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  allowedDocumentTypes:
+                    - Command
+                    - Policy
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac4-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":["Command","Policy"],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac4-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac4-cfg
+                documentType: Command
+                content: '{"schemaVersion":"2.2","description":"AC-4 allowed type","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac4-doc
+                namespace: ssmdocument
+              spec:
+                documentType: Command
+
+    # AC-5 (Negative): Disallowed documentType — when the resolved type is not in allowedDocumentTypes,
+    # the ACK Document is NOT created (includeWhen guard blocks it).
+    - name: ac5-disallowed-type
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac5-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  allowedDocumentTypes:
+                    - Command
+                    - Policy
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac5-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":["Command","Policy"],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac5-disallowed-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac5-cfg
+                documentType: Automation
+                content: '{"schemaVersion":"2.2","description":"AC-5 disallowed type","mainSteps":[]}'
+        - script:
+            content: |
+              # Give kro time to reconcile, then assert ACK Document was NOT created
+              sleep 5
+              COUNT=$(kubectl get documents.ssm.services.k8s.aws -n ssmdocument ac5-disallowed-doc --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" -ne "0" ]; then
+                echo "ERROR: ACK Document should not exist when documentType is not in allowedDocumentTypes"
+                exit 1
+              fi
+              echo "PASS: ACK Document correctly not created for disallowed documentType"
+
+    # AC-6: JSON content format — document with explicit JSON format.
+    - name: ac6-json-content
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac6-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac6-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac6-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac6-cfg
+                documentFormat: JSON
+                content: '{"schemaVersion":"2.2","description":"AC-6 JSON format","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac6-doc
+                namespace: ssmdocument
+              spec:
+                documentFormat: JSON
+
+    # AC-7: YAML content format — document with YAML format and YAML-encoded content body.
+    - name: ac7-yaml-content
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac7-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac7-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac7-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac7-cfg
+                documentFormat: YAML
+                content: |-
+                  schemaVersion: "2.2"
+                  description: "AC-7 YAML format"
+                  mainSteps: []
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac7-doc
+                namespace: ssmdocument
+              spec:
+                documentFormat: YAML
+
+    # AC-8: Optional fields — displayName and targetType are passed through to the ACK Document.
+    - name: ac8-optional-fields
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac8-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac8-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac8-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac8-cfg
+                displayName: "My Display Name"
+                targetType: "/AWS::EC2::Instance"
+                content: '{"schemaVersion":"2.2","description":"AC-8 optional fields","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac8-doc
+                namespace: ssmdocument
+              spec:
+                displayName: "My Display Name"
+                targetType: "/AWS::EC2::Instance"
+
+    # AC-9: versionName immutability — spec.versionName is passed through to ACK Document.
+    # Immutability is enforced by ACK at the AWS API layer (not kro admission).
+    - name: ac9-versionname-immutable
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac9-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac9-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac9-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac9-cfg
+                versionName: "Release1.0"
+                content: '{"schemaVersion":"2.2","description":"AC-9 versionName","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac9-doc
+                namespace: ssmdocument
+              spec:
+                versionName: "Release1.0"
+
+    # AC-10: Naming default template — defaults.namingTemplate resolves to the expected resource name.
+    - name: ac10-naming-default-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac10-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac10-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac10-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac10-cfg
+                content: '{"schemaVersion":"2.2","description":"AC-10 naming","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac10-doc
+                namespace: ssmdocument
+              spec:
+                name: ssmdocument-ac10-doc
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac10-doc
+                namespace: ssmdocument
+              status:
+                resourceName: ssmdocument-ac10-doc
+                namingStatus: valid
+                predictedArn: "arn:aws:ssm:ap-southeast-2:123456789012:document/ssmdocument-ac10-doc"
+
+    # AC-11: Naming mandatory template — mandatory.namingTemplate overrides defaults template.
+    - name: ac11-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac11-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "doc-{name}"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac11-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"doc-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac11-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac11-cfg
+                content: '{"schemaVersion":"2.2","description":"AC-11 mandatory naming","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac11-doc
+                namespace: ssmdocument
+              spec:
+                name: doc-ac11-doc
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac11-doc
+                namespace: ssmdocument
+              status:
+                resourceName: doc-ac11-doc
+                namingStatus: valid
+
+    # AC-12: Name override — spec.nameOverride bypasses all naming templates.
+    - name: ac12-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac12-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac12-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac12-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac12-cfg
+                nameOverride: my-custom-document
+                content: '{"schemaVersion":"2.2","description":"AC-12 name override","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac12-doc
+                namespace: ssmdocument
+              spec:
+                name: my-custom-document
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac12-doc
+                namespace: ssmdocument
+              status:
+                resourceName: my-custom-document
+                namingStatus: valid
+
+    # AC-13 (Negative): Unresolved naming token — when the template contains {tag.env} but env
+    # tag is not in any tier, namingStatus is "invalid-unresolved-tokens" and ACK Document is NOT created.
+    - name: ac13-naming-unresolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac13-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}-{tag.env}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac13-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}-{tag.env}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac13-unresolved-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac13-cfg
+                content: '{"schemaVersion":"2.2","description":"AC-13 unresolved token","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac13-unresolved-doc
+                namespace: ssmdocument
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              COUNT=$(kubectl get documents.ssm.services.k8s.aws -n ssmdocument ac13-unresolved-doc --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" -ne "0" ]; then
+                echo "ERROR: ACK Document should not exist when naming has unresolved tokens"
+                exit 1
+              fi
+              echo "PASS: ACK Document correctly not created for unresolved naming token"
+
+    # AC-14: Tags merge — defaults, instance, and mandatory tags are merged in priority order
+    # (mandatory wins). All three tiers appear in the ACK Document spec.tags struct list.
+    - name: ac14-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac14-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory:
+                  tags:
+                    mandatory-tag: val1
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    default-tag: val2
+        - script:
+            content: |
+              kubectl patch ssmconfig ac14-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{"mandatory-tag":"val1"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{"default-tag":"val2"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac14-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac14-cfg
+                tags:
+                  instance-tag: val3
+                content: '{"schemaVersion":"2.2","description":"AC-14 tags merge","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac14-doc
+                namespace: ssmdocument
+        - script:
+            content: |
+              kubectl get documents.ssm.services.k8s.aws -n ssmdocument ac14-doc -o json | \
+                jq -e '
+                  .spec.tags | map({(.key): .value}) | add |
+                  (."mandatory-tag" == "val1") and
+                  (."default-tag" == "val2") and
+                  (."instance-tag" == "val3")
+                ' || { echo "ERROR: tag merge assertion failed"; exit 1; }
+              echo "PASS: all three tag tiers merged correctly"
+
+    # AC-15: syncedLabels — syncedLabels are dual-written to ACK Document K8s labels (prefixed
+    # aws.kropath.run/) and also merged into spec.tags (cloud tags).
+    - name: ac15-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac15-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    env: prod
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac15-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{"env":"prod"},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac15-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac15-cfg
+                syncedLabels:
+                  team: platform
+                content: '{"schemaVersion":"2.2","description":"AC-15 syncedLabels","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac15-doc
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/env: prod
+                  aws.kropath.run/team: platform
+        - script:
+            content: |
+              kubectl get documents.ssm.services.k8s.aws -n ssmdocument ac15-doc -o json | \
+                jq -e '
+                  .spec.tags | map({(.key): .value}) | add |
+                  (."env" == "prod") and (."team" == "platform")
+                ' || { echo "ERROR: syncedLabels not written to cloud tags"; exit 1; }
+              echo "PASS: syncedLabels present in both K8s labels and cloud tags"
+
+    # AC-16: Standard metadata — ACK Document has kropath-managed K8s labels and deletion-policy annotation.
+    - name: ac16-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac16-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac16-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac16-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac16-cfg
+                content: '{"schemaVersion":"2.2","description":"AC-16 standard metadata","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac16-doc
+                namespace: ssmdocument
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac16-doc
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: SSMDocument
+                    name: ac16-doc
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # AC-17: Deletion policy delete — spec.deletionPolicy: delete sets the ACK annotation.
+    - name: ac17-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac17-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac17-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac17-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac17-cfg
+                deletionPolicy: delete
+                content: '{"schemaVersion":"2.2","description":"AC-17 deletion delete","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac17-doc
+                namespace: ssmdocument
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-18: Deletion policy retain — spec.deletionPolicy: retain (default) sets the ACK annotation.
+    - name: ac18-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac18-cfg
+                namespace: ssmdocument
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac18-cfg -n ssmdocument \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"documentType":"","allowedDocumentTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMDocument
+              metadata:
+                name: ac18-doc
+                namespace: ssmdocument
+              spec:
+                configRef: ac18-cfg
+                deletionPolicy: retain
+                content: '{"schemaVersion":"2.2","description":"AC-18 deletion retain","mainSteps":[]}'
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Document
+              metadata:
+                name: ac18-doc
+                namespace: ssmdocument
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
