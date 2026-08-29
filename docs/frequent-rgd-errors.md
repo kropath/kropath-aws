@@ -1086,6 +1086,33 @@ Real drift found in the CloudFront family (KRO-443), every instance of which blo
 * **What Works Instead:** Make the field's *presence* conditional rather than its value — split the template on `includeWhen` (KRO-905, KRO-906) so the key is absent entirely when it does not apply. Guard **every** field in a mode-gated family: SQS ships four FIFO attributes, and gating only `fifoQueue` and `contentBasedDeduplication` still leaves `deduplicationScope` and `fifoThroughputLimit` flowing from their schema defaults (`queue`, `perQueue`) onto standard queues.
 * **Operational note — these do not self-heal:** Both failures land as `ACK.Terminal=True`. **ACK stops retrying a terminal condition**, so the resource sits failed indefinitely and a GitOps re-sync of an unchanged manifest will not clear it. The spec must actually change. When verifying a fix, confirm `ACK.ResourceSynced=True` rather than assuming a re-sync recovered it.
 
+### Empty-Value Rejection Is Not Only an Attributes Problem — Structured Sub-Resource Calls Fail the Same Way (S3)
+
+* **What Fails:** The same `: ""` fallback, on a resource that is *not* attribute-passthrough:
+    ```yaml
+    sseAlgorithm:   ${... : "aws:kms"}   # resolves to aws:kms from the platform baseline
+    kmsMasterKeyID: ${... : ""}          # nothing configures a key anywhere
+    ```
+    ```log
+    Error syncing property 'Encryption': operation error S3: PutBucketEncryption,
+    StatusCode: 400, api error InvalidArgument: if the default sse algorithm is
+    aws:kms or aws:kms:dsse and a KMSMasterKeyID is specified, it must be non-empty
+    ```
+* **Why:** The section above is scoped to SNS/SQS because those forward `spec` into a flat `Attributes` map. **The lesson generalises further than its examples.** ACK's S3 controller creates the bucket and then syncs each property through its own API call (`PutBucketEncryption`, `PutBucketTagging`, …). AWS applies the same rule there: a key that is present-but-empty is "specified", not absent. Any RGD field reaching a structured AWS call is exposed to this, not just attribute-passthrough families.
+* **Two consequences that make it diagnose badly:**
+    * **Partial success — the resource exists but is silently under-configured.** Properties sync in sequence and `Encryption` runs *before* `Tagging`. The failure aborts the reconcile, so `PutBucketTagging` is never reached. The bucket is created in AWS with **no tags**, while `spec.tagging.tagSet` is perfectly correct. The presenting symptom is "tags are missing", which points the investigation at the tag template — the wrong file. **Rule: when a resource exists in AWS but is missing configuration, look for an earlier property failing in the ACK controller log, not at the missing property's template.**
+    * **`ACK.Recoverable` behaves the opposite way to `ACK.Terminal`.** The operational note above ("these do not self-heal") applies to terminal conditions. This one is `ACK.Recoverable=True`, so ACK requeues without effective backoff — the live `Bucket` advanced roughly 25 resourceVersions per second indefinitely. ArgoCD diffs an object that never settles and the tile flaps; kro's apply collides with ACK's writes and reports `ResourcesReady=False :: resource reconciliation failed: cluster mutated`. Neither symptom names encryption. A flapping ArgoCD tile plus `cluster mutated` is a signature of a recoverable ACK error underneath, not of a kro or ArgoCD problem.
+* **What Works Instead:** Omit the field when it resolves empty, or supply a genuinely valid value. Where AWS documents a managed default, prefer it: `snstopic` already defaults `kmsMasterKeyID` to `alias/aws/sns`, which is exactly why SNS never hit this. `s3bucket` had no equivalent and now defaults to `alias/aws/s3` (KRO-913). Sibling RGDs diverging on the same field is itself the smell worth checking.
+
+### Guard *Every* Field in a Mode-Gated Family — Both Halves, Not Either Half
+
+* **What Fails:** KRO-906 gated `deduplicationScope` and `fifoThroughputLimit` behind an `includeWhen` split but left `fifoQueue: "false"` and `contentBasedDeduplication: "false"` hardcoded on the standard-queue branch. AWS rejects those too:
+    ```log
+    InvalidAttributeName: Unknown Attribute FifoQueue.
+    ```
+* **Why:** `CreateQueue` rejects the `FifoQueue` attribute outright when the queue name does not end in `.fifo`. The value `"false"` is not "FIFO disabled" — it is an attribute that must not be sent at all. The note in the section above anticipated the converse mistake (gating `fifoQueue`/`contentBasedDeduplication` while leaving the other two flowing); the failure that actually shipped was the mirror image. **Either half left ungated fails the same way**, so the family has to be audited as a whole rather than by whichever field was named in the last ticket.
+* **Fixed in:** KRO-912. Tracked history: the SNS/SQS/S3 empty-value defect was found and fixed one field group at a time across KRO-905, KRO-906, KRO-898, KRO-911, KRO-912 and KRO-913. KRO-915 sweeps all RGDs for the remaining `: ""` / literal-`"false"` fallbacks rather than waiting for AWS to reject the next one.
+
 ## 8. Diagnosing RGD Failures — Two Traps in the Tooling Itself
 
 ### `kubectl wait rgd --all --timeout=120s` Shares ONE Budget Across All RGDs
