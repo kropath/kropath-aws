@@ -1,0 +1,523 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: athenaworkgroup.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: AthenaWorkGroup
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      description: string | default=""
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Governance booleans — tri-state (no default) so mandatory.X presence can be detected
+      enforceWorkGroupConfiguration: boolean
+      publishCloudWatchMetricsEnabled: boolean
+      enableMinimumEncryptionConfiguration: boolean
+      requesterPaysEnabled: boolean
+      # Governance integer — tri-state
+      bytesScannedCutoffPerQuery: integer
+      # Governance strings
+      resultEncryptionOption: string | default=""
+      resultOutputLocation: string | default=""
+      engineVersion: string | default=""
+      # Result config passthrough
+      resultExpectedBucketOwner: string | default=""
+      resultAclOption: string | default=""
+      # Cross-RGD refs for result KMS — mutually exclusive
+      resultKmsKeyRef: string | default=""
+      resultKmsKeyArn: string | default=""
+      # Managed results config
+      managedQueryResultsEnabled: boolean | default=false
+      # Cross-RGD refs for managed results KMS — mutually exclusive
+      managedResultsKmsKeyRef: string | default=""
+      managedResultsKmsKeyArn: string | default=""
+      # Execution role (Spark) — cross-RGD ref or direct ARN, mutually exclusive
+      executionRoleRef: string | default=""
+      executionRoleArn: string | default=""
+      # Customer content KMS (Spark) — cross-RGD ref or direct ARN, mutually exclusive
+      customerContentKmsKeyRef: string | default=""
+      customerContentKmsKeyArn: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${(!naming.data.effectiveName.contains("{") && rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws))
+          ? "arn:aws:athena:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":workgroup/" + naming.data.effectiveName
+          : ""}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # kro infers rsrcCfg as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: AthenaConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Optional KMSKey lookup for result configuration encryption.
+    # Sentinel pattern: when resultKmsKeyRef is empty, selector never matches and list is [].
+    - id: resultKmsKey
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KMSKey
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.resultKmsKeyRef != "" ? schema.spec.resultKmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # Optional KMSKey lookup for managed query results encryption.
+    - id: managedResultsKmsKey
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KMSKey
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.managedResultsKmsKeyRef != "" ? schema.spec.managedResultsKmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # Optional IAMRole lookup for Spark execution role.
+    - id: executionRoleIam
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMRole
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.executionRoleRef != "" ? schema.spec.executionRoleRef : "kro-empty-fallback-sentinel"}'
+
+    # Optional KMSKey lookup for customer content encryption (Spark).
+    - id: customerContentKmsKey
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KMSKey
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.customerContentKmsKeyRef != "" ? schema.spec.customerContentKmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # Advisory ConfigMap: resultKmsKeyRef and resultKmsKeyArn are mutually exclusive.
+    # x-kubernetes-validations cannot be preserved by kro v0.9.2 — advisory ConfigMap used.
+    - id: resultKmsMutualExclusionError
+      includeWhen:
+        - '${schema.spec.resultKmsKeyRef != "" && schema.spec.resultKmsKeyArn != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-result-kms-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AthenaWorkGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "resultKmsKeyRef and resultKmsKeyArn are mutually exclusive — set one or neither"
+
+    # Advisory ConfigMap: managedResultsKmsKeyRef and managedResultsKmsKeyArn are mutually exclusive.
+    - id: managedKmsMutualExclusionError
+      includeWhen:
+        - '${schema.spec.managedResultsKmsKeyRef != "" && schema.spec.managedResultsKmsKeyArn != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-managed-kms-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AthenaWorkGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "managedResultsKmsKeyRef and managedResultsKmsKeyArn are mutually exclusive — set one or neither"
+
+    # Advisory ConfigMap: executionRoleRef and executionRoleArn are mutually exclusive.
+    - id: executionRoleMutualExclusionError
+      includeWhen:
+        - '${schema.spec.executionRoleRef != "" && schema.spec.executionRoleArn != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-execution-role-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AthenaWorkGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "executionRoleRef and executionRoleArn are mutually exclusive — set one or neither"
+
+    # Advisory ConfigMap: customerContentKmsKeyRef and customerContentKmsKeyArn are mutually exclusive.
+    - id: customerKmsMutualExclusionError
+      includeWhen:
+        - '${schema.spec.customerContentKmsKeyRef != "" && schema.spec.customerContentKmsKeyArn != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-customer-kms-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AthenaWorkGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "customerContentKmsKeyRef and customerContentKmsKeyArn are mutually exclusive — set one or neither"
+
+    # Advisory ConfigMap: resultOutputLocation and managedQueryResultsEnabled are mutually exclusive.
+    # (client-owned S3 vs Athena-managed S3 are mutually exclusive per ACK WorkGroup CRD notes)
+    - id: resultManagedMutualExclusionError
+      includeWhen:
+        - '${schema.spec.resultOutputLocation != "" && schema.spec.managedQueryResultsEnabled}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-result-managed-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AthenaWorkGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "resultOutputLocation and managedQueryResultsEnabled are mutually exclusive — use client-owned S3 (resultOutputLocation) or Athena-managed S3 (managedQueryResultsEnabled), not both"
+
+    # Naming ConfigMap — materialises effectiveName, resourceName and namingStatus.
+    # Default template: {namespace}-{name}. WorkGroup names follow ^[a-zA-Z0-9._-]{1,128}$.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-wg-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: workgroup-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AthenaWorkGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)
+              .contains("{") ? "invalid-unresolved-tokens" : "valid")}
+
+    # ACK WorkGroup CR — primary cloud resource.
+    # Only created when effectiveName has no unresolved tokens.
+    # WorkGroup.spec.name is immutable after creation (CEL self == oldSelf in ACK CRD).
+    - id: workGroup
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: athena.services.k8s.aws/v1alpha1
+        kind: WorkGroup
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AthenaWorkGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource name — always effectiveName (immutable after creation per ACK CRD)
+          name: ${naming.data.effectiveName}
+          description: "${schema.spec.description}"
+          configuration:
+            # enforceWorkGroupConfiguration — three-tier boolean cascade: mandatory wins over instance, instance over defaults
+            enforceWorkGroupConfiguration: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceWorkGroupConfiguration.orValue(false))
+                || schema.spec.?enforceWorkGroupConfiguration.orValue(false)
+                || (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enforceWorkGroupConfiguration.orValue(false))}
+            # publishCloudWatchMetricsEnabled — three-tier boolean cascade
+            publishCloudWatchMetricsEnabled: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?publishCloudWatchMetricsEnabled.orValue(false))
+                || schema.spec.?publishCloudWatchMetricsEnabled.orValue(false)
+                || (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?publishCloudWatchMetricsEnabled.orValue(false))}
+            # enableMinimumEncryptionConfiguration — three-tier boolean cascade
+            enableMinimumEncryptionConfiguration: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enableMinimumEncryptionConfiguration.orValue(false))
+                || schema.spec.?enableMinimumEncryptionConfiguration.orValue(false)
+                || (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enableMinimumEncryptionConfiguration.orValue(false))}
+            # requesterPaysEnabled — three-tier boolean cascade
+            requesterPaysEnabled: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?requesterPaysEnabled.orValue(false))
+                || schema.spec.?requesterPaysEnabled.orValue(false)
+                || (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?requesterPaysEnabled.orValue(false))}
+            # bytesScannedCutoffPerQuery — three-tier integer cascade; 0 = no cutoff
+            bytesScannedCutoffPerQuery: >-
+              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?bytesScannedCutoffPerQuery.orValue(0) > 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.bytesScannedCutoffPerQuery
+                : (schema.spec.?bytesScannedCutoffPerQuery.orValue(0) > 0
+                    ? schema.spec.bytesScannedCutoffPerQuery
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?bytesScannedCutoffPerQuery.orValue(0) > 0
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.bytesScannedCutoffPerQuery
+                        : 0))}
+            engineVersion:
+              # selectedEngineVersion — three-tier string cascade
+              selectedEngineVersion: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?engineVersion.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.engineVersion
+                  : (schema.spec.engineVersion != ""
+                      ? schema.spec.engineVersion
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?engineVersion.orValue("") != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.engineVersion
+                          : ""))}
+            resultConfiguration:
+              # outputLocation — three-tier string cascade; mandatory governs → instance → defaults
+              outputLocation: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?resultOutputLocation.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.resultOutputLocation
+                  : (schema.spec.resultOutputLocation != ""
+                      ? schema.spec.resultOutputLocation
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?resultOutputLocation.orValue("") != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.resultOutputLocation
+                          : ""))}
+              expectedBucketOwner: "${schema.spec.resultExpectedBucketOwner}"
+              aclConfiguration:
+                s3ACLOption: "${schema.spec.resultAclOption}"
+              encryptionConfiguration:
+                # encryptionOption — three-tier string cascade
+                encryptionOption: >-
+                  ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?resultEncryptionOption.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.resultEncryptionOption
+                    : (schema.spec.resultEncryptionOption != ""
+                        ? schema.spec.resultEncryptionOption
+                        : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?resultEncryptionOption.orValue("") != ""
+                            ? rsrcCfg[0].status.effectiveConfig.defaults.resultEncryptionOption
+                            : ""))}
+                # kmsKey — resolved from resultKmsKeyRef (cross-RGD) or resultKmsKeyArn (direct)
+                kmsKey: >-
+                  ${resultKmsKey.size() > 0 && schema.spec.resultKmsKeyRef != ""
+                    ? resultKmsKey[0].status.predictedArn
+                    : schema.spec.resultKmsKeyArn}
+            managedQueryResultsConfiguration:
+              enabled: ${schema.spec.managedQueryResultsEnabled}
+              encryptionConfiguration:
+                # kmsKey — resolved from managedResultsKmsKeyRef or managedResultsKmsKeyArn
+                kmsKey: >-
+                  ${managedResultsKmsKey.size() > 0 && schema.spec.managedResultsKmsKeyRef != ""
+                    ? managedResultsKmsKey[0].status.predictedArn
+                    : schema.spec.managedResultsKmsKeyArn}
+            # executionRole — resolved from executionRoleRef (cross-RGD) or executionRoleArn (direct)
+            executionRole: >-
+              ${executionRoleIam.size() > 0 && schema.spec.executionRoleRef != ""
+                ? executionRoleIam[0].status.predictedArn
+                : schema.spec.executionRoleArn}
+            customerContentEncryptionConfiguration:
+              # kmsKey — resolved from customerContentKmsKeyRef or customerContentKmsKeyArn
+              kmsKey: >-
+                ${customerContentKmsKey.size() > 0 && schema.spec.customerContentKmsKeyRef != ""
+                  ? customerContentKmsKey[0].status.predictedArn
+                  : schema.spec.customerContentKmsKeyArn}
+          # Cloud resource tags — convert map to {key, value} list required by ACK Athena.
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
