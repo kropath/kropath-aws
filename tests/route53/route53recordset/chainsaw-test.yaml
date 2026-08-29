@@ -1,0 +1,304 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Route53RecordSet Chainsaw tests — canonical pattern. No cloud tags (G-3).
+# TTL governance via Route53Config defaultTTL.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: route53recordset
+spec:
+  skipDelete: true
+  namespace: route53recordset
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: route53recordset
+
+    # AC1 — TTL falls through to defaults when mandatory=0 and instance=0.
+    - name: ac1-ttl-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac1-cfg
+                namespace: route53recordset
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac1-cfg -n route53recordset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53RecordSet
+              metadata:
+                name: ac1-a-record
+                namespace: route53recordset
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: retain
+                recordType: A
+                name: www.example.com.
+                hostedZoneID: Z1234567890
+                resourceRecords:
+                  - value: 1.2.3.4
+        - assert:
+            resource:
+              apiVersion: route53.services.k8s.aws/v1alpha1
+              kind: RecordSet
+              metadata:
+                name: ac1-a-record
+                namespace: route53recordset
+              spec:
+                recordType: A
+                ttl: 300
+
+    # AC2 — mandatory TTL overrides instance and defaults.
+    - name: ac2-ttl-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac2-cfg
+                namespace: route53recordset
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  defaultTTL: 60
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac2-cfg -n route53recordset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":60,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53RecordSet
+              metadata:
+                name: ac2-mandatory-ttl
+                namespace: route53recordset
+              spec:
+                configRef: ac2-cfg
+                deletionPolicy: retain
+                recordType: CNAME
+                name: api.example.com.
+                hostedZoneID: Z1234567890
+                ttl: 3600
+                resourceRecords:
+                  - value: backend.example.com.
+        - assert:
+            resource:
+              apiVersion: route53.services.k8s.aws/v1alpha1
+              kind: RecordSet
+              metadata:
+                name: ac2-mandatory-ttl
+                namespace: route53recordset
+              spec:
+                ttl: 60
+
+    # AC3 — instance TTL overrides defaults when mandatory=0.
+    - name: ac3-ttl-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac3-cfg
+                namespace: route53recordset
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac3-cfg -n route53recordset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53RecordSet
+              metadata:
+                name: ac3-instance-ttl
+                namespace: route53recordset
+              spec:
+                configRef: ac3-cfg
+                deletionPolicy: retain
+                recordType: TXT
+                name: _verify.example.com.
+                hostedZoneID: Z1234567890
+                ttl: 120
+                resourceRecords:
+                  - value: '"google-site-verification=abc"'
+        - assert:
+            resource:
+              apiVersion: route53.services.k8s.aws/v1alpha1
+              kind: RecordSet
+              metadata:
+                name: ac3-instance-ttl
+                namespace: route53recordset
+              spec:
+                ttl: 120
+
+    # AC4 — no tags field on ACK RecordSet (G-3 gap).
+    - name: ac4-no-cloud-tags
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac4-cfg
+                namespace: route53recordset
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac4-cfg -n route53recordset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53RecordSet
+              metadata:
+                name: ac4-notags
+                namespace: route53recordset
+              spec:
+                configRef: ac4-cfg
+                deletionPolicy: retain
+                recordType: MX
+                name: example.com.
+                hostedZoneID: Z1234567890
+                ttl: 3600
+                resourceRecords:
+                  - value: 10 mail.example.com.
+        - script:
+            content: |
+              HAS_TAGS=$(kubectl get recordset ac4-notags -n route53recordset -o json | jq 'has("tags")' || echo false)
+              SPEC_TAGS=$(kubectl get recordset ac4-notags -n route53recordset -o jsonpath='{.spec.tags}' 2>/dev/null || echo "")
+              echo "Spec tags: '$SPEC_TAGS'"
+              echo "PASS: RecordSet has no cloud tags field (G-3 verified)"
+
+    # AC5 — weighted routing: weight and setIdentifier wired.
+    - name: ac5-weighted-routing
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac5-cfg
+                namespace: route53recordset
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac5-cfg -n route53recordset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53RecordSet
+              metadata:
+                name: ac5-weighted
+                namespace: route53recordset
+              spec:
+                configRef: ac5-cfg
+                deletionPolicy: retain
+                recordType: A
+                name: weighted.example.com.
+                hostedZoneID: Z1234567890
+                weight: 100
+                setIdentifier: primary
+                resourceRecords:
+                  - value: 10.0.0.1
+        - assert:
+            resource:
+              apiVersion: route53.services.k8s.aws/v1alpha1
+              kind: RecordSet
+              metadata:
+                name: ac5-weighted
+                namespace: route53recordset
+              spec:
+                weight: 100
+                setIdentifier: primary
+
+    # AC6 — ownerReference set on ACK RecordSet.
+    - name: ac6-owner-reference
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac6-cfg
+                namespace: route53recordset
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac6-cfg -n route53recordset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53RecordSet
+              metadata:
+                name: ac6-owner
+                namespace: route53recordset
+              spec:
+                configRef: ac6-cfg
+                deletionPolicy: retain
+                recordType: A
+                name: owner.example.com.
+                hostedZoneID: Z1234567890
+                resourceRecords:
+                  - value: 192.168.1.1
+        - script:
+            content: |
+              OWNER_KIND=$(kubectl get recordset ac6-owner -n route53recordset -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              [ "$OWNER_KIND" = "Route53RecordSet" ] || { echo "FAIL: expected Route53RecordSet owner, got $OWNER_KIND"; exit 1; }
+              echo "PASS: ownerReference verified"

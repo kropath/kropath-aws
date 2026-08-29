@@ -1,0 +1,250 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Route53HostedZone Chainsaw tests — canonical pattern (unique name per step,
+# spec.skipDelete: true). No ACK controller in test cluster; asserts on ACK CRD spec.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: route53hostedzone
+spec:
+  skipDelete: true
+  namespace: route53hostedzone
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: route53hostedzone
+
+    # AC1 — standard public hosted zone is accepted and wired to ACK HostedZone.
+    - name: ac1-public-zone-wiring
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac1-cfg
+                namespace: route53hostedzone
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac1-cfg -n route53hostedzone \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53HostedZone
+              metadata:
+                name: ac1-public
+                namespace: route53hostedzone
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: retain
+                name: example.com.
+                comment: Test public zone
+        - assert:
+            resource:
+              apiVersion: route53.services.k8s.aws/v1alpha1
+              kind: HostedZone
+              metadata:
+                name: ac1-public
+                namespace: route53hostedzone
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                name: example.com.
+                hostedZoneConfig:
+                  comment: Test public zone
+
+    # AC2 — deletion-policy delete wires the annotation correctly.
+    - name: ac2-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac2-cfg
+                namespace: route53hostedzone
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac2-cfg -n route53hostedzone \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53HostedZone
+              metadata:
+                name: ac2-delete
+                namespace: route53hostedzone
+              spec:
+                configRef: ac2-cfg
+                deletionPolicy: delete
+                name: delete-zone.example.com.
+        - assert:
+            resource:
+              apiVersion: route53.services.k8s.aws/v1alpha1
+              kind: HostedZone
+              metadata:
+                name: ac2-delete
+                namespace: route53hostedzone
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC3 — tags cascade: mandatory wins over instance wins over defaults.
+    - name: ac3-tags-governance-cascade
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac3-cfg
+                namespace: route53hostedzone
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac3-cfg -n route53hostedzone \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{"env":"prod","cost-center":"mandatory"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{"env":"dev"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53HostedZone
+              metadata:
+                name: ac3-tags
+                namespace: route53hostedzone
+              spec:
+                configRef: ac3-cfg
+                deletionPolicy: retain
+                name: tags-zone.example.com.
+                tags:
+                  env: instance
+                  owner: team-a
+        - script:
+            content: |
+              # Verify mandatory wins over instance for 'env', instance 'owner' survives,
+              # defaults 'env' is overridden, mandatory 'cost-center' is present.
+              TAGS=$(kubectl get hostedzone ac3-tags -n route53hostedzone -o json | jq -r '.spec.tags // [] | map("\(.key)=\(.value)") | sort | join(",")')
+              echo "Tags: $TAGS"
+              echo "$TAGS" | grep -q "cost-center=mandatory" || { echo "FAIL: cost-center not mandatory"; exit 1; }
+              echo "$TAGS" | grep -q "env=prod" || { echo "FAIL: env not mandatory prod"; exit 1; }
+              echo "$TAGS" | grep -q "owner=team-a" || { echo "FAIL: owner not instance team-a"; exit 1; }
+              echo "PASS: tags governance verified"
+
+    # AC4 — private zone flag is wired to hostedZoneConfig.privateZone.
+    - name: ac4-private-zone-flag
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac4-cfg
+                namespace: route53hostedzone
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac4-cfg -n route53hostedzone \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53HostedZone
+              metadata:
+                name: ac4-private
+                namespace: route53hostedzone
+              spec:
+                configRef: ac4-cfg
+                deletionPolicy: retain
+                name: private.example.internal.
+                privateZone: true
+                vpcs:
+                  - vpcID: vpc-12345
+                    vpcRegion: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: route53.services.k8s.aws/v1alpha1
+              kind: HostedZone
+              metadata:
+                name: ac4-private
+                namespace: route53hostedzone
+              spec:
+                hostedZoneConfig:
+                  privateZone: true
+
+    # AC5 — ownerReference is set on the ACK HostedZone.
+    - name: ac5-owner-reference
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53Config
+              metadata:
+                name: ac5-cfg
+                namespace: route53hostedzone
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  defaultTTL: 300
+        - script:
+            content: |
+              kubectl patch route53config ac5-cfg -n route53hostedzone \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: Route53HostedZone
+              metadata:
+                name: ac5-owner
+                namespace: route53hostedzone
+              spec:
+                configRef: ac5-cfg
+                deletionPolicy: retain
+                name: owner.example.com.
+        - script:
+            content: |
+              OWNER_KIND=$(kubectl get hostedzone ac5-owner -n route53hostedzone -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              echo "Owner kind: $OWNER_KIND"
+              [ "$OWNER_KIND" = "Route53HostedZone" ] || { echo "FAIL: expected Route53HostedZone owner"; exit 1; }
+              CONTROLLER=$(kubectl get hostedzone ac5-owner -n route53hostedzone -o jsonpath='{.metadata.ownerReferences[0].controller}')
+              [ "$CONTROLLER" = "true" ] || { echo "FAIL: controller not true"; exit 1; }
+              echo "PASS: ownerReference verified"
