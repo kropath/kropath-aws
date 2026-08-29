@@ -1,0 +1,415 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md): single governance externalRef via
+# selector.matchLabels (Theme 28), optional Secret externalRef for SecureString valueFrom,
+# naming ConfigMap for status-accessible computed fields, includeWhen guards on naming
+# validity and value/key semantic constraints, tags via .merge().transformList({key,value}).
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: ssmparameter.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: SSMParameter
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Parameter value for String and StringList types (mutually exclusive with valueFrom).
+      value: string | default=""
+      # Secret reference for SecureString values. secretKeyRef.name must label the Secret with
+      # aws.kropath.run/parameter-secret: <name> so the externalRef selector can locate it.
+      valueFrom:
+        secretKeyRef:
+          name: string | default=""
+          key: string | default=""
+      # Parameter type cascade: mandatory → instance → defaults → "".
+      # Immutable after creation — enforced by ACK at the AWS API layer.
+      type: string | default=""
+      description: string | default=""
+      # Tier cascade: mandatory → instance → defaults → "".
+      tier: string | default=""
+      dataType: string | default=""
+      allowedPattern: string | default=""
+      # KMS key ID/ARN/alias. Cascade: mandatory → instance → defaults → "".
+      # Mutually exclusive with keyRef.
+      keyID: string | default=""
+      # ACK cross-resource reference to a KMS Key CR. Mutually exclusive with keyID.
+      keyRef:
+        from:
+          name: string | default=""
+          namespace: string | default=""
+      # Parameter policies JSON (lifecycle rules such as expiration and notification).
+      policies: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      # SSM Parameter ARN: no double slash when effectiveName starts with "/".
+      # arn:aws:ssm:{region}:{account}:parameter{/name} vs :parameter/{name}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws)
+          && naming.data.resourceName != "" && !naming.data.resourceName.contains("{")
+          ? "arn:aws:ssm:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+            + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("")
+            + ":parameter"
+            + (naming.data.resourceName.startsWith("/")
+                ? naming.data.resourceName
+                : "/" + naming.data.resourceName)
+          : ""}
+      version: >-
+        ${ackParameter.?status.?version.orValue(0)}
+      conditions: >-
+        ${ackParameter.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221): CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: SSMConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Optional Secret lookup for SecureString valueFrom. Locates a Secret in the same namespace
+    # with label aws.kropath.run/parameter-secret: <secretKeyRef.name>. Returns an empty list
+    # when valueFrom.secretKeyRef.name is "" (no valueFrom configured), so paramSecret.size() == 0.
+    - id: paramSecret
+      externalRef:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/parameter-secret: >-
+                ${schema.spec.valueFrom.secretKeyRef.name != "" ? schema.spec.valueFrom.secretKeyRef.name : "kro-empty-fallback-sentinel"}
+
+    # Naming ConfigMap — materialises effectiveName, resourceName, namingStatus, resolved governance
+    # fields, and value/key validation booleans. Required because the status block cannot access
+    # schema.* directly (docs/frequent-rgd-errors.md §3 — status block scope limited to child outputs).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: ssmparameter-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # effectiveName: resolved from nameOverride → mandatory template → defaults template → "{namespace}-{name}".
+          # Tag tokens ({tag.X}) resolved: mandatory > instance > defaults. Unresolved tokens kept
+          # verbatim so namingStatus can detect them.
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          # resourceName intentionally duplicates the effectiveName CEL: ConfigMap data fields
+          # cannot cross-reference each other during template evaluation (SSMDocument pattern).
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+          # resolvedType: mandatory → instance → defaults → "" (empty = not enforced).
+          # Immutability enforcement happens at ACK level (x-kubernetes-validations on the ACK CRD).
+          resolvedType: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?type.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.type
+              : (schema.spec.type != ""
+                  ? schema.spec.type
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?type.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.type
+                      : ""))}
+          # resolvedTier: mandatory → instance → defaults → "" (empty = AWS account default).
+          resolvedTier: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?tier.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.tier
+              : (schema.spec.tier != ""
+                  ? schema.spec.tier
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?tier.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.tier
+                      : ""))}
+          # resolvedKeyID: mandatory → instance → defaults → "" (empty = AWS default KMS key).
+          resolvedKeyID: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?keyID.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.keyID
+              : (schema.spec.keyID != ""
+                  ? schema.spec.keyID
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?keyID.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.keyID
+                      : ""))}
+          # valueIsValid: "true" when value/valueFrom semantics are valid:
+          #   (1) not both value AND valueFrom set,
+          #   (2) SecureString does not use spec.value instead of valueFrom,
+          #   (3) non-SecureString type does not use valueFrom instead of spec.value.
+          # resolvedType expression is inlined three times (ConfigMap fields cannot cross-reference each other).
+          valueIsValid: >-
+            ${(
+              !(schema.spec.value != "" && schema.spec.valueFrom.secretKeyRef.name != "")
+              && !(
+                  (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?type.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.type
+                    : (schema.spec.type != ""
+                        ? schema.spec.type
+                        : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?type.orValue("") != ""
+                            ? rsrcCfg[0].status.effectiveConfig.defaults.type
+                            : ""))) == "SecureString"
+                  && schema.spec.value != ""
+                  && schema.spec.valueFrom.secretKeyRef.name == "")
+              && !(
+                  (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?type.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.type
+                    : (schema.spec.type != ""
+                        ? schema.spec.type
+                        : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?type.orValue("") != ""
+                            ? rsrcCfg[0].status.effectiveConfig.defaults.type
+                            : ""))) != "SecureString"
+                  && (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?type.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.type
+                    : (schema.spec.type != ""
+                        ? schema.spec.type
+                        : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?type.orValue("") != ""
+                            ? rsrcCfg[0].status.effectiveConfig.defaults.type
+                            : ""))) != ""
+                  && schema.spec.valueFrom.secretKeyRef.name != "")
+            ) ? "true" : "false"}
+          # keyIsValid: "true" when not both resolvedKeyID and keyRef.from.name are set.
+          # resolvedKeyID expression is inlined (same cross-reference constraint as above).
+          keyIsValid: >-
+            ${!(
+              (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?keyID.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.keyID
+                : (schema.spec.keyID != ""
+                    ? schema.spec.keyID
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?keyID.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.keyID
+                        : ""))) != ""
+              && schema.spec.keyRef.from.name != ""
+            ) ? "true" : "false"}
+
+    # ACK SSM Parameter CR — primary cloud resource.
+    # Created only when:
+    #   (1) resourceName has no unresolved {tag.X} tokens (naming is fully resolved),
+    #   (2) value/valueFrom semantics are valid (valueIsValid == "true"), AND
+    #   (3) keyID/keyRef are not both set (keyIsValid == "true").
+    - id: ackParameter
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+        - '${naming.data.valueIsValid == "true"}'
+        - '${naming.data.keyIsValid == "true"}'
+      template:
+        apiVersion: ssm.services.k8s.aws/v1alpha1
+        kind: Parameter
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          # For SecureString: read value from the referenced K8s Secret via paramSecret externalRef.
+          # For String/StringList: use spec.value directly.
+          # string() on Secret data bytes yields the UTF-8 plaintext (Go client base64-decodes data).
+          value: >-
+            ${naming.data.resolvedType == "SecureString"
+              && paramSecret.size() > 0
+              && schema.spec.valueFrom.secretKeyRef.key in paramSecret[0].data
+                ? string(paramSecret[0].data[schema.spec.valueFrom.secretKeyRef.key])
+                : schema.spec.value}
+          # type: immutable after creation — enforced by ACK CRD x-kubernetes-validations.
+          type: ${naming.data.resolvedType}
+          tier: ${naming.data.resolvedTier}
+          keyID: ${naming.data.resolvedKeyID}
+          # keyRef: ACK cross-resource reference to a KMS Key CR. Empty from.name = no reference.
+          keyRef:
+            from:
+              name: ${schema.spec.keyRef.from.name}
+              namespace: ${schema.spec.keyRef.from.namespace}
+          description: ${schema.spec.description}
+          dataType: ${schema.spec.dataType}
+          allowedPattern: ${schema.spec.allowedPattern}
+          # policies: parameter lifecycle rules JSON (expiration, notification).
+          policies: ${schema.spec.policies}
+          # Cloud tags: merge defaults → instance spec → mandatory (mandatory wins on key collision).
+          # syncedLabels and syncedAnnotations are dual-written to cloud tags (ADR-015 §6.1).
+          # ACK SSM Parameter spec.tags is array<{key, value}> — must use transformList.
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
