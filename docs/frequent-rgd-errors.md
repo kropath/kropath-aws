@@ -695,6 +695,7 @@ This document tracks technical friction points, syntax limitations, and runtime 
     ```
     For KMS Key's `tagKey`/`tagValue` naming, use `.tagKey`/`.tagValue` in the jq filter instead. For S3 Bucket's `tagging` field: same `key`/`value` shape as IAM, just query `.spec.tagging`.
 * **Rule:** Apply this jq-script pattern to **every** chainsaw check on a list field that is populated by a CEL `.merge()`/`.transformList()` chain — even single-item lists, for consistency and to future-proof against a later test adding a second item. Do not apply it to lists that echo raw user input verbatim (e.g. `spec.mandatory.allowedKeySpecs` on a config CR, `spec.policies` ARNs on an IAMRole) — those preserve apply-time order deterministically and are not CEL-transformed, so a plain positional `assert:` is fine for them.
+* **Order-independent assertions are a safety net, not the fix.** A CEL-transformed list that is unordered *in the cluster* is a production defect in its own right, not merely an awkward thing to assert against — see §6.1. Sort the list in the RGD; keep the jq pattern anyway, because it stays correct if a later refactor reorders the merge chain.
 
 ### `kubectl get role`/`kubectl get user` Short-Name Collisions with Kubernetes RBAC
 
@@ -942,6 +943,113 @@ This document tracks technical friction points, syntax limitations, and runtime 
 
 ---
 
+## 6.1. Rendered Output Must Be Byte-Stable Across Reconciles
+
+Two defects in this section share one root idea: kro compares what it rendered against what is
+stored, and **any** difference is treated as a real change. A template that renders the same
+*meaning* two different ways therefore never converges. Both bugs below were found in one
+investigation (KRO-916, KRO-917) and both present as something other than what they are.
+
+### `.transformList()` Over a Map Is Unordered — Sort Before Emitting
+
+* **What Fails:** Ending a cross-tier tag merge at the transform, which is the pattern §6 recommends
+  for correctness and §2 uses in its examples:
+    ```yaml
+    tagSet: >-
+      ${(defaults.tags ?? {})
+        .merge(schema.spec.tags)
+        .merge(mandatory.tags ?? {})
+        .transformList(k, v, {"key": k, "value": v})}     # <-- unordered
+    ```
+* **Symptom:** The instance never reaches `Ready`, and the reason names neither tags nor ordering:
+    ```
+    type: Ready
+    status: "False"
+    reason: NotReady
+    message: 'resource reconciliation failed: cluster mutated'
+    ```
+  Meanwhile the ACK resource is **completely healthy** — `ACK.ResourceSynced=True`, the resource
+  exists in AWS, and the tags on it are correct. Only `metadata.generation` on the ACK resource
+  moves, at roughly 4 writes/second.
+* **Why:** CEL `.transformList()` iterates a map, and map iteration order is not stable between
+  evaluations. The rendered list holds the same entries in a different sequence each reconcile. A
+  list is ordered, so kro's applyset sees a genuine object change, reports `HasClusterMutation()`,
+  and requeues with `cluster mutated`. There is no pass in which nothing changed, so `Ready` is
+  **structurally unreachable** — this never settles on its own and no amount of waiting or
+  re-syncing helps.
+* **What Works Instead:** Sort deterministically as the last step, so the same tag set always
+  renders the same sequence:
+    ```yaml
+    tagSet: >-
+      ${(defaults.tags ?? {})
+        .merge(schema.spec.tags)
+        .merge(mandatory.tags ?? {})
+        .transformList(k, v, {"key": k, "value": v})
+        .sortBy(x, x.key)}                                 # <-- required
+    ```
+* **Scope:** Every map-to-list conversion that reaches a rendered resource, not only tags. Families
+  whose ACK schema takes a list of key/value structs (S3 `tagging.tagSet`, and any future family on
+  the same shape) are exposed; families that pass `tags` through as a **map** (SNS, SQS) are not,
+  which is why this surfaced on S3 first and looked S3-specific.
+* **Diagnosing it:** Sample the ACK resource's spec twice and diff. Identical *content* in a
+  different *order* is conclusive:
+    ```bash
+    for i in 1 2; do
+      kubectl get bucket.s3.services.k8s.aws <name> -n <ns> \
+        -o jsonpath='{.spec.tagging.tagSet}' ; echo; sleep 4
+    done
+    ```
+  A climbing `metadata.generation` with a byte-identical *sorted* spec is the same signature.
+* **Fixed in:** KRO-916.
+
+### A Float Default Written `0.0` Drives an Unbounded CRD Write Loop
+
+* **What Fails:** A SimpleSchema float default written with a fractional part:
+    ```yaml
+    throttlingRateLimit: float | default=0.0     # <-- loops
+    ```
+* **Symptom:** kro stops doing anything else. Its entire log output, 9–11 times per second, is:
+    ```log
+    rgd-controller  Updating existing CRD        <plural>.aws.kropath.run
+    rgd-controller  Waiting for CRD to become ready
+    ```
+  The generated CRD was observed at `metadata.generation` **789140** while every other kropath CRD
+  in the same cluster sat at 4 or 5.
+* **Why:** kro emits the CRD schema default as the raw bytes `0.0`. The API server normalises the
+  stored JSON number to `0`. kro compares schema defaults with `bytes.Equal`
+  (`pkg/graph/crd/compat/schema.go`), so the comparison can never match, `Ensure` takes the patch
+  branch instead of its "CRD is up-to-date" early return (`pkg/client/crd.go`), and the write
+  repeats forever. The stored spec is byte-identical across writes — **only `generation` moves**,
+  which is why a plain `kubectl get -o yaml` looks entirely normal.
+* **Blast radius is the whole controller, not one family.** All kro controllers share one client-go
+  rate limiter. One looping RGD consumes roughly 20 API QPS and starves the instance controllers,
+  so unrelated resources stop converging. Symptoms appear in families that have nothing to do with
+  the offending RGD.
+* **What Works Instead:** Write the literal so that it survives a JSON round-trip unchanged:
+    ```yaml
+    throttlingRateLimit: float | default=0       # <-- stable
+    ```
+  This is not a style preference. `0.0`, `1.0`, `2.50` and any other trailing-zero form normalise
+  on write and will loop; `0`, `1`, `2.5` will not. The bug is upstream in kro's byte-wise
+  comparison, but the RGD-side literal is the fix that is available today.
+* **Confirmed against a control group.** Same schema shape (`type: number`, zero default), only the
+  literal differs:
+
+  | RGD | Declaration | CRD generation |
+  |---|---|---|
+  | `apigatewayv2stage` | `float \| default=0.0` | **789140** |
+  | `cloudfrontresponseheaderspolicy` | `float \| default=0` | 1 |
+  | `rdscluster` | `float \| default=0` | 1 |
+
+* **Diagnosing it:** Generation is the tell — the content never looks wrong.
+    ```bash
+    kubectl get crd -o custom-columns='NAME:.metadata.name,GEN:.metadata.generation' \
+      | grep kropath | sort -k2 -nr | head
+    ```
+  Anything above single digits is looping. Confirm with `kubectl -n kro-system logs deploy/kro`:
+  a single repeating pair of lines and nothing else.
+* **Fixed in:** KRO-917.
+
 ## 7. ACK Target-Schema Fidelity — Verify Every Field Against the Live CRD
 
 The RGD's user-facing `types:` block and the ACK CRD it feeds are **two independent schemas**.
@@ -1101,7 +1209,7 @@ Real drift found in the CloudFront family (KRO-443), every instance of which blo
 * **Why:** The section above is scoped to SNS/SQS because those forward `spec` into a flat `Attributes` map. **The lesson generalises further than its examples.** ACK's S3 controller creates the bucket and then syncs each property through its own API call (`PutBucketEncryption`, `PutBucketTagging`, …). AWS applies the same rule there: a key that is present-but-empty is "specified", not absent. Any RGD field reaching a structured AWS call is exposed to this, not just attribute-passthrough families.
 * **Two consequences that make it diagnose badly:**
     * **Partial success — the resource exists but is silently under-configured.** Properties sync in sequence and `Encryption` runs *before* `Tagging`. The failure aborts the reconcile, so `PutBucketTagging` is never reached. The bucket is created in AWS with **no tags**, while `spec.tagging.tagSet` is perfectly correct. The presenting symptom is "tags are missing", which points the investigation at the tag template — the wrong file. **Rule: when a resource exists in AWS but is missing configuration, look for an earlier property failing in the ACK controller log, not at the missing property's template.**
-    * **`ACK.Recoverable` behaves the opposite way to `ACK.Terminal`.** The operational note above ("these do not self-heal") applies to terminal conditions. This one is `ACK.Recoverable=True`, so ACK requeues without effective backoff — the live `Bucket` advanced roughly 25 resourceVersions per second indefinitely. ArgoCD diffs an object that never settles and the tile flaps; kro's apply collides with ACK's writes and reports `ResourcesReady=False :: resource reconciliation failed: cluster mutated`. Neither symptom names encryption. A flapping ArgoCD tile plus `cluster mutated` is a signature of a recoverable ACK error underneath, not of a kro or ArgoCD problem.
+    * **`ACK.Recoverable` behaves the opposite way to `ACK.Terminal`.** The operational note above ("these do not self-heal") applies to terminal conditions. This one is `ACK.Recoverable=True`, so ACK requeues without effective backoff — the live `Bucket` advanced roughly 25 resourceVersions per second indefinitely. ArgoCD diffs an object that never settles and the tile flaps; kro's apply collides with ACK's writes and reports `ResourcesReady=False :: resource reconciliation failed: cluster mutated`. Neither symptom names encryption. A flapping ArgoCD tile plus `cluster mutated` means *something* below ArgoCD is rewriting the object every pass — it is never a kro-vs-ArgoCD problem, but it is not always ACK. There are two causes and they are told apart by one check. If the ACK resource carries `ACK.Recoverable=True`, it is this one. If ACK reports `ACK.ResourceSynced=True` and the object *still* churns, the RGD itself is rendering a different object each pass — see §6.1 on non-deterministic list ordering.
 * **What Works Instead:** Omit the field when it resolves empty, or supply a genuinely valid value. Where AWS documents a managed default, prefer it: `snstopic` already defaults `kmsMasterKeyID` to `alias/aws/sns`, which is exactly why SNS never hit this. `s3bucket` had no equivalent and now defaults to `alias/aws/s3` (KRO-913). Sibling RGDs diverging on the same field is itself the smell worth checking.
 
 ### Guard *Every* Field in a Mode-Gated Family — Both Halves, Not Either Half
