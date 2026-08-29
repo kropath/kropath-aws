@@ -118,3 +118,51 @@ feedback is configured. Uses `jq` with `if has($f)` to detect field presence.
   conditionally omitting an entire block of ACK Topic fields.
 - Checking for non-empty VALUES (not just key presence) is essential when the upstream controller
   materialises full struct skeletons with empty-string sentinels.
+
+---
+
+## Follow-up: conditions fan across 4 ACK Topic variants (Implementation Reviewer feedback)
+
+**Tested 2026-08-29.** Implementation Reviewer (PR #173 review) requested that `conditions` be
+fanned across all 4 ACK Topic variants to match the `topicArn` pattern.
+
+**Ternary approach failed:**
+```
+found no matching overload for '_?_:_' applied to
+'(bool, list(__type_ackTopicWithPolicyWithFeedback.status.conditions.@idx),
+  list(__type_ackTopicWithPolicyNoFeedback.status.conditions.@idx))'
+```
+
+**List concatenation approach also failed:**
+```
+found no matching overload for '_+_' applied to
+'(list(__type_ackTopicWithPolicyWithFeedback.status.conditions.@idx),
+  list(__type_ackTopicWithPolicyNoFeedback.status.conditions.@idx))'
+```
+
+**Root cause:** kro assigns a unique nominal type to each resource node's list fields
+(`__type_<nodeId>.status.conditions.@idx`). These types are distinct even when the underlying
+CRD is identical. Both the ternary operator `_?_:_` and the concatenation operator `_+_` require
+type-compatible operands and refuse to unify different nominal list types.
+
+**Outcome:** The same CEL list type constraint documented in the KRO-905 log (workaround: reference
+only one node for list-type status fields) applies to the 4-variant case. Neither ternary nor
+concatenation can fan list-type status fields across multiple resource nodes.
+
+**Design implication:** With N `includeWhen` variants, exactly one is active and the rest are
+excluded (no status materialised → `.orValue([])` returns `[]`). Surfacing conditions from all
+variants requires a kro-level change to support nominal type unification for `includeWhen`-split
+resources of the same CRD kind. This is a kro feature gap, not a RGD authoring problem.
+
+**Candidate upstream patterns (to evaluate):**
+- kro could emit a unified type for all nodes sharing the same `apiVersion/kind`, enabling ternary/`+`.
+- RGD authors could write a CEL macro that merges conditions via string serialization/deserialization,
+  but this is not currently supported in kro's template expressions.
+
+**Status:** Escalated to Implementation Reviewer. `conditions` references `ackTopicNoPolicyNoFeedback`
+(the most common path: no policy, no feedback) as the single canonical source. Topics on other
+paths surface `conditions: []` — a known limitation pending a kro-level fix.
+
+**Add to `docs/frequent-rgd-errors.md`:** "4-variant `includeWhen` split — list fan-out not possible.
+When an RGD uses ≥2 `includeWhen` variants of the same CRD kind, `status.conditions` cannot be
+fanned across them via ternary or `+`. Reference a single canonical node."
