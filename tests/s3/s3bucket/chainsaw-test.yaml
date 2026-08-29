@@ -1302,3 +1302,210 @@ spec:
                     - applyServerSideEncryptionByDefault:
                         sseAlgorithm: aws:kms
                       bucketKeyEnabled: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # KRO-903 regression guards — naming CEL syncedLabels/syncedAnnotations guard
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-903-1: mandatory has {tag.product}-{name} template and tags but
+    # NO syncedLabels key; should fall through to defaults.syncedLabels
+    # without throwing "no such key: syncedLabels".
+    # mandatory.syncedLabels absent → mandatory.?syncedLabels.orValue({}) = {}
+    # falls through to defaults.syncedLabels = {product: data}
+    # effectiveName = data-kro903-no-sl
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro903-1-no-synced-labels-in-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Config
+              metadata:
+                name: kro903-no-sl-cfg
+                labels:
+                  aws.kropath.run/resource-name: kro903-no-sl-cfg
+              spec: {}
+        - script:
+            content: |
+              # mandatory has tags but NO syncedLabels/syncedAnnotations keys — the KRO-903 failure path.
+              # Must not supply "syncedLabels":{} (key-present-empty-map passes the has() guard
+              # even before the fix and does not reproduce the crash).
+              kubectl patch s3config kro903-no-sl-cfg -n s3bucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{tag.product}-{name}","tags":{"managed-by":"kropath","provisioner":"argocd"}},"defaults":{"encryptionAlgorithm":"aws:kms","kmsKeyArn":"","blockPublicAccess":true,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{"product":"data"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-no-sl
+              spec:
+                configRef: kro903-no-sl-cfg
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: kro903-no-sl
+              spec:
+                name: data-kro903-no-sl
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-no-sl
+              status:
+                resourceName: data-kro903-no-sl
+                predictedArn: arn:aws:s3:::data-kro903-no-sl
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-903-2: fallthrough to defaults.syncedLabels verified explicitly.
+    # mandatory has {tag.env}-{namespace}-{name} template, no syncedLabels key.
+    # defaults.syncedLabels = {env: staging}
+    # effectiveName = staging-s3bucket-kro903-dflt-sl
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro903-2-defaults-synced-labels-fallthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Config
+              metadata:
+                name: kro903-dflt-sl-cfg
+                labels:
+                  aws.kropath.run/resource-name: kro903-dflt-sl-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch s3config kro903-dflt-sl-cfg -n s3bucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{tag.env}-{namespace}-{name}","tags":{"managed-by":"kropath"}},"defaults":{"encryptionAlgorithm":"aws:kms","kmsKeyArn":"","blockPublicAccess":true,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{"env":"staging"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-dflt-sl
+              spec:
+                configRef: kro903-dflt-sl-cfg
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: kro903-dflt-sl
+              spec:
+                name: staging-s3bucket-kro903-dflt-sl
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-dflt-sl
+              status:
+                resourceName: staging-s3bucket-kro903-dflt-sl
+                predictedArn: arn:aws:s3:::staging-s3bucket-kro903-dflt-sl
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-903-3: mandatory.syncedLabels present → resolves from mandatory
+    # (regression: verifies the guard did not break the mandatory-wins path).
+    # mandatory.syncedLabels = {product: platform}
+    # defaults.syncedLabels  = {product: should-not-appear}
+    # effectiveName = platform-kro903-mand-sl (mandatory wins)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro903-3-mandatory-synced-labels-present
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Config
+              metadata:
+                name: kro903-mand-sl-cfg
+                labels:
+                  aws.kropath.run/resource-name: kro903-mand-sl-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch s3config kro903-mand-sl-cfg -n s3bucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{tag.product}-{name}","tags":{"managed-by":"kropath"},"syncedLabels":{"product":"platform"},"syncedAnnotations":{}},"defaults":{"encryptionAlgorithm":"aws:kms","kmsKeyArn":"","blockPublicAccess":true,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{"product":"should-not-appear"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-mand-sl
+              spec:
+                configRef: kro903-mand-sl-cfg
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: kro903-mand-sl
+              spec:
+                name: platform-kro903-mand-sl
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-mand-sl
+              status:
+                resourceName: platform-kro903-mand-sl
+                predictedArn: arn:aws:s3:::platform-kro903-mand-sl
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-903-4: mandatory has NO syncedAnnotations key; should fall through
+    # to defaults.syncedAnnotations without throwing "no such key: syncedAnnotations".
+    # mandatory has tags + syncedLabels:{} but NO syncedAnnotations key.
+    # defaults.syncedAnnotations = {cost-center: infra}
+    # effectiveName = infra-kro903-no-sa
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro903-4-no-synced-annotations-in-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Config
+              metadata:
+                name: kro903-no-sa-cfg
+                labels:
+                  aws.kropath.run/resource-name: kro903-no-sa-cfg
+              spec: {}
+        - script:
+            content: |
+              # mandatory has syncedLabels:{} but NO syncedAnnotations key.
+              # cost-center must fall through to defaults.syncedAnnotations.
+              kubectl patch s3config kro903-no-sa-cfg -n s3bucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{tag.cost-center}-{name}","tags":{"managed-by":"kropath"},"syncedLabels":{}},"defaults":{"encryptionAlgorithm":"aws:kms","kmsKeyArn":"","blockPublicAccess":true,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{account_id}","tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-center":"infra"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-no-sa
+              spec:
+                configRef: kro903-no-sa-cfg
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: kro903-no-sa
+              spec:
+                name: infra-kro903-no-sa
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro903-no-sa
+              status:
+                resourceName: infra-kro903-no-sa
+                predictedArn: arn:aws:s3:::infra-kro903-no-sa
+                namingStatus: valid
