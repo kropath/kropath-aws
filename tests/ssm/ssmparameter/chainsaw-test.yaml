@@ -1,0 +1,1068 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ssm-03 Chainsaw tests — one scenario per acceptance criterion (20 total).
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step + skipDelete"):
+# every step creates a uniquely-named SSMConfig + SSMParameter; nothing is deleted between steps,
+# so no ACK finalizer blocks deletion and kro's per-object-key backoff never compounds.
+# spec.skipDelete: true stops chainsaw's end-of-test cascade; the ephemeral cluster is discarded.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ssmparameter
+spec:
+  skipDelete: true
+  namespace: ssmparameter
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: Default type — when defaults.type is "String" and instance spec.type is empty,
+    # the defaults value is applied. ACK Parameter spec.type == "String".
+    - name: ac1-create-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac1-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac1-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac1-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac1-cfg
+                value: my-config-value
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac1-param
+                namespace: ssmparameter
+              spec:
+                type: String
+                value: my-config-value
+                name: ssmparameter-ac1-param
+
+    # AC-2: Instance type wins over defaults — instance spec.type overrides defaults.type.
+    - name: ac2-instance-type
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac2-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac2-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac2-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac2-cfg
+                type: StringList
+                value: "val1,val2"
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac2-param
+                namespace: ssmparameter
+              spec:
+                type: StringList
+
+    # AC-3: Mandatory type wins — mandatory.type overrides instance spec.type.
+    - name: ac3-mandatory-type
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac3-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  type: SecureString
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac3-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"SecureString","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: ac3-secret
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/parameter-secret: ac3-secret
+              type: Opaque
+              stringData:
+                password: secureValue123
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac3-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac3-cfg
+                type: String
+                valueFrom:
+                  secretKeyRef:
+                    name: ac3-secret
+                    key: password
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac3-param
+                namespace: ssmparameter
+              spec:
+                type: SecureString
+
+    # AC-4: Mandatory tier wins — mandatory.tier overrides instance spec.tier.
+    - name: ac4-mandatory-tier
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac4-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  tier: Advanced
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac4-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"Advanced","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac4-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac4-cfg
+                tier: Standard
+                value: tier-test-value
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac4-param
+                namespace: ssmparameter
+              spec:
+                tier: Advanced
+
+    # AC-5: Mandatory keyID propagated — mandatory.keyID applied when instance spec.keyID is empty.
+    - name: ac5-mandatory-keyid
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac5-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  keyID: "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+                  type: SecureString
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac5-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"SecureString","tier":"","keyID":"arn:aws:kms:us-east-1:123456789012:key/abc-123","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: ac5-secret
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/parameter-secret: ac5-secret
+              type: Opaque
+              stringData:
+                value: secureValueForAC5
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac5-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac5-cfg
+                valueFrom:
+                  secretKeyRef:
+                    name: ac5-secret
+                    key: value
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac5-param
+                namespace: ssmparameter
+              spec:
+                keyID: "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+
+    # AC-6: String value — spec.value used directly for String type.
+    - name: ac6-value-string
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac6-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac6-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac6-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac6-cfg
+                type: String
+                value: hello-world
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac6-param
+                namespace: ssmparameter
+              spec:
+                value: hello-world
+                type: String
+
+    # AC-7: SecureString via valueFrom — Secret value read and passed to ACK Parameter spec.value.
+    # Secret must have label aws.kropath.run/parameter-secret: <name> for the externalRef selector.
+    - name: ac7-value-securestring
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac7-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac7-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: db-creds
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/parameter-secret: db-creds
+              type: Opaque
+              stringData:
+                password: my-db-password-value
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac7-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac7-cfg
+                type: SecureString
+                valueFrom:
+                  secretKeyRef:
+                    name: db-creds
+                    key: password
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac7-param
+                namespace: ssmparameter
+              spec:
+                type: SecureString
+                value: my-db-password-value
+
+    # AC-8 (Negative): Both value AND valueFrom set — includeWhen blocks ACK Parameter creation.
+    - name: ac8-value-both
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac8-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac8-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac8-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac8-cfg
+                value: "hello"
+                valueFrom:
+                  secretKeyRef:
+                    name: some-secret
+                    key: k
+        - script:
+            content: |
+              # Give kro time to reconcile
+              sleep 5
+              COUNT=$(kubectl get parameters.ssm.services.k8s.aws -n ssmparameter ac8-param --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" -ne "0" ]; then
+                echo "ERROR: ACK Parameter should not exist when both value and valueFrom are set"
+                exit 1
+              fi
+              echo "PASS: ACK Parameter correctly not created (value + valueFrom mutual exclusion)"
+
+    # AC-9 (Negative): SecureString with spec.value — includeWhen blocks ACK Parameter creation.
+    - name: ac9-securestring-with-value
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac9-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac9-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac9-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac9-cfg
+                type: SecureString
+                value: plaintext-secret
+        - script:
+            content: |
+              sleep 5
+              COUNT=$(kubectl get parameters.ssm.services.k8s.aws -n ssmparameter ac9-param --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" -ne "0" ]; then
+                echo "ERROR: ACK Parameter should not exist when SecureString uses spec.value instead of valueFrom"
+                exit 1
+              fi
+              echo "PASS: ACK Parameter correctly not created (SecureString must use valueFrom)"
+
+    # AC-10 (Negative): String type with valueFrom — includeWhen blocks ACK Parameter creation.
+    - name: ac10-string-with-valuefrom
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac10-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac10-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac10-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac10-cfg
+                type: String
+                valueFrom:
+                  secretKeyRef:
+                    name: some-secret
+                    key: k
+        - script:
+            content: |
+              sleep 5
+              COUNT=$(kubectl get parameters.ssm.services.k8s.aws -n ssmparameter ac10-param --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" -ne "0" ]; then
+                echo "ERROR: ACK Parameter should not exist when String type uses valueFrom"
+                exit 1
+              fi
+              echo "PASS: ACK Parameter correctly not created (String/StringList must use spec.value)"
+
+    # AC-11 (Negative): Type immutability — ACK CRD x-kubernetes-validations rejects type changes.
+    # Creates a String parameter, then attempts to change type to SecureString.
+    # ACK Parameter spec.type must remain "String" (kro's update is rejected by ACK admission).
+    - name: ac11-type-immutable
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac11-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac11-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac11-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac11-cfg
+                type: String
+                value: original-value
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac11-param
+                namespace: ssmparameter
+              spec:
+                type: String
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: ac11-secret
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/parameter-secret: ac11-secret
+              type: Opaque
+              stringData:
+                value: secureValue
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac11-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac11-cfg
+                type: SecureString
+                valueFrom:
+                  secretKeyRef:
+                    name: ac11-secret
+                    key: value
+        - script:
+            content: |
+              sleep 5
+              # ACK CRD immutability guard should reject the type change.
+              # The ACK Parameter type must remain "String".
+              TYPE=$(kubectl get parameters.ssm.services.k8s.aws -n ssmparameter ac11-param -o jsonpath='{.spec.type}' 2>/dev/null)
+              if [ "$TYPE" != "String" ]; then
+                echo "ERROR: ACK Parameter type should remain String (immutability not enforced). Got: $TYPE"
+                exit 1
+              fi
+              echo "PASS: ACK Parameter type remained String after attempted change to SecureString"
+
+    # AC-12: Tier one-way upgrade — Standard → Advanced upgrade is accepted.
+    - name: ac12-tier-upgrade
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac12-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac12-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac12-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac12-cfg
+                tier: Standard
+                value: tier-test
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac12-param
+                namespace: ssmparameter
+              spec:
+                tier: Standard
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac12-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac12-cfg
+                tier: Advanced
+                value: tier-test
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac12-param
+                namespace: ssmparameter
+              spec:
+                tier: Advanced
+
+    # AC-13: keyRef — ACK cross-resource reference to a KMS Key CR is wired correctly.
+    # Verifies that spec.keyRef.from.name is passed through to the ACK Parameter.
+    - name: ac13-keyref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac13-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac13-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: ac13-secret
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/parameter-secret: ac13-secret
+              type: Opaque
+              stringData:
+                value: secureForKeyRef
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac13-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac13-cfg
+                type: SecureString
+                valueFrom:
+                  secretKeyRef:
+                    name: ac13-secret
+                    key: value
+                keyRef:
+                  from:
+                    name: my-kms-key
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac13-param
+                namespace: ssmparameter
+              spec:
+                keyRef:
+                  from:
+                    name: my-kms-key
+
+    # AC-14 (Negative): Both keyID and keyRef set — includeWhen blocks ACK Parameter creation.
+    - name: ac14-keyid-keyref-both
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac14-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac14-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac14-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac14-cfg
+                type: SecureString
+                valueFrom:
+                  secretKeyRef:
+                    name: some-secret
+                    key: k
+                keyID: "arn:aws:kms:us-east-1:123456789012:key/abc-def"
+                keyRef:
+                  from:
+                    name: my-kms-key
+        - script:
+            content: |
+              sleep 5
+              COUNT=$(kubectl get parameters.ssm.services.k8s.aws -n ssmparameter ac14-param --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" -ne "0" ]; then
+                echo "ERROR: ACK Parameter should not exist when both keyID and keyRef are set"
+                exit 1
+              fi
+              echo "PASS: ACK Parameter correctly not created (keyID + keyRef mutual exclusion)"
+
+    # AC-15: Naming template — defaults.namingTemplate applied; status.resourceName computed.
+    - name: ac15-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac15-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac15-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: db-host
+                namespace: ssmparameter
+              spec:
+                configRef: ac15-cfg
+                value: db.example.com
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: db-host
+                namespace: ssmparameter
+              status:
+                resourceName: ssmparameter-db-host
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: db-host
+                namespace: ssmparameter
+              spec:
+                name: ssmparameter-db-host
+
+    # AC-16: nameOverride with hierarchical path — spec.nameOverride bypasses naming template.
+    # SSM supports paths like /prod/database/host. No double slash in predictedArn.
+    - name: ac16-name-override-path
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac16-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac16-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac16-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac16-cfg
+                nameOverride: /prod/database/host
+                value: db-host-value
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac16-param
+                namespace: ssmparameter
+              status:
+                resourceName: /prod/database/host
+                namingStatus: valid
+                predictedArn: arn:aws:ssm:ap-southeast-2:123456789012:parameter/prod/database/host
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac16-param
+                namespace: ssmparameter
+              spec:
+                name: /prod/database/host
+
+    # AC-17 (Negative): Unresolved naming token — namingStatus is "invalid-unresolved-tokens".
+    - name: ac17-naming-unresolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac17-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac17-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac17-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac17-cfg
+                value: some-value
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac17-param
+                namespace: ssmparameter
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              COUNT=$(kubectl get parameters.ssm.services.k8s.aws -n ssmparameter ac17-param --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              if [ "$COUNT" -ne "0" ]; then
+                echo "ERROR: ACK Parameter should not exist when naming has unresolved tokens"
+                exit 1
+              fi
+              echo "PASS: ACK Parameter correctly not created for unresolved naming token"
+
+    # AC-18: Tags merge — defaults, instance, and mandatory tags merged in priority order.
+    # Mandatory tags win on key collision. All three tiers appear in ACK Parameter spec.tags.
+    - name: ac18-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac18-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                mandatory:
+                  tags:
+                    cost-centre: infrastructure
+                    env: prod
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    param-class: config
+        - script:
+            content: |
+              kubectl patch ssmconfig ac18-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{"cost-centre":"infrastructure","env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{"param-class":"config"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac18-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac18-cfg
+                value: config-value
+                tags:
+                  app: myapp
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac18-param
+                namespace: ssmparameter
+        - script:
+            content: |
+              kubectl get parameters.ssm.services.k8s.aws -n ssmparameter ac18-param -o json | \
+                jq -e '
+                  .spec.tags | map({(.key): .value}) | add |
+                  (."cost-centre" == "infrastructure") and
+                  (."env" == "prod") and
+                  (."param-class" == "config") and
+                  (."app" == "myapp")
+                ' || { echo "ERROR: tag merge assertion failed"; exit 1; }
+              echo "PASS: all three tag tiers merged correctly in ACK Parameter"
+
+    # AC-19: Standard metadata — ACK Parameter has kropath-managed K8s labels, deletion-policy
+    # annotation, and ownerReference back to the SSMParameter CR.
+    - name: ac19-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac19-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac19-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac19-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac19-cfg
+                value: metadata-test-value
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac19-param
+                namespace: ssmparameter
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac19-param
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: SSMParameter
+                    name: ac19-param
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # AC-20: Deletion policy delete — spec.deletionPolicy: delete sets the ACK annotation.
+    - name: ac20-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac20-cfg
+                namespace: ssmparameter
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                defaults:
+                  type: String
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac20-cfg -n ssmparameter \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"type":"","tier":"","keyID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"type":"String","tier":"","keyID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMParameter
+              metadata:
+                name: ac20-param
+                namespace: ssmparameter
+              spec:
+                configRef: ac20-cfg
+                deletionPolicy: delete
+                value: deletion-policy-test
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: Parameter
+              metadata:
+                name: ac20-param
+                namespace: ssmparameter
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
