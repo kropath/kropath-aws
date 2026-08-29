@@ -1,0 +1,779 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ssm-04 Chainsaw tests — one scenario per acceptance criterion (16 total).
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step + skipDelete"):
+# every step creates a uniquely-named SSMConfig + SSMPatchBaseline; nothing is deleted between steps.
+# spec.skipDelete: true stops chainsaw's end-of-test cascade; the ephemeral cluster is discarded.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ssmpatchbaseline
+spec:
+  skipDelete: true
+  namespace: ssmpatchbaseline
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: Default OS — no operatingSystem in any tier → resolved operatingSystem = "WINDOWS"
+    - name: ac01-default-os
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac01-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac01-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac01-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac01-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac01-cfg
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac01-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                operatingSystem: WINDOWS
+
+    # AC-2: defaults.operatingSystem cascades when instance operatingSystem is empty
+    - name: ac02-defaults-os
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac02-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac02-cfg
+              spec:
+                defaults:
+                  operatingSystem: AMAZON_LINUX_2
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac02-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"AMAZON_LINUX_2","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac02-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac02-cfg
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac02-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                operatingSystem: AMAZON_LINUX_2
+
+    # AC-3: mandatory.operatingSystem wins over instance-level operatingSystem
+    # CRD x-kubernetes-validations: operatingSystem cannot be in both mandatory AND defaults simultaneously.
+    # Set it only in mandatory; leave defaults empty. Instance sets WINDOWS; mandatory UBUNTU wins.
+    - name: ac03-mandatory-os
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac03-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac03-cfg
+              spec:
+                mandatory:
+                  operatingSystem: UBUNTU
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac03-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"UBUNTU","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac03-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac03-cfg
+                operatingSystem: WINDOWS
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac03-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                operatingSystem: UBUNTU
+
+    # AC-4: mandatory.approvedPatchesComplianceLevel wins over instance
+    - name: ac04-mandatory-compliance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac04-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac04-cfg
+              spec:
+                mandatory:
+                  approvedPatchesComplianceLevel: HIGH
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac04-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"HIGH","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac04-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac04-cfg
+                approvedPatchesComplianceLevel: MEDIUM
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac04-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                approvedPatchesComplianceLevel: HIGH
+
+    # AC-5: mandatory.rejectedPatchesAction wins over instance
+    - name: ac05-mandatory-rejectedaction
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac05-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac05-cfg
+              spec:
+                mandatory:
+                  rejectedPatchesAction: BLOCK
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac05-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":"BLOCK"},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac05-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac05-cfg
+                rejectedPatchesAction: ALLOW_AS_DEPENDENCY
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac05-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                rejectedPatchesAction: BLOCK
+
+    # AC-6: approvalRules passthrough — patchRules array passed to ACK verbatim
+    - name: ac06-approval-rules
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac06-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac06-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac06-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac06-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac06-cfg
+                approvalRules:
+                  patchRules:
+                    - approveAfterDays: 7
+                      complianceLevel: MEDIUM
+                      patchFilterGroup:
+                        patchFilters:
+                          - key: CLASSIFICATION
+                            values:
+                              - Security
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac06-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                approvalRules:
+                  patchRules:
+                    - approveAfterDays: 7
+                      complianceLevel: MEDIUM
+
+    # AC-7: approvedPatches and rejectedPatches passthrough — arrays propagated verbatim
+    - name: ac07-approved-rejected
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac07-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac07-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac07-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac07-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac07-cfg
+                approvedPatches:
+                  - KB1234567
+                rejectedPatches:
+                  - KB7654321
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac07-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                approvedPatches:
+                  - KB1234567
+                rejectedPatches:
+                  - KB7654321
+
+    # AC-8: globalFilters passthrough — patchFilters array passed to ACK verbatim
+    - name: ac08-global-filters
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac08-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac08-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac08-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac08-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac08-cfg
+                globalFilters:
+                  patchFilters:
+                    - key: PRODUCT
+                      values:
+                        - WindowsServer2019
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac08-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                globalFilters:
+                  patchFilters:
+                    - key: PRODUCT
+                      values:
+                        - WindowsServer2019
+
+    # AC-9: mandatory.approvedPatchesEnableNonSecurity=true wins via OR cascade
+    # Instance has the field absent (bare boolean, not set); mandatory injects true via effectiveConfig.
+    # KRO-899: false is pruned from effectiveConfig; defaults tier omits the field to simulate pruning.
+    - name: ac09-mandatory-nonsecurity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac09-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac09-cfg
+              spec:
+                mandatory:
+                  approvedPatchesEnableNonSecurity: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac09-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":"","approvedPatchesEnableNonSecurity":true},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac09-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac09-cfg
+                # approvedPatchesEnableNonSecurity intentionally absent (bare boolean — not set)
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac09-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                approvedPatchesEnableNonSecurity: true
+
+    # AC-10: default naming template expands to "{namespace}-{name}"
+    - name: ac10-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac10-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac10-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac10-naming
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac10-cfg
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac10-naming-naming
+                namespace: ssmpatchbaseline
+              data:
+                resourceName: ssmpatchbaseline-ac10-naming
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac10-naming
+                namespace: ssmpatchbaseline
+              spec:
+                name: ssmpatchbaseline-ac10-naming
+
+    # AC-11: nameOverride bypasses naming template
+    - name: ac11-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac11-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac11-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac11-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac11-cfg
+                nameOverride: my-custom-baseline
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac11-baseline-naming
+                namespace: ssmpatchbaseline
+              data:
+                resourceName: my-custom-baseline
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac11-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                name: my-custom-baseline
+
+    # AC-12: unresolved naming token → namingStatus=invalid-unresolved-tokens, ackPatchBaseline absent
+    - name: ac12-naming-unresolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac12-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "{namespace}-{tag.environment}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac12-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"{namespace}-{tag.environment}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac12-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac12-cfg
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac12-baseline-naming
+                namespace: ssmpatchbaseline
+              data:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              # Verify ackPatchBaseline is NOT created (includeWhen blocks it when naming is invalid)
+              if kubectl get patchbaselines.ssm.services.k8s.aws ac12-baseline -n ssmpatchbaseline 2>/dev/null; then
+                echo "ERROR: ackPatchBaseline exists but should be absent due to invalid-unresolved-tokens"
+                exit 1
+              fi
+              echo "OK: ackPatchBaseline correctly absent when namingStatus=invalid-unresolved-tokens"
+
+    # AC-13: predictedArn populated from ACK-assigned baselineID
+    - name: ac13-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac13-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac13-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac13-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac13-cfg
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac13-baseline
+                namespace: ssmpatchbaseline
+        - script:
+            content: |
+              # Simulate ACK assigning a baselineID after AWS creates the patch baseline
+              kubectl patch patchbaselines.ssm.services.k8s.aws ac13-baseline -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"baselineID":"pb-test1234567890ab"}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac13-baseline
+                namespace: ssmpatchbaseline
+              status:
+                baselineID: pb-test1234567890ab
+                predictedArn: arn:aws:ssm:ap-southeast-2:123456789012:patchbaseline/pb-test1234567890ab
+
+    # AC-14: tags merge cascade — defaults → spec → mandatory (mandatory wins on collision)
+    # Uses jq script for order-independent verification (CEL-generated lists have unstable key order).
+    - name: ac14-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac14-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory:
+                  tags:
+                    Team: ops
+                defaults:
+                  tags:
+                    env: prod
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac14-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"Team":"ops"},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{"env":"prod"},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac14-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac14-cfg
+                tags:
+                  project: infra
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac14-baseline
+                namespace: ssmpatchbaseline
+        - script:
+            content: |
+              TAGS=$(kubectl get patchbaselines.ssm.services.k8s.aws ac14-baseline -n ssmpatchbaseline -o json | jq '.spec.tags')
+              echo "Tags: $TAGS"
+              HAS_TEAM=$(echo "$TAGS" | jq 'map(select(.key=="Team" and .value=="ops")) | length')
+              HAS_PROJECT=$(echo "$TAGS" | jq 'map(select(.key=="project" and .value=="infra")) | length')
+              HAS_ENV=$(echo "$TAGS" | jq 'map(select(.key=="env" and .value=="prod")) | length')
+              if [ "$HAS_TEAM" -eq 1 ] && [ "$HAS_PROJECT" -eq 1 ] && [ "$HAS_ENV" -eq 1 ]; then
+                echo "OK: all expected tags present"
+              else
+                echo "ERROR: missing tags. Team=$HAS_TEAM project=$HAS_PROJECT env=$HAS_ENV"
+                exit 1
+              fi
+
+    # AC-15: standard metadata — managed-by label, instance label, deletion-policy annotation, ownerReference
+    - name: ac15-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac15-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac15-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac15-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac15-cfg
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac15-baseline
+                namespace: ssmpatchbaseline
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac15-baseline
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              OWNER_KIND=$(kubectl get patchbaselines.ssm.services.k8s.aws ac15-baseline -n ssmpatchbaseline \
+                -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              OWNER_NAME=$(kubectl get patchbaselines.ssm.services.k8s.aws ac15-baseline -n ssmpatchbaseline \
+                -o jsonpath='{.metadata.ownerReferences[0].name}')
+              CONTROLLER=$(kubectl get patchbaselines.ssm.services.k8s.aws ac15-baseline -n ssmpatchbaseline \
+                -o jsonpath='{.metadata.ownerReferences[0].controller}')
+              if [ "$OWNER_KIND" = "SSMPatchBaseline" ] && [ "$OWNER_NAME" = "ac15-baseline" ] && [ "$CONTROLLER" = "true" ]; then
+                echo "OK: ownerReference correctly wired to SSMPatchBaseline/ac15-baseline"
+              else
+                echo "ERROR: ownerReference kind=$OWNER_KIND name=$OWNER_NAME controller=$CONTROLLER"
+                exit 1
+              fi
+
+    # AC-16: deletion policy annotation flows through to ACK resource
+    - name: ac16-deletion-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: ac16-cfg
+                namespace: ssmpatchbaseline
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch ssmconfig ac16-cfg -n ssmpatchbaseline \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{},"operatingSystem":"","approvedPatchesComplianceLevel":"","rejectedPatchesAction":""},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMPatchBaseline
+              metadata:
+                name: ac16-baseline
+                namespace: ssmpatchbaseline
+              spec:
+                configRef: ac16-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: PatchBaseline
+              metadata:
+                name: ac16-baseline
+                namespace: ssmpatchbaseline
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
