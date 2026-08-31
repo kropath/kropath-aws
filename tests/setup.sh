@@ -110,7 +110,9 @@ for rgd in "${SCRIPT_DIR}/../rgds/"*.yaml; do
     *) non_lambda_args+=("-f" "$rgd") ;;
   esac
 done
-kubectl apply "${non_lambda_args[@]}"
+# Use --server-side to avoid the 262144-byte annotation limit (kubectl.kubernetes.io/last-applied-configuration).
+# snstopic.aws.kropath.run.yaml (~276KB) exceeds that limit and fails with client-side apply (KRO-920).
+kubectl apply --server-side "${non_lambda_args[@]}"
 
 # Wait for all non-lambda RGDs to become Ready before starting Lambda waves.
 # Without this wait, Lambda wave 1's 120s clock starts while kro is still processing
