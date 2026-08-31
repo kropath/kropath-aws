@@ -1308,6 +1308,40 @@ Real drift found in the CloudFront family (KRO-443), every instance of which blo
 * **Why:** `CreateQueue` rejects the `FifoQueue` attribute outright when the queue name does not end in `.fifo`. The value `"false"` is not "FIFO disabled" — it is an attribute that must not be sent at all. The note in the section above anticipated the converse mistake (gating `fifoQueue`/`contentBasedDeduplication` while leaving the other two flowing); the failure that actually shipped was the mirror image. **Either half left ungated fails the same way**, so the family has to be audited as a whole rather than by whichever field was named in the last ticket.
 * **Fixed in:** KRO-912. Tracked history: the SNS/SQS/S3 empty-value defect was found and fixed one field group at a time across KRO-905, KRO-906, KRO-898, KRO-911, KRO-912 and KRO-913. KRO-915 sweeps all RGDs for the remaining `: ""` / literal-`"false"` fallbacks rather than waiting for AWS to reject the next one.
 
+### `optional.none()` in Write Position Is Rejected by kro v0.9.2 — Field-Level Omission Is Not Achievable (KRO-928)
+
+* **What Fails:** Attempting to conditionally omit a scalar string field by returning `optional.none()` from a CEL ternary:
+    ```yaml
+    someField: ${conditionMet ? "arn:aws:iam::..." : optional.none()}
+    ```
+    kro rejects the RGD immediately:
+    ```
+    found no matching overload for '_?_:_' applied to '(bool, string, optional_type(dyn))'
+    RGD reaches Inactive — GraphAccepted: False
+    ```
+    Map-merge construction (`{}.merge(...)`) also cannot produce a field that is absent from the rendered CR because the template YAML structure is fixed at authoring time.
+
+* **Why this matters for the omit-don't-empty rule:** The rule "omit the field rather than setting it to empty string" is correct but implies that omission is always achievable. It is achievable at the **resource level** — put the field in a separate template variant gated by `includeWhen` so the entire resource is absent when the condition is false. It is NOT achievable at the **field level within a single template** in kro v0.9.2. If ten fields can each be independently present or absent (e.g. 5 protocols × 2 ARNs = 10 combinations), 2^10 = 1024 template variants would be needed — which is impractical. The correct mitigation is to detect the unsupported configuration in-graph (using a named ConfigMap that computes a flag) and surface an error ConfigMap to the user instead of rendering a broken CR.
+
+* **Proven by:** KRO-928 probe 4 on 2026-08-31 against kro v0.9.2:
+    ```yaml
+    # Probe RGD kro928probe4 — optional.none() in write position
+    template:
+      spec:
+        nested:
+          sqsSuccessFeedbackRoleArn: >-
+            ${schema.spec.testConfig.nested.sqsSuccessFeedbackRoleArn != ""
+              ? schema.spec.testConfig.nested.sqsSuccessFeedbackRoleArn
+              : optional.none()}
+    # Result: Inactive
+    # Error: found no matching overload for '_?_:_' applied to
+    #        '(bool, string, optional_type(dyn))'
+    ```
+
+* **SNS Topic example — mixed ARN detection pattern (KRO-928):** When only some of the 10 ARN fields are configured, `hasMixedFeedbackARN` is computed in the naming ConfigMap using: `(anyArn) && !(all 10 positions each have at least one non-empty source)`. When `hasMixedFeedbackARN == "true"`, the four WithARN templates are gated out via `includeWhen` (adding `&& naming.data.hasMixedFeedbackARN != "true"`) and the `mixedFeedbackARNError` advisory ConfigMap is rendered instead. See `docs/deferred-capabilities.md` for the unblock condition.
+
+* **To unblock:** When kro adds support for `optional.none()` in write position (or equivalent field-omission semantics), replace the multi-variant template approach with a single template using conditional field emission.
+
 ## 8. Diagnosing RGD Failures — Two Traps in the Tooling Itself
 
 ### `kubectl wait rgd --all --timeout=120s` Shares ONE Budget Across All RGDs
