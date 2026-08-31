@@ -1050,6 +1050,83 @@ investigation (KRO-916, KRO-917) and both present as something other than what t
   a single repeating pair of lines and nothing else.
 * **Fixed in:** KRO-917.
 
+### Omission Is Wrong for Fields the Provider Late-Initialises
+
+The rule in §7 — an unconfigured optional attribute must be *absent*, not present-and-empty — is
+correct for attributes **AWS rejects when empty**. It is wrong for fields **AWS populates itself**,
+and applying it there trades a terminal error for a silent write loop.
+
+* **What Fails:** Omitting a field that ACK late-initialises. `snstopic` stopped emitting `policy`
+  when `topicPolicyRef` is empty (KRO-905). SNS returns a default access policy for every topic, so
+  ACK reads it back and writes it into `spec`:
+    ```json
+    {"Version":"2008-10-17","Id":"__default_policy_ID",
+     "Statement":[{"Sid":"__default_statement_ID","Effect":"Allow","Principal":{"AWS":"*"}, ...}]}
+    ```
+* **Symptom:** Nothing reports an error. ACK is `ACK.ResourceSynced=True` with no terminal
+  condition, kro is `Ready=True :: AllResourcesReady` — and the ACK object is rewritten roughly
+  **five times per second, indefinitely**. Every reconcile is a real AWS API call, so this bills
+  continuously while looking healthy from every status field anyone would think to check.
+* **Why:** Omitting a field does not mean "no opinion". It hands the field to the provider's field
+  manager. `managedFields` shows the split plainly:
+    ```
+    kro.run/applyset   Apply    -> metadata + the spec kro renders
+    controller         Update   -> {"f:spec": {"f:policy": {}}}     <-- ACK owns policy
+    ```
+  kro renders an object without `policy`, ACK puts one back, and neither converges.
+* **Delete and recreate does not help.** A freshly created topic reproduces the churn immediately.
+  This is structural, not a stuck object.
+* **How to tell the two cases apart before omitting:** ask whether AWS *rejects* the field when
+  empty, or *supplies* it when absent.
+    * Rejects when empty → omit (§7). `ContentBasedDeduplication`, `FifoQueue`, `Policy` on
+      **create**.
+    * Supplies when absent → do not omit; render the value AWS would return, so the desired state
+      matches the observed one. Otherwise the field is contested forever.
+  The tell is an `ACK.LateInitialized=True` condition on the resource, or the field appearing in
+  `spec` with a value nobody configured.
+* **Diagnosing it:** a climbing `metadata.generation` on a resource whose status is entirely green.
+    ```bash
+    for i in 1 2; do
+      kubectl get <ack-kind> <name> -n <ns> -o jsonpath='{.metadata.generation}{"\n"}'; sleep 6
+    done
+    kubectl get <ack-kind> <name> -n <ns> --show-managed-fields -o json \
+      | jq '.metadata.managedFields[] | {manager, operation, fields: .fieldsV1}'
+    ```
+  Two managers touching the same `f:spec` key is the confirmation.
+* **Tracked in:** KRO-920. Audit alongside it the other fields the omit-don't-empty work touched —
+  S3 `createBucketConfiguration.locationConstraint` and `versioning.status` are the obvious
+  candidates.
+
+### `includeWhen` Must Not Read Another Node in the Same Graph
+
+* **What Fails:** Gating resource inclusion on the observed state of a sibling node. `snstopic`
+  renders twelve mutually-exclusive ACK Topic variants, each gated on the `naming` ConfigMap:
+    ```
+    ${!naming.data.resourceName.contains("{") && naming.data.hasFeedback == "true" && ...}
+    ```
+* **Symptom:** Deletion hangs forever. The instance sits in `DELETING` holding `kro.run/finalizer`,
+  and kro retries indefinitely:
+    ```log
+    includeWhen dependency "naming" not ready: node "naming":
+      no observed state: waiting for readiness (data pending)
+    ```
+  It never clears on its own. The name stays taken, so a GitOps re-sync cannot recreate the
+  instance and the tenant Application stalls without reporting a failure.
+* **Why:** On teardown kro needs `naming.data` to evaluate the gates and decide which variants exist
+  to delete — but `naming` is part of the same graph and is itself being removed. **The gate
+  outlives the thing it reads.** Confirmed by observing that the S3 and SQS naming ConfigMaps were
+  present in the same namespaces while the SNS ones were already gone.
+* **What Works Instead:** Derive gate inputs from `schema.spec` and the resolved config tiers, which
+  are available at every point in the lifecycle including deletion. A `naming` ConfigMap may still
+  be rendered as an *output*; it must not be an *input* to inclusion.
+* **The variant count is the underlying hazard.** Gating arrived with the empty-attribute work and
+  grew with it — `includeWhen` went 1 → 2 → 4 → 8 → 12 across KRO-905, KRO-911 and KRO-915. Each
+  step fixed a real AWS rejection; together they built the deadlock. If presence-gating can be
+  expressed without the combinatorial split, this class disappears.
+* **Check the sibling families.** `sqsqueue` was expanded to 16 variants by the same work. It is
+  healthy today but has not been torn down since — verify it under delete before trusting it.
+* **Tracked in:** KRO-919.
+
 ## 7. ACK Target-Schema Fidelity — Verify Every Field Against the Live CRD
 
 The RGD's user-facing `types:` block and the ACK CRD it feeds are **two independent schemas**.
