@@ -1101,9 +1101,11 @@ and applying it there trades a terminal error for a silent write loop.
       | jq '.metadata.managedFields[] | {manager, operation, fields: .fieldsV1}'
     ```
   Two managers touching the same `f:spec` key is the confirmation.
-* **Tracked in:** KRO-920. Audit alongside it the other fields the omit-don't-empty work touched —
-  S3 `createBucketConfiguration.locationConstraint` and `versioning.status` are the obvious
-  candidates.
+* **Fixed in:** KRO-920. All six "NoPolicy" SNS Topic variants (standard + FIFO × 3 feedback
+  combinations) now render the AWS default access policy explicitly, so kro's desired state matches
+  what ACK would late-initialise and the ~2,600-write transient handover is eliminated. Audit
+  alongside it the other fields the omit-don't-empty work touched — S3
+  `createBucketConfiguration.locationConstraint` and `versioning.status` are the obvious candidates.
 
 ### `includeWhen` Must Not Read Another Node in the Same Graph
 
