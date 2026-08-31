@@ -58,9 +58,14 @@ spec:
           ? "arn:aws:logs:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":log-group:" + naming.data.effectiveName
           : ""}
       logGroupArn: >-
-        ${ackLogGroup.?status.?ackResourceMetadata.?arn.orValue("")}
+        ${ackLogGroupWithKms.?status.?ackResourceMetadata.?arn.orValue("")}
+      logGroupArnNoKms: >-
+        ${ackLogGroupNoKms.?status.?ackResourceMetadata.?arn.orValue("")}
+      # kro cannot merge list types across resources; separate fields required.
       conditions: >-
-        ${ackLogGroup.?status.?conditions.orValue([])}
+        ${ackLogGroupWithKms.?status.?conditions.orValue([])}
+      noKmsConditions: >-
+        ${ackLogGroupNoKms.?status.?conditions.orValue([])}
     additionalPrinterColumns:
       - name: ResourceName
         type: string
@@ -143,11 +148,16 @@ spec:
               .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
               .replace("{configRef}", schema.spec.configRef))}
 
-    # ACK CloudWatch Logs LogGroup CR — primary cloud resource.
-    # Only created when namingStatus is valid (effectiveName has no unresolved tokens).
-    - id: ackLogGroup
+    # ACK CloudWatch Logs LogGroup CR — variant WITH KMS encryption.
+    # Created when naming is valid and at least one governance tier (or spec) provides kmsKeyId.
+    # Omitting kmsKeyID entirely when empty avoids the ACK API rejection for "" KMS ARN.
+    - id: ackLogGroupWithKms
       includeWhen:
-        - '${!naming.data.effectiveName.contains("{")}'
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+            && ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyId.orValue("") != "")
+                || schema.spec.kmsKeyId != ""
+                || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyId.orValue("") != ""))}
       template:
         apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
         kind: LogGroup
@@ -172,26 +182,19 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          # Log group name — immutable after creation (ACK enforces self == oldSelf CEL validation).
           name: ${naming.data.effectiveName}
-          # KMS encryption — three-tier cascade: mandatory → instance → defaults.
-          # Empty string = CloudWatch Logs default encryption (no KMS). Full ARN required.
           kmsKeyID: >-
             ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyId.orValue("") != ""
               ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsKeyId
               : (schema.spec.kmsKeyId != ""
                   ? schema.spec.kmsKeyId
                   : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyId.orValue("") : ""))}
-          # Retention — three-tier cascade: mandatory → instance → defaults.
-          # 0 = indefinite retention (ACK calls DeleteRetentionPolicy).
           retentionDays: >-
             ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?retentionDays.orValue(0) != 0
               ? rsrcCfg[0].status.effectiveConfig.mandatory.retentionDays
               : (schema.spec.retentionDays != 0
                   ? schema.spec.retentionDays
                   : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?retentionDays.orValue(0) : 0))}
-          # Subscription filters — instance-only (not governed via CloudWatchLogsConfig).
-          # Field name mapping: destinationArn → destinationARN, roleArn → roleARN (ACK uses SCREAMING_CAPS).
           subscriptionFilters: >-
             ${schema.spec.subscriptionFilters.map(f, {
               "filterName": f.filterName,
@@ -200,9 +203,65 @@ spec:
               "roleARN": f.roleArn,
               "distribution": f.distribution
             })}
-          # Cloud resource tags — direct map<string,string> passthrough (unlike SNS/SQS which use {key,value} list).
-          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
-          # syncedLabels and syncedAnnotations are also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+
+    # ACK CloudWatch Logs LogGroup CR — variant WITHOUT KMS encryption.
+    # Created when naming is valid and no governance tier provides kmsKeyId.
+    - id: ackLogGroupNoKms
+      includeWhen:
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+            && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyId.orValue("") == "")
+            && schema.spec.kmsKeyId == ""
+            && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyId.orValue("") == "")}
+      template:
+        apiVersion: cloudwatchlogs.services.k8s.aws/v1alpha1
+        kind: LogGroup
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudWatchLogsLogGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          retentionDays: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?retentionDays.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.retentionDays
+              : (schema.spec.retentionDays != 0
+                  ? schema.spec.retentionDays
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?retentionDays.orValue(0) : 0))}
+          subscriptionFilters: >-
+            ${schema.spec.subscriptionFilters.map(f, {
+              "filterName": f.filterName,
+              "filterPattern": f.filterPattern,
+              "destinationARN": f.destinationArn,
+              "roleARN": f.roleArn,
+              "distribution": f.distribution
+            })}
           tags: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
               .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
