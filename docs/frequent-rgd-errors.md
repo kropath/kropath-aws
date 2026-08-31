@@ -1065,8 +1065,10 @@ and applying it there trades a terminal error for a silent write loop.
     ```
 * **Symptom:** Nothing reports an error. ACK is `ACK.ResourceSynced=True` with no terminal
   condition, kro is `Ready=True :: AllResourcesReady` — and the ACK object is rewritten roughly
-  **five times per second, indefinitely**. Every reconcile is a real AWS API call, so this bills
-  continuously while looking healthy from every status field anyone would think to check.
+  **five times per second for the next ten to fifteen minutes**, around **2,600 writes**, before
+  the two managers settle into shared ownership of the field. Every one of those reconciles is a
+  real AWS API call, so a resource that looks healthy from every status field anyone would think
+  to check quietly bills a few thousand calls each time it is created.
 * **Why:** Omitting a field does not mean "no opinion". It hands the field to the provider's field
   manager. `managedFields` shows the split plainly:
     ```
@@ -1074,8 +1076,12 @@ and applying it there trades a terminal error for a silent write loop.
     controller         Update   -> {"f:spec": {"f:policy": {}}}     <-- ACK owns policy
     ```
   kro renders an object without `policy`, ACK puts one back, and neither converges.
-* **Delete and recreate does not help.** A freshly created topic reproduces the churn immediately.
-  This is structural, not a stuck object.
+* **It converges, which is what makes it easy to miss.** Two topics created eight minutes apart
+  both settled — generation 2703 and 2595 — and stayed settled. Sampling one of them mid-handover
+  looks identical to an unbounded loop, so the two are indistinguishable without waiting it out.
+  That also means **delete-and-recreate "fixes" it**, in the sense that the resource does reach a
+  steady state; it simply re-pays the handover every time. The cost is per creation, not
+  continuous — which lowers the urgency without changing the defect.
 * **How to tell the two cases apart before omitting:** ask whether AWS *rejects* the field when
   empty, or *supplies* it when absent.
     * Rejects when empty → omit (§7). `ContentBasedDeduplication`, `FifoQueue`, `Policy` on
@@ -1085,6 +1091,8 @@ and applying it there trades a terminal error for a silent write loop.
   The tell is an `ACK.LateInitialized=True` condition on the resource, or the field appearing in
   `spec` with a value nobody configured.
 * **Diagnosing it:** a climbing `metadata.generation` on a resource whose status is entirely green.
+  Sample well after creation — during the first ten minutes every freshly created resource of this
+  kind is still converging, so an early sample cannot distinguish this defect from normal settling.
     ```bash
     for i in 1 2; do
       kubectl get <ack-kind> <name> -n <ns> -o jsonpath='{.metadata.generation}{"\n"}'; sleep 6
