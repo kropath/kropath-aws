@@ -35,8 +35,13 @@ ACK_NAMESPACE="ack-system"
 
 resolve_ack_chart_version() {
   local svc="$1"
-
-  curl -fsSL "https://api.github.com/repos/aws-controllers-k8s/${svc}-controller/releases/latest" \
+  local -a auth_args=()
+  # Use GITHUB_TOKEN when available (5000 req/hr vs 60/hr unauthenticated).
+  # In CI, this is set via the workflow env; locally, callers may export it.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  curl -fsSL "${auth_args[@]}" "https://api.github.com/repos/aws-controllers-k8s/${svc}-controller/releases/latest" \
     | jq -r '.tag_name | ltrimstr("v")'
 }
 
