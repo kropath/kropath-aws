@@ -202,19 +202,55 @@ if ! kubectl wait rgd \
   lambdacodesigningconfig.aws.kropath.run \
   lambdalayerversion.aws.kropath.run \
   --for=condition=Ready --timeout=120s; then
-  echo "==> RGD condition dump (for diagnosis):"
-  kubectl get rgd lambdacodesigningconfig.aws.kropath.run lambdalayerversion.aws.kropath.run \
-    -o jsonpath='{range .items[*]}{"--- "}{.metadata.name}{"\n"}{.status.conditions}{"\n"}{end}' || true
-  exit 1
+  # Apply same GraphAccepted=False graceful handling as the non-lambda batch: transient
+  # GitHub API 403 errors prevent lambda ACK CRDs from installing, making wave RGDs
+  # permanently GraphAccepted=False. Treat those as warnings and continue so that
+  # waves 2/3 (and the final wait) can also reach their graceful-handling paths.
+  lambda_wave1_not_ready=$(kubectl get rgd \
+    lambdacodesigningconfig.aws.kropath.run \
+    lambdalayerversion.aws.kropath.run \
+    -o jsonpath='{range .items[?(@.status.state!="Active")]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  lambda_wave1_has_non_perm=false
+  while IFS= read -r rgd; do
+    [ -z "${rgd}" ] && continue
+    ga_status=$(kubectl get rgd "${rgd}" \
+      -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].status}' 2>/dev/null || true)
+    if [ "${ga_status}" != "False" ]; then
+      lambda_wave1_has_non_perm=true
+    fi
+  done <<< "${lambda_wave1_not_ready}"
+  if ${lambda_wave1_has_non_perm}; then
+    echo "Lambda wave 1 FAILED (genuine graph errors — fix these before proceeding):"
+    kubectl get rgd lambdacodesigningconfig.aws.kropath.run lambdalayerversion.aws.kropath.run \
+      -o jsonpath='{range .items[*]}{"--- "}{.metadata.name}{"\n"}{.status.conditions}{"\n"}{end}' || true
+    exit 1
+  fi
+  echo "  WARNING: Lambda wave 1 RGDs have permanent GraphAccepted=False (lambda ACK CRDs not in ECR)."
+  echo "  Waves 2 and 3 will be applied and will also surface GraphAccepted=False; handled at final wait."
 fi
 
 echo "==> Lambda RGD wave 2 (LambdaFunction, needs LambdaCodeSigningConfig CRD from wave 1)..."
 kubectl apply -f "${SCRIPT_DIR}/../rgds/lambdafunction.aws.kropath.run.yaml"
 if ! kubectl wait rgd lambdafunction.aws.kropath.run --for=condition=Ready --timeout=120s; then
-  echo "==> RGD condition dump (for diagnosis):"
-  kubectl get rgd lambdafunction.aws.kropath.run \
-    -o jsonpath='{"--- "}{.metadata.name}{"\n"}{.status.conditions}{"\n"}' || true
-  exit 1
+  lambda_wave2_not_ready=$(kubectl get rgd lambdafunction.aws.kropath.run \
+    -o jsonpath='{range .items[?(@.status.state!="Active")]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  lambda_wave2_has_non_perm=false
+  while IFS= read -r rgd; do
+    [ -z "${rgd}" ] && continue
+    ga_status=$(kubectl get rgd "${rgd}" \
+      -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].status}' 2>/dev/null || true)
+    if [ "${ga_status}" != "False" ]; then
+      lambda_wave2_has_non_perm=true
+    fi
+  done <<< "${lambda_wave2_not_ready}"
+  if ${lambda_wave2_has_non_perm}; then
+    echo "Lambda wave 2 FAILED (genuine graph errors — fix these before proceeding):"
+    kubectl get rgd lambdafunction.aws.kropath.run \
+      -o jsonpath='{"--- "}{.metadata.name}{"\n"}{.status.conditions}{"\n"}' || true
+    exit 1
+  fi
+  echo "  WARNING: Lambda wave 2 RGD has permanent GraphAccepted=False (lambda ACK CRDs not in ECR)."
+  echo "  Wave 3 will be applied and handled at final wait."
 fi
 
 echo "==> Lambda RGD wave 3 (need LambdaFunction CRD from wave 2)..."
