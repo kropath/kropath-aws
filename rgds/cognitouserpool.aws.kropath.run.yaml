@@ -1,0 +1,682 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cognitouserpool.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: CognitoUserPool
+    scope: Namespaced
+    spec:
+      # Standard governance fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Governed security fields (falls through to CognitoConfig cascade)
+      mfaConfiguration: string | default=""
+      smsAuthenticationMessage: string | default=""
+      advancedSecurityMode: string | default=""
+      deletionProtection: string | default=""
+
+      # Password policy — per-sub-field cascade (OD-1 Option B).
+      # Integer sub-fields: 0 = not set (fall through to governance).
+      # Boolean sub-fields: bare boolean (no default) for pointer semantics —
+      # kro materialises `| default=false` onto every instance, defeating has() detection.
+      passwordPolicy:
+        minimumLength: integer | default=0
+        requireLowercase: boolean
+        requireNumbers: boolean
+        requireSymbols: boolean
+        requireUppercase: boolean
+        temporaryPasswordValidityDays: integer | default=0
+
+      # Username and sign-in — IMMUTABLE after creation; mutually exclusive with aliasAttributes
+      usernameAttributes: "[]string | default=[]"
+      aliasAttributes: "[]string | default=[]"
+      autoVerifiedAttributes: "[]string | default=[]"
+      usernameConfiguration:
+        caseSensitive: boolean
+
+      # Admin user creation — pass-through
+      adminCreateUserConfig:
+        allowAdminCreateUserOnly: boolean
+        inviteMessageTemplate:
+          emailMessage: string | default=""
+          emailSubject: string | default=""
+          sMSMessage: string | default=""
+        unusedAccountValidityDays: integer | default=0
+
+      # Email configuration — pass-through
+      emailConfiguration:
+        emailSendingAccount: string | default=""
+        from: string | default=""
+        replyToEmailAddress: string | default=""
+        sourceARN: string | default=""
+        configurationSet: string | default=""
+
+      # SMS configuration — pass-through
+      smsConfiguration:
+        snsCallerARN: string | default=""
+        externalID: string | default=""
+        snsRegion: string | default=""
+
+      # Lambda triggers — pass-through (not governed; OD-4 resolved)
+      lambdaConfig:
+        createAuthChallenge: string | default=""
+        customMessage: string | default=""
+        defineAuthChallenge: string | default=""
+        postAuthentication: string | default=""
+        postConfirmation: string | default=""
+        preAuthentication: string | default=""
+        preSignUp: string | default=""
+        preTokenGeneration: string | default=""
+        userMigration: string | default=""
+        verifyAuthChallengeResponse: string | default=""
+        customEmailSender:
+          lambdaARN: string | default=""
+          lambdaVersion: string | default=""
+        customSMSSender:
+          lambdaARN: string | default=""
+          lambdaVersion: string | default=""
+        preTokenGenerationConfig:
+          lambdaARN: string | default=""
+          lambdaVersion: string | default=""
+        kmsKeyID: string | default=""
+
+      # Attribute schema — append-only; pass-through
+      schema: "[]SchemaAttribute | default=[]"
+
+      # Account recovery — pass-through
+      accountRecoverySetting:
+        recoveryMechanisms: "[]RecoveryMechanism | default=[]"
+
+      # Device configuration — bare booleans (pointer semantics)
+      deviceConfiguration:
+        challengeRequiredOnNewDevice: boolean
+        deviceOnlyRememberedOnUserPrompt: boolean
+
+      # Verification message template — pass-through
+      verificationMessageTemplate:
+        defaultEmailOption: string | default=""
+        emailMessage: string | default=""
+        emailMessageByLink: string | default=""
+        emailSubject: string | default=""
+        emailSubjectByLink: string | default=""
+        smsMessage: string | default=""
+
+      # User attribute update settings — pass-through
+      userAttributeUpdateSettings:
+        attributesRequireVerificationBeforeUpdate: "[]string | default=[]"
+
+    types:
+      SchemaAttribute:
+        attributeDataType: string | default=""
+        developerOnlyAttribute: boolean
+        mutable: boolean
+        name: string | default=""
+        required: boolean
+        numberAttributeConstraints:
+          minValue: string | default=""
+          maxValue: string | default=""
+        stringAttributeConstraints:
+          minLength: string | default=""
+          maxLength: string | default=""
+      RecoveryMechanism:
+        name: string | default=""
+        priority: integer | default=1
+
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      # userPoolArn and userPoolId — exposed from whichever ACK UserPool variant is active.
+      # ackUserPoolFull is active when resolvedAdvancedSecurityMode != ""; ackUserPool otherwise.
+      # In local tests without real ACK, these are empty unless status is patched.
+      userPoolArn: >-
+        ${has(ackUserPoolFull.status) && has(ackUserPoolFull.status.ackResourceMetadata) ? ackUserPoolFull.status.?ackResourceMetadata.?arn.orValue("") : ackUserPool.?status.?ackResourceMetadata.?arn.orValue("")}
+      userPoolId: >-
+        ${has(ackUserPoolFull.status) && has(ackUserPoolFull.status.id) ? ackUserPoolFull.status.?id.orValue("") : ackUserPool.?status.?id.orValue("")}
+      validationError: >-
+        ${has(mutualExclusionError.data) && has(mutualExclusionError.data.error) ? mutualExclusionError.data.error : ""}
+
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    # Single governance config lookup (ADR-010 D-1, Theme 28/KRO-221).
+    # Uses selector.matchLabels — CEL in externalRef.metadata.name is not evaluated.
+    # Result is a list; all accesses use rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CognitoConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — materialises resourceName, namingStatus, and key resolved values
+    # used in includeWhen conditions for the ACK UserPool variants.
+    # The status block cannot reference schema.* directly (out of scope); these computed values
+    # flow through this ConfigMap to the status block via naming.data.*.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CognitoUserPool
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # resourceName: effective cloud resource name with full {tag.X} substitution.
+          # Tag tokens resolved cascade order: mandatory wins over spec, spec wins over defaults.
+          # Any unresolved {tag.X} token is kept verbatim so namingStatus reports invalid.
+          resourceName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+          # resolvedAdvancedSecurityMode — used in includeWhen to select between ackUserPool
+          # (no userPoolAddOns) and ackUserPoolFull (with userPoolAddOns). When "", userPoolAddOns
+          # is omitted entirely from the ACK UserPool spec (OQ-2: omit rather than set empty object).
+          resolvedAdvancedSecurityMode: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?advancedSecurityMode.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?advancedSecurityMode.orValue("")
+              : (schema.spec.advancedSecurityMode != ""
+                  ? schema.spec.advancedSecurityMode
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?advancedSecurityMode.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?advancedSecurityMode.orValue("")
+                      : ""))}
+          # usernameAliasConflict — "true" when both usernameAttributes and aliasAttributes are
+          # non-empty; mutually exclusive (AC-33). ACK UserPool resources are excluded when "true".
+          usernameAliasConflict: >-
+            ${(schema.spec.usernameAttributes.size() > 0 && schema.spec.aliasAttributes.size() > 0) ? "true" : "false"}
+
+    # Advisory ConfigMap for AC-33 mutual exclusion.
+    # kro v0.9.2 does not preserve x-kubernetes-validations (regenerates CRD on every apply).
+    # This ConfigMap surfaces as status.validationError and gates the ACK UserPool creation.
+    - id: mutualExclusionError
+      includeWhen:
+        - '${schema.spec.usernameAttributes.size() > 0 && schema.spec.aliasAttributes.size() > 0}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CognitoUserPool
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "usernameAttributes and aliasAttributes are mutually exclusive — set only one"
+
+    # ACK UserPool — basic variant (no userPoolAddOns).
+    # Included when: no mutual exclusion conflict, valid naming, and advancedSecurityMode is empty.
+    - id: ackUserPool
+      includeWhen:
+        - '${naming.data.usernameAliasConflict != "true" && !naming.data.resourceName.contains("{") && naming.data.resolvedAdvancedSecurityMode == ""}'
+      template:
+        apiVersion: cognitoidentityprovider.services.k8s.aws/v1alpha1
+        kind: UserPool
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CognitoUserPool
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          # MFA — mandatory -> instance -> defaults -> built-in fallback (OFF)
+          mfaConfiguration: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?mfaConfiguration.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?mfaConfiguration.orValue("")
+              : (schema.spec.mfaConfiguration != ""
+                  ? schema.spec.mfaConfiguration
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?mfaConfiguration.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?mfaConfiguration.orValue("")
+                      : "OFF"))}
+          # Deletion protection — mandatory -> instance -> defaults -> INACTIVE
+          deletionProtection: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?deletionProtection.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?deletionProtection.orValue("")
+              : (schema.spec.deletionProtection != ""
+                  ? schema.spec.deletionProtection
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?deletionProtection.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?deletionProtection.orValue("")
+                      : "INACTIVE"))}
+          # Password policy — per-sub-field cascade
+          policies:
+            passwordPolicy:
+              minimumLength: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?minimumLength.orValue(0) > 0
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?minimumLength.orValue(0)
+                  : (schema.spec.passwordPolicy.minimumLength > 0
+                      ? schema.spec.passwordPolicy.minimumLength
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?minimumLength.orValue(0) > 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?minimumLength.orValue(0)
+                          : 8))}
+              requireLowercase: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireLowercase)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireLowercase
+                  : (has(schema.spec.passwordPolicy.requireLowercase)
+                      ? schema.spec.passwordPolicy.requireLowercase
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireLowercase)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireLowercase
+                          : true))}
+              requireNumbers: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireNumbers)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireNumbers
+                  : (has(schema.spec.passwordPolicy.requireNumbers)
+                      ? schema.spec.passwordPolicy.requireNumbers
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireNumbers)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireNumbers
+                          : true))}
+              requireSymbols: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireSymbols)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireSymbols
+                  : (has(schema.spec.passwordPolicy.requireSymbols)
+                      ? schema.spec.passwordPolicy.requireSymbols
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireSymbols)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireSymbols
+                          : true))}
+              requireUppercase: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireUppercase)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireUppercase
+                  : (has(schema.spec.passwordPolicy.requireUppercase)
+                      ? schema.spec.passwordPolicy.requireUppercase
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireUppercase)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireUppercase
+                          : true))}
+              temporaryPasswordValidityDays: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0) > 0
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0)
+                  : (schema.spec.passwordPolicy.temporaryPasswordValidityDays > 0
+                      ? schema.spec.passwordPolicy.temporaryPasswordValidityDays
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0) > 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0)
+                          : 7))}
+          # SMS authentication message — pass-through
+          smsAuthenticationMessage: ${schema.spec.smsAuthenticationMessage}
+          # Username and sign-in — pass-through; immutable after creation
+          usernameAttributes: ${schema.spec.usernameAttributes}
+          aliasAttributes: ${schema.spec.aliasAttributes}
+          autoVerifiedAttributes: ${schema.spec.autoVerifiedAttributes}
+          usernameConfiguration:
+            caseSensitive: ${schema.spec.?usernameConfiguration.?caseSensitive.orValue(false)}
+          # Admin user creation — pass-through
+          adminCreateUserConfig:
+            allowAdminCreateUserOnly: ${schema.spec.?adminCreateUserConfig.?allowAdminCreateUserOnly.orValue(false)}
+            inviteMessageTemplate:
+              emailMessage: ${schema.spec.adminCreateUserConfig.inviteMessageTemplate.emailMessage}
+              emailSubject: ${schema.spec.adminCreateUserConfig.inviteMessageTemplate.emailSubject}
+              sMSMessage: ${schema.spec.adminCreateUserConfig.inviteMessageTemplate.sMSMessage}
+            unusedAccountValidityDays: ${schema.spec.adminCreateUserConfig.unusedAccountValidityDays}
+          # Email configuration — pass-through
+          emailConfiguration:
+            emailSendingAccount: ${schema.spec.emailConfiguration.emailSendingAccount}
+            from: ${schema.spec.emailConfiguration.from}
+            replyToEmailAddress: ${schema.spec.emailConfiguration.replyToEmailAddress}
+            sourceARN: ${schema.spec.emailConfiguration.sourceARN}
+            configurationSet: ${schema.spec.emailConfiguration.configurationSet}
+          # SMS configuration — pass-through
+          smsConfiguration:
+            snsCallerARN: ${schema.spec.smsConfiguration.snsCallerARN}
+            externalID: ${schema.spec.smsConfiguration.externalID}
+            snsRegion: ${schema.spec.smsConfiguration.snsRegion}
+          # Lambda triggers — pass-through
+          lambdaConfig:
+            createAuthChallenge: ${schema.spec.lambdaConfig.createAuthChallenge}
+            customMessage: ${schema.spec.lambdaConfig.customMessage}
+            defineAuthChallenge: ${schema.spec.lambdaConfig.defineAuthChallenge}
+            postAuthentication: ${schema.spec.lambdaConfig.postAuthentication}
+            postConfirmation: ${schema.spec.lambdaConfig.postConfirmation}
+            preAuthentication: ${schema.spec.lambdaConfig.preAuthentication}
+            preSignUp: ${schema.spec.lambdaConfig.preSignUp}
+            preTokenGeneration: ${schema.spec.lambdaConfig.preTokenGeneration}
+            userMigration: ${schema.spec.lambdaConfig.userMigration}
+            verifyAuthChallengeResponse: ${schema.spec.lambdaConfig.verifyAuthChallengeResponse}
+            customEmailSender:
+              lambdaARN: ${schema.spec.lambdaConfig.customEmailSender.lambdaARN}
+              lambdaVersion: ${schema.spec.lambdaConfig.customEmailSender.lambdaVersion}
+            customSMSSender:
+              lambdaARN: ${schema.spec.lambdaConfig.customSMSSender.lambdaARN}
+              lambdaVersion: ${schema.spec.lambdaConfig.customSMSSender.lambdaVersion}
+            preTokenGenerationConfig:
+              lambdaARN: ${schema.spec.lambdaConfig.preTokenGenerationConfig.lambdaARN}
+              lambdaVersion: ${schema.spec.lambdaConfig.preTokenGenerationConfig.lambdaVersion}
+            kmsKeyID: ${schema.spec.lambdaConfig.kmsKeyID}
+          # Attribute schema — pass-through; append-only
+          schema: ${schema.spec.schema}
+          # Account recovery — pass-through
+          accountRecoverySetting:
+            recoveryMechanisms: ${schema.spec.accountRecoverySetting.recoveryMechanisms}
+          # Device configuration — pass-through
+          deviceConfiguration:
+            challengeRequiredOnNewDevice: ${schema.spec.?deviceConfiguration.?challengeRequiredOnNewDevice.orValue(false)}
+            deviceOnlyRememberedOnUserPrompt: ${schema.spec.?deviceConfiguration.?deviceOnlyRememberedOnUserPrompt.orValue(false)}
+          # Verification message template — pass-through
+          verificationMessageTemplate:
+            defaultEmailOption: ${schema.spec.verificationMessageTemplate.defaultEmailOption}
+            emailMessage: ${schema.spec.verificationMessageTemplate.emailMessage}
+            emailMessageByLink: ${schema.spec.verificationMessageTemplate.emailMessageByLink}
+            emailSubject: ${schema.spec.verificationMessageTemplate.emailSubject}
+            emailSubjectByLink: ${schema.spec.verificationMessageTemplate.emailSubjectByLink}
+            smsMessage: ${schema.spec.verificationMessageTemplate.smsMessage}
+          # User attribute update settings — pass-through
+          userAttributeUpdateSettings:
+            attributesRequireVerificationBeforeUpdate: ${schema.spec.userAttributeUpdateSettings.attributesRequireVerificationBeforeUpdate}
+          # Cloud resource tags — ACK spec.userPoolTags is map[string]string (not array).
+          # Merge order: defaults -> instance spec -> mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations dual-written to cloud tags (ADR-015 §6.1).
+          userPoolTags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+
+    # ACK UserPool — full variant (with userPoolAddOns).
+    # Included when: no mutual exclusion conflict, valid naming, and advancedSecurityMode is non-empty.
+    # Duplicates base spec fields; userPoolAddOns omission is achieved by this two-variant pattern
+    # (kro v0.9.2 cannot conditionally include a sub-object field within a single template).
+    - id: ackUserPoolFull
+      includeWhen:
+        - '${naming.data.usernameAliasConflict != "true" && !naming.data.resourceName.contains("{") && naming.data.resolvedAdvancedSecurityMode != ""}'
+      template:
+        apiVersion: cognitoidentityprovider.services.k8s.aws/v1alpha1
+        kind: UserPool
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CognitoUserPool
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          mfaConfiguration: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?mfaConfiguration.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?mfaConfiguration.orValue("")
+              : (schema.spec.mfaConfiguration != ""
+                  ? schema.spec.mfaConfiguration
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?mfaConfiguration.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?mfaConfiguration.orValue("")
+                      : "OFF"))}
+          deletionProtection: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?deletionProtection.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?deletionProtection.orValue("")
+              : (schema.spec.deletionProtection != ""
+                  ? schema.spec.deletionProtection
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?deletionProtection.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?deletionProtection.orValue("")
+                      : "INACTIVE"))}
+          policies:
+            passwordPolicy:
+              minimumLength: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?minimumLength.orValue(0) > 0
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?minimumLength.orValue(0)
+                  : (schema.spec.passwordPolicy.minimumLength > 0
+                      ? schema.spec.passwordPolicy.minimumLength
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?minimumLength.orValue(0) > 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?minimumLength.orValue(0)
+                          : 8))}
+              requireLowercase: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireLowercase)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireLowercase
+                  : (has(schema.spec.passwordPolicy.requireLowercase)
+                      ? schema.spec.passwordPolicy.requireLowercase
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireLowercase)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireLowercase
+                          : true))}
+              requireNumbers: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireNumbers)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireNumbers
+                  : (has(schema.spec.passwordPolicy.requireNumbers)
+                      ? schema.spec.passwordPolicy.requireNumbers
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireNumbers)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireNumbers
+                          : true))}
+              requireSymbols: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireSymbols)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireSymbols
+                  : (has(schema.spec.passwordPolicy.requireSymbols)
+                      ? schema.spec.passwordPolicy.requireSymbols
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireSymbols)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireSymbols
+                          : true))}
+              requireUppercase: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireUppercase)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.passwordPolicy.requireUppercase
+                  : (has(schema.spec.passwordPolicy.requireUppercase)
+                      ? schema.spec.passwordPolicy.requireUppercase
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy) && has(rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireUppercase)
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.passwordPolicy.requireUppercase
+                          : true))}
+              temporaryPasswordValidityDays: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0) > 0
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0)
+                  : (schema.spec.passwordPolicy.temporaryPasswordValidityDays > 0
+                      ? schema.spec.passwordPolicy.temporaryPasswordValidityDays
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0) > 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.?passwordPolicy.?temporaryPasswordValidityDays.orValue(0)
+                          : 7))}
+          smsAuthenticationMessage: ${schema.spec.smsAuthenticationMessage}
+          usernameAttributes: ${schema.spec.usernameAttributes}
+          aliasAttributes: ${schema.spec.aliasAttributes}
+          autoVerifiedAttributes: ${schema.spec.autoVerifiedAttributes}
+          usernameConfiguration:
+            caseSensitive: ${schema.spec.?usernameConfiguration.?caseSensitive.orValue(false)}
+          adminCreateUserConfig:
+            allowAdminCreateUserOnly: ${schema.spec.?adminCreateUserConfig.?allowAdminCreateUserOnly.orValue(false)}
+            inviteMessageTemplate:
+              emailMessage: ${schema.spec.adminCreateUserConfig.inviteMessageTemplate.emailMessage}
+              emailSubject: ${schema.spec.adminCreateUserConfig.inviteMessageTemplate.emailSubject}
+              sMSMessage: ${schema.spec.adminCreateUserConfig.inviteMessageTemplate.sMSMessage}
+            unusedAccountValidityDays: ${schema.spec.adminCreateUserConfig.unusedAccountValidityDays}
+          emailConfiguration:
+            emailSendingAccount: ${schema.spec.emailConfiguration.emailSendingAccount}
+            from: ${schema.spec.emailConfiguration.from}
+            replyToEmailAddress: ${schema.spec.emailConfiguration.replyToEmailAddress}
+            sourceARN: ${schema.spec.emailConfiguration.sourceARN}
+            configurationSet: ${schema.spec.emailConfiguration.configurationSet}
+          smsConfiguration:
+            snsCallerARN: ${schema.spec.smsConfiguration.snsCallerARN}
+            externalID: ${schema.spec.smsConfiguration.externalID}
+            snsRegion: ${schema.spec.smsConfiguration.snsRegion}
+          lambdaConfig:
+            createAuthChallenge: ${schema.spec.lambdaConfig.createAuthChallenge}
+            customMessage: ${schema.spec.lambdaConfig.customMessage}
+            defineAuthChallenge: ${schema.spec.lambdaConfig.defineAuthChallenge}
+            postAuthentication: ${schema.spec.lambdaConfig.postAuthentication}
+            postConfirmation: ${schema.spec.lambdaConfig.postConfirmation}
+            preAuthentication: ${schema.spec.lambdaConfig.preAuthentication}
+            preSignUp: ${schema.spec.lambdaConfig.preSignUp}
+            preTokenGeneration: ${schema.spec.lambdaConfig.preTokenGeneration}
+            userMigration: ${schema.spec.lambdaConfig.userMigration}
+            verifyAuthChallengeResponse: ${schema.spec.lambdaConfig.verifyAuthChallengeResponse}
+            customEmailSender:
+              lambdaARN: ${schema.spec.lambdaConfig.customEmailSender.lambdaARN}
+              lambdaVersion: ${schema.spec.lambdaConfig.customEmailSender.lambdaVersion}
+            customSMSSender:
+              lambdaARN: ${schema.spec.lambdaConfig.customSMSSender.lambdaARN}
+              lambdaVersion: ${schema.spec.lambdaConfig.customSMSSender.lambdaVersion}
+            preTokenGenerationConfig:
+              lambdaARN: ${schema.spec.lambdaConfig.preTokenGenerationConfig.lambdaARN}
+              lambdaVersion: ${schema.spec.lambdaConfig.preTokenGenerationConfig.lambdaVersion}
+            kmsKeyID: ${schema.spec.lambdaConfig.kmsKeyID}
+          schema: ${schema.spec.schema}
+          accountRecoverySetting:
+            recoveryMechanisms: ${schema.spec.accountRecoverySetting.recoveryMechanisms}
+          deviceConfiguration:
+            challengeRequiredOnNewDevice: ${schema.spec.?deviceConfiguration.?challengeRequiredOnNewDevice.orValue(false)}
+            deviceOnlyRememberedOnUserPrompt: ${schema.spec.?deviceConfiguration.?deviceOnlyRememberedOnUserPrompt.orValue(false)}
+          verificationMessageTemplate:
+            defaultEmailOption: ${schema.spec.verificationMessageTemplate.defaultEmailOption}
+            emailMessage: ${schema.spec.verificationMessageTemplate.emailMessage}
+            emailMessageByLink: ${schema.spec.verificationMessageTemplate.emailMessageByLink}
+            emailSubject: ${schema.spec.verificationMessageTemplate.emailSubject}
+            emailSubjectByLink: ${schema.spec.verificationMessageTemplate.emailSubjectByLink}
+            smsMessage: ${schema.spec.verificationMessageTemplate.smsMessage}
+          userAttributeUpdateSettings:
+            attributesRequireVerificationBeforeUpdate: ${schema.spec.userAttributeUpdateSettings.attributesRequireVerificationBeforeUpdate}
+          userPoolTags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+          # Advanced security add-ons — only present in this variant (resolvedAdvancedSecurityMode != "")
+          userPoolAddOns:
+            advancedSecurityMode: ${naming.data.resolvedAdvancedSecurityMode}
