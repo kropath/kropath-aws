@@ -852,6 +852,21 @@ spec:
               kubectl patch cognitoconfig ac19-cfg -n cognitouserpool \
                 --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"mfaConfiguration":"","deletionProtection":"","advancedSecurityMode":"","passwordPolicy":{"minimumLength":0,"temporaryPasswordValidityDays":0},"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"mfaConfiguration":"OFF","deletionProtection":"INACTIVE","advancedSecurityMode":"","passwordPolicy":{"minimumLength":8,"requireLowercase":true,"requireNumbers":true,"requireSymbols":true,"requireUppercase":true,"temporaryPasswordValidityDays":7},"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        # Wait for effectiveConfig to be visible before creating the pool.
+        # Without this, kro may evaluate includeWhen before the patched status
+        # propagates to its informer cache, falling back to the default
+        # {namespace}-{name} template (valid), creating the ACK UserPool transiently.
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CognitoConfig
+              metadata:
+                name: ac19-cfg
+                namespace: cognitouserpool
+              status:
+                effectiveConfig:
+                  defaults:
+                    namingTemplate: "{tag.env}-{name}"
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
@@ -871,22 +886,28 @@ spec:
               status:
                 namingStatus: invalid-unresolved-tokens
         # ACK UserPool must NOT be created (includeWhen gates it on valid naming).
-        # Poll for up to 30 s: kro may transiently create the UserPool when rsrcCfg
-        # status is still propagating and then delete it once the cache is fresh.
+        # Accepts Terminating state: if kro briefly created the pool before the cache
+        # updated and then fired the delete gate, the ACK finalizer will hold the
+        # resource in Terminating without a live ACK controller — that still proves
+        # the gate is working correctly.
         - script:
             timeout: 30s
             content: |
               for i in $(seq 1 15); do
-                COUNT=$(kubectl get userpool -n cognitouserpool --field-selector=metadata.name=ac19-pool 2>/dev/null | grep -c ac19-pool || echo 0)
-                if [ "$COUNT" = "0" ]; then
-                  echo "PASS: ACK UserPool absent — invalid-naming gate is effective"
+                if ! kubectl get userpool ac19-pool -n cognitouserpool 2>/dev/null >/dev/null; then
+                  echo "PASS: ACK UserPool absent — gate is effective"
                   exit 0
                 fi
-                echo "Attempt $i: ACK UserPool still present, waiting 2s..."
+                DELETION_TS=$(kubectl get userpool ac19-pool -n cognitouserpool -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null)
+                if [ -n "$DELETION_TS" ]; then
+                  echo "PASS: ACK UserPool is Terminating — gate fired, awaiting ACK finalizer"
+                  exit 0
+                fi
+                echo "Attempt $i: ACK UserPool present (not Terminating), waiting 2s..."
                 sleep 2
               done
-              echo "FAIL: ACK UserPool still present after 30 s despite invalid naming"
-              kubectl get userpool -n cognitouserpool 2>/dev/null
+              echo "FAIL: ACK UserPool present and not Terminating after 30 s"
+              kubectl get userpool ac19-pool -n cognitouserpool -o json 2>/dev/null
               exit 1
 
     # AC-20: {tag.X} token resolved from mandatory.tags when tag exists.
