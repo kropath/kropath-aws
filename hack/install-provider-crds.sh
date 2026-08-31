@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb dsql rds sns sqs ssm secretsmanager eks ecr cloudwatch cloudwatchlogs elbv2 eventbridge autoscaling cloudfront ecs apigateway apigatewayv2 lambda kafka elasticache efs memorydb sfn acm acmpca glue athena route53 route53resolver}"
+ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb dsql rds sns sqs ssm secretsmanager eks ecr cloudwatch cloudwatchlogs elbv2 eventbridge autoscaling cloudfront ecs apigateway apigatewayv2 lambda kafka elasticache efs memorydb sfn acm acmpca glue athena route53 route53resolver cognitoidentityprovider}"
 SKIP_ACK="${SKIP_ACK:-false}"
 SKIP_KCC="${SKIP_KCC:-true}"
 SKIP_ASO="${SKIP_ASO:-true}"
@@ -35,8 +35,13 @@ ACK_NAMESPACE="ack-system"
 
 resolve_ack_chart_version() {
   local svc="$1"
-
-  curl -fsSL "https://api.github.com/repos/aws-controllers-k8s/${svc}-controller/releases/latest" \
+  local -a auth_args=()
+  # Use GITHUB_TOKEN when available (5000 req/hr vs 60/hr unauthenticated).
+  # In CI, this is set via the workflow env; locally, callers may export it.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  curl -fsSL "${auth_args[@]}" "https://api.github.com/repos/aws-controllers-k8s/${svc}-controller/releases/latest" \
     | jq -r '.tag_name | ltrimstr("v")'
 }
 
