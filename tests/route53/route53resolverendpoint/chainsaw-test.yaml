@@ -684,8 +684,9 @@ spec:
               [ "$RESOURCE_NAME" = "route53resolverendpoint-ac13-endpoint" ] || { echo "FAIL: expected status.resourceName=route53resolverendpoint-ac13-endpoint, got $RESOURCE_NAME"; exit 1; }
               echo "PASS: status.resourceName present; resolverEndpointID/hostVPCID populated by real AWS"
 
-    # AC13 — negative: fewer than 2 IP addresses rejected by Route53 Resolver API.
-    # In a local cluster without real ACK controllers, this documents the expected behavior.
+    # AC13 — negative: fewer than 2 IP addresses triggers advisory validationError.
+    # kro cannot enforce min-items on arrays at admission; enforcement is at the Route53 API layer.
+    # The RGD surfaces the constraint via an advisory ConfigMap (status.validationError pattern).
     - name: ac14-insufficient-ips
       try:
         - apply:
@@ -707,10 +708,9 @@ spec:
                 -p '{"status":{"effectiveConfig":{"mandatory":{"defaultTTL":0,"healthCheckRequestInterval":0,"healthCheckFailureThreshold":0,"resolverEndpointType":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"defaultTTL":300,"healthCheckRequestInterval":30,"healthCheckFailureThreshold":3,"resolverEndpointType":"IPV4","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
         - script:
             content: |
-              # Apply with only 1 IP address. Route53 Resolver requires at least 2.
-              # If a schema validation rule enforces this, the apply will be rejected (expected).
-              # If the CR is accepted, the Route53 API will reject it; this test will fail,
-              # indicating missing schema enforcement.
+              # Apply with only 1 IP address — kro admits the CR (no admission rejection for arrays).
+              # The RGD creates an advisory ConfigMap (ipAddressesMinError) that surfaces in
+              # status.validationError. The spec says enforcement is at the Route53 API layer.
               OUTPUT=$(kubectl apply -f - 2>&1 <<'MANIFEST'
               apiVersion: aws.kropath.run/v1alpha1
               kind: Route53ResolverEndpoint
@@ -728,6 +728,21 @@ spec:
               MANIFEST
               )
               echo "apply output: $OUTPUT"
-              echo "$OUTPUT" | grep -qiE "invalid|denied|forbidden|minimum|too few|at least" && { echo "PASS: 1-IP endpoint rejected at admission"; exit 0; }
-              echo "FAIL: 1-IP endpoint accepted — minimum-2-IP schema enforcement is missing"
+              # CR is admitted by kro (no schema-level rejection for array min-items).
+              # Advisory ConfigMap approach: check that status.validationError is populated.
+              for i in $(seq 1 15); do
+                VERR=$(kubectl get route53resolverendpoint ac14-badips -n route53resolverendpoint -o jsonpath='{.status.validationError}' 2>/dev/null)
+                if echo "$VERR" | grep -qi "ipAddresses\|at least 2\|minimum"; then
+                  echo "PASS: status.validationError set — '$VERR'"
+                  exit 0
+                fi
+                # Also check for the advisory ConfigMap directly
+                CM=$(kubectl get configmap ac14-badips-ipaddresses-min-error -n route53resolverendpoint 2>/dev/null)
+                if [ -n "$CM" ]; then
+                  echo "PASS: advisory ConfigMap ac14-badips-ipaddresses-min-error exists"
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "FAIL: neither status.validationError nor advisory ConfigMap found after 30s for 1-IP endpoint"
               exit 1
