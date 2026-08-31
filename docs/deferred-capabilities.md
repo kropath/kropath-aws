@@ -43,3 +43,39 @@ downstream effect until upstream support is added.
 
 **To unblock:** Either the ACK IAM User CRD gains a `groups` field, or the ACK IAM Group CRD
 gains a `users`/`usernames` field that lists member user ARNs. Re-open AC-6 when either lands.
+
+---
+
+## AWS SNS — `SNSTopic` (KRO-928)
+
+### Mixed delivery-feedback ARN configuration (partial ARN set)
+
+**Spec requirement:** When only some of the 10 ARN fields (5 protocols × `successFeedbackRoleArn`
+and `failureFeedbackRoleArn`) are configured, the RGD should omit the unconfigured ARN fields
+so that AWS SNS does not receive empty-string attribute values (which AWS rejects).
+
+**Blocking constraint:** kro v0.9.2 cannot conditionally omit scalar string fields from a
+template at render time. The `optional.none()` type is not supported in write position — kro's
+CEL type checker rejects any ternary whose branches are `string` and `optional_type(dyn)`:
+
+```
+# KRO-928 probe 4 result (2026-08-31):
+# Template field: ${conditionMet ? someString : optional.none()}
+# kro error: found no matching overload for '_?_:_' applied to
+#            '(bool, string, optional_type(dyn))'
+# RGD reaches Inactive; not usable.
+```
+
+The `omit-don't-empty` rule in `docs/frequent-rgd-errors.md` documents that empty-string
+ARN fields cause AWS to reject the SNS Topic API call. Field omission via `optional.none()` is
+the correct fix but is not achievable in kro v0.9.2.
+
+**Mitigation in place:** The RGD detects mixed-ARN configurations via the `hasMixedFeedbackARN`
+flag in the naming ConfigMap. When detected, an advisory `mixedFeedbackARNError` ConfigMap is
+created in-graph, no ACK Topic CR is rendered for the feedback variant, and the user receives a
+clear error message instructing them to configure all 10 ARN fields or none.
+
+**To unblock:** When kro supports `optional.none()` (or equivalent field-omission semantics) in
+template write position, remove the 12-variant template structure and replace with a single
+template using conditional field emission. Also remove the `mixedFeedbackARNError` ConfigMap and
+the `hasMixedFeedbackARN` flag from the naming ConfigMap.
