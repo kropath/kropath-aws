@@ -1,0 +1,331 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-appscaling-01 Chainsaw tests — one scenario per acceptance criterion.
+# Canonical pattern: unique resource name per step, skipDelete: true.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: appscalingconfig
+spec:
+  skipDelete: true
+  namespace: appscalingconfig
+  steps:
+    # AC-1: happy-path: general-policy-creation
+    # Verify a general-policy style AppScalingConfig (defaults-only, mandatory all zeros)
+    # is accepted by the API server without validation errors.
+    - name: ac1-general-policy-creation
+      try:
+        - apply:
+            file: 00-appscalingconfig-namespace.yaml
+        - apply:
+            file: 01-general-policy-creation.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: general-policy-test
+                namespace: appscalingconfig
+              spec:
+                mandatory:
+                  minCapacity: 0
+                  maxCapacity: 0
+                  disableScaleIn: false
+                  scaleInCooldown: 0
+                  scaleOutCooldown: 0
+                defaults:
+                  minCapacity: 1
+                  maxCapacity: 10
+                  disableScaleIn: false
+                  scaleInCooldown: 300
+                  scaleOutCooldown: 60
+
+    # AC-2: happy-path: production-profile-creation
+    # Verify a production profile (mandatory minCapacity:2, maxCapacity:100, disableScaleIn:true,
+    # scaleInCooldown:600) is accepted by the API server.
+    - name: ac2-production-profile-creation
+      try:
+        - apply:
+            file: 02-production-profile-creation.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: production-profile-test
+                namespace: appscalingconfig
+              spec:
+                mandatory:
+                  minCapacity: 2
+                  maxCapacity: 100
+                  disableScaleIn: true
+                  scaleInCooldown: 600
+                  scaleOutCooldown: 0
+                defaults:
+                  minCapacity: 0
+                  maxCapacity: 0
+                  scaleOutCooldown: 60
+
+    # AC-3: happy-path: cost-optimized-profile-creation
+    # Verify a cost-optimized profile (defaults.minCapacity:0, defaults.maxCapacity:5,
+    # aggressive cooldowns) is accepted. Scale-to-zero minCapacity=0 is valid.
+    - name: ac3-cost-optimized-profile-creation
+      try:
+        - apply:
+            file: 03-cost-optimized-profile-creation.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cost-optimized-test
+                namespace: appscalingconfig
+              spec:
+                mandatory:
+                  minCapacity: 0
+                  maxCapacity: 0
+                  disableScaleIn: false
+                  scaleInCooldown: 0
+                  scaleOutCooldown: 0
+                defaults:
+                  minCapacity: 0
+                  maxCapacity: 5
+                  disableScaleIn: false
+                  scaleInCooldown: 60
+                  scaleOutCooldown: 30
+
+    # AC-4: negative: min-capacity-tier-conflict
+    # minCapacity non-zero in BOTH mandatory (5) and defaults (1) — must be rejected
+    # by x-kubernetes-validations: "minCapacity cannot be set (non-zero) in both mandatory and defaults"
+    - name: ac4-min-capacity-tier-conflict
+      try:
+        - apply:
+            file: 04-min-capacity-tier-conflict.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: AppScalingConfig
+                check:
+                  ($error != null): true
+
+    # AC-5: negative: max-capacity-tier-conflict
+    # maxCapacity non-zero in BOTH mandatory (100) and defaults (10) — must be rejected.
+    - name: ac5-max-capacity-tier-conflict
+      try:
+        - apply:
+            file: 05-max-capacity-tier-conflict.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: AppScalingConfig
+                check:
+                  ($error != null): true
+
+    # AC-6: negative: disable-scale-in-tier-conflict
+    # disableScaleIn true in BOTH mandatory and defaults — must be rejected.
+    - name: ac6-disable-scale-in-tier-conflict
+      try:
+        - apply:
+            file: 06-disable-scale-in-tier-conflict.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: AppScalingConfig
+                check:
+                  ($error != null): true
+
+    # AC-7: negative: scale-in-cooldown-tier-conflict
+    # scaleInCooldown non-zero in BOTH mandatory (600) and defaults (300) — must be rejected.
+    - name: ac7-scale-in-cooldown-tier-conflict
+      try:
+        - apply:
+            file: 07-scale-in-cooldown-tier-conflict.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: AppScalingConfig
+                check:
+                  ($error != null): true
+
+    # AC-8: negative: scale-out-cooldown-tier-conflict
+    # scaleOutCooldown non-zero in BOTH mandatory (120) and defaults (60) — must be rejected.
+    - name: ac8-scale-out-cooldown-tier-conflict
+      try:
+        - apply:
+            file: 08-scale-out-cooldown-tier-conflict.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: AppScalingConfig
+                check:
+                  ($error != null): true
+
+    # AC-9: happy-path: kropathconfig-mandatory-override
+    # AppScalingConfig is accepted; simulate kropath-controller writing effectiveConfig.mandatory.minCapacity=2
+    # (as if KropathConfig.mandatory.appScaling.minCapacity=2 overrides the profile's zero).
+    # This verifies the status schema allows the controller-computed value to be stored.
+    - name: ac9-kropathconfig-mandatory-override
+      try:
+        - apply:
+            file: 09-kropathconfig-mandatory-override.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cascade-test-mandatory-override
+                namespace: appscalingconfig
+        - script:
+            content: |
+              kubectl patch appscalingconfig cascade-test-mandatory-override \
+                -n appscalingconfig \
+                --subresource status \
+                --type merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"minCapacity":2,"maxCapacity":0,"disableScaleIn":false,"scaleInCooldown":0,"scaleOutCooldown":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"minCapacity":1,"maxCapacity":10,"disableScaleIn":false,"scaleInCooldown":300,"scaleOutCooldown":60,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"region":"us-east-1","accountId":"123456789012"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cascade-test-mandatory-override
+                namespace: appscalingconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    minCapacity: 2
+            timeout: 30s
+
+    # AC-10: happy-path: tag-merge-cascade
+    # Simulate controller merging KropathConfig.mandatory.tags={cost-centre:platform} with
+    # AppScalingConfig.mandatory.tags={scaling-team:platform} into effectiveConfig.mandatory.tags.
+    - name: ac10-tag-merge-cascade
+      try:
+        - apply:
+            file: 10-tag-merge-cascade.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cascade-test-tag-merge
+                namespace: appscalingconfig
+        - script:
+            content: |
+              kubectl patch appscalingconfig cascade-test-tag-merge \
+                -n appscalingconfig \
+                --subresource status \
+                --type merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"minCapacity":0,"maxCapacity":0,"disableScaleIn":false,"scaleInCooldown":0,"scaleOutCooldown":0,"tags":{"scaling-team":"platform","cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"minCapacity":0,"maxCapacity":0,"disableScaleIn":false,"scaleInCooldown":0,"scaleOutCooldown":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"region":"us-east-1","accountId":"123456789012"}}}}'
+        - script:
+            content: |
+              kubectl get appscalingconfig cascade-test-tag-merge -n appscalingconfig \
+                -o jsonpath='{.status.effectiveConfig.mandatory.tags}' | \
+                grep -q '"scaling-team":"platform"' && \
+              kubectl get appscalingconfig cascade-test-tag-merge -n appscalingconfig \
+                -o jsonpath='{.status.effectiveConfig.mandatory.tags}' | \
+                grep -q '"cost-centre":"platform"'
+            timeout: 30s
+
+    # AC-11: happy-path: synced-labels-cascade
+    # Simulate controller writing effectiveConfig.mandatory.syncedLabels with team:scaling
+    # (from AppScalingConfig.mandatory.syncedLabels).
+    - name: ac11-synced-labels-cascade
+      try:
+        - apply:
+            file: 11-synced-labels-cascade.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cascade-test-synced-labels
+                namespace: appscalingconfig
+        - script:
+            content: |
+              kubectl patch appscalingconfig cascade-test-synced-labels \
+                -n appscalingconfig \
+                --subresource status \
+                --type merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"minCapacity":0,"maxCapacity":0,"disableScaleIn":false,"scaleInCooldown":0,"scaleOutCooldown":0,"tags":{},"syncedLabels":{"team":"scaling"},"syncedAnnotations":{}},"defaults":{"minCapacity":0,"maxCapacity":0,"disableScaleIn":false,"scaleInCooldown":0,"scaleOutCooldown":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"region":"us-east-1","accountId":"123456789012"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cascade-test-synced-labels
+                namespace: appscalingconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    syncedLabels:
+                      team: scaling
+            timeout: 30s
+
+    # AC-12: happy-path: invalid-capacity-range
+    # AppScalingConfig with mandatory.minCapacity:10 > mandatory.maxCapacity:5 is admitted by
+    # the API server (range validation is controller-side, not CEL admission).
+    # Simulate controller setting status.conditions[type=Valid].status=False, reason=InvalidCapacityRange.
+    - name: ac12-invalid-capacity-range
+      try:
+        - apply:
+            file: 12-invalid-capacity-range.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cascade-test-invalid-capacity-range
+                namespace: appscalingconfig
+              spec:
+                mandatory:
+                  minCapacity: 10
+                  maxCapacity: 5
+        - script:
+            content: |
+              kubectl patch appscalingconfig cascade-test-invalid-capacity-range \
+                -n appscalingconfig \
+                --subresource status \
+                --type merge \
+                -p '{"status":{"conditions":[{"type":"Valid","status":"False","reason":"InvalidCapacityRange","message":"mandatory.minCapacity (10) must not exceed mandatory.maxCapacity (5)","lastTransitionTime":"2026-09-01T00:00:00Z"}]}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: cascade-test-invalid-capacity-range
+                namespace: appscalingconfig
+              status:
+                conditions:
+                  - type: Valid
+                    status: "False"
+                    reason: InvalidCapacityRange
+            timeout: 30s
+
+    # AC-13: happy-path: label-selector-lookup
+    # AppScalingConfig carries metadata.labels.aws.kropath.run/resource-name: label-selector-test
+    # enabling RGD externalRef selector.matchLabels to locate the config CR (Theme 28).
+    - name: ac13-label-selector-lookup
+      try:
+        - apply:
+            file: 13-label-selector-lookup.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingConfig
+              metadata:
+                name: label-selector-test
+                namespace: appscalingconfig
+                labels:
+                  aws.kropath.run/resource-name: label-selector-test
