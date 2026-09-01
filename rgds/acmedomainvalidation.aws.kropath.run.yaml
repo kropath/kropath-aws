@@ -47,9 +47,13 @@ spec:
       hostedZoneID: string | default=""
     status:
       conditions: >-
-        ${ackDomainValidation.?status.?conditions.orValue([])}
+        ${ackDomainValidationWithEndpoint.?status.?conditions.orValue([])}
+      noEndpointConditions: >-
+        ${ackDomainValidationNoEndpoint.?status.?conditions.orValue([])}
       validationStatus: >-
-        ${ackDomainValidation.?status.?status.orValue("")}
+        ${ackDomainValidationWithEndpoint.?status.?status.orValue("") != ""
+          ? ackDomainValidationWithEndpoint.status.status
+          : ackDomainValidationNoEndpoint.?status.?status.orValue("")}
       endpointArnAndRefError: >-
         ${has(endpointArnAndRefError.data) ? endpointArnAndRefError.data.error : ""}
       missingEndpointError: >-
@@ -131,11 +135,15 @@ spec:
           error: "one of acmeEndpointARN or acmeEndpointRef is required"
 
     # ACK AcmeDomainValidation CR — only when validations pass.
-    - id: ackDomainValidation
+    - id: ackDomainValidationWithEndpoint
       includeWhen:
         - >-
           ${!(schema.spec.acmeEndpointARN != "" && schema.spec.acmeEndpointRef != "")
             && !(schema.spec.acmeEndpointARN == "" && schema.spec.acmeEndpointRef == "")}
+        - >-
+          ${schema.spec.acmeEndpointARN != ""
+            || (acmeEndpointRefCr.size() > 0
+                && acmeEndpointRefCr[0].?status.?acmeEndpointARN.orValue("") != "")}
       template:
         apiVersion: acm.services.k8s.aws/v1alpha1
         kind: AcmeDomainValidation
@@ -179,6 +187,56 @@ spec:
               : (acmeEndpointRefCr.size() > 0
                   ? acmeEndpointRefCr[0].status.acmeEndpointARN
                   : "")}
+          prevalidationOptions: >-
+            ${has(schema.spec.dnsPrevalidationEnabled) && schema.spec.dnsPrevalidationEnabled
+              ? {"dnsPrevalidation": {"hostedZoneID": schema.spec.hostedZoneID, "domainScope": {"exactDomain": schema.spec.dnsPrevalidationExactDomain, "subdomains": has(schema.spec.dnsPrevalidationSubdomains) && schema.spec.dnsPrevalidationSubdomains, "wildcards": has(schema.spec.dnsPrevalidationWildcards) && schema.spec.dnsPrevalidationWildcards}}}
+              : {}}
+    - id: ackDomainValidationNoEndpoint
+      includeWhen:
+        - >-
+          ${!(schema.spec.acmeEndpointARN != "" && schema.spec.acmeEndpointRef != "")
+            && !(schema.spec.acmeEndpointARN == "" && schema.spec.acmeEndpointRef == "")}
+        - >-
+          ${schema.spec.acmeEndpointARN == ""
+            && (acmeEndpointRefCr.size() == 0
+                || acmeEndpointRefCr[0].?status.?acmeEndpointARN.orValue("") == "")}
+      template:
+        apiVersion: acm.services.k8s.aws/v1alpha1
+        kind: AcmeDomainValidation
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMEDomainValidation
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          domainName: "${schema.spec.domainName}"
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
           prevalidationOptions: >-
             ${has(schema.spec.dnsPrevalidationEnabled) && schema.spec.dnsPrevalidationEnabled
               ? {"dnsPrevalidation": {"hostedZoneID": schema.spec.hostedZoneID, "domainScope": {"exactDomain": schema.spec.dnsPrevalidationExactDomain, "subdomains": has(schema.spec.dnsPrevalidationSubdomains) && schema.spec.dnsPrevalidationSubdomains, "wildcards": has(schema.spec.dnsPrevalidationWildcards) && schema.spec.dnsPrevalidationWildcards}}}

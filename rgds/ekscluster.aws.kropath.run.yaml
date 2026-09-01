@@ -92,11 +92,17 @@ spec:
           ? "arn:aws:eks:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":cluster/" + naming.data.effectiveName
           : ""}
       clusterEndpoint: >-
-        ${ackCluster.?status.?endpoint.orValue("")}
+        ${ackClusterWithVersion.?status.?endpoint.orValue("") != ""
+          ? ackClusterWithVersion.status.endpoint
+          : ackClusterNoVersion.?status.?endpoint.orValue("")}
       clusterCertificateAuthority: >-
-        ${ackCluster.?status.?certificateAuthority.?data.orValue("")}
+        ${ackClusterWithVersion.?status.?certificateAuthority.?data.orValue("") != ""
+          ? ackClusterWithVersion.status.certificateAuthority.data
+          : ackClusterNoVersion.?status.?certificateAuthority.?data.orValue("")}
       conditions: >-
-        ${ackCluster.?status.?conditions.orValue([])}
+        ${ackClusterWithVersion.?status.?conditions.orValue([])}
+      noVersionConditions: >-
+        ${ackClusterNoVersion.?status.?conditions.orValue([])}
     additionalPrinterColumns:
       - name: ResourceName
         type: string
@@ -220,7 +226,12 @@ spec:
 
     # ACK EKS Cluster CR — primary cloud resource.
     # Only created when namingStatus is valid (effectiveName has no unresolved tokens).
-    - id: ackCluster
+    - id: ackClusterWithVersion
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?version.orValue("") != "")
+            || schema.spec.version != ""
+            || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?version.orValue("") != "")}
       includeWhen:
         - '${!naming.data.effectiveName.contains("{")}'
       template:
@@ -258,6 +269,125 @@ spec:
               : (schema.spec.version != ""
                   ? schema.spec.version
                   : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?version.orValue("") : ""))}
+          # VPC configuration — subnet IDs and security groups are instance-only passthrough.
+          # Endpoint access booleans are governed: mandatory → instance → defaults (nil=unset=fall through).
+          resourcesVPCConfig:
+            subnetIDs: ${schema.spec.resourcesVPCConfig.subnetIds}
+            securityGroupIDs: ${schema.spec.resourcesVPCConfig.securityGroupIds}
+            publicAccessCIDRs: ${schema.spec.resourcesVPCConfig.publicAccessCidrs}
+            # Endpoint boolean governance: mandatory tier overrides instance.
+            # Schema fields are kro-typed as bool (non-nullable), so null-check only
+            # works on effectiveConfig (dynamic). Instance default=true matches AC-19.
+            endpointPublicAccess: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?endpointPublicAccess.orValue(false)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointPublicAccess
+                : schema.spec.resourcesVPCConfig.endpointPublicAccess}
+            endpointPrivateAccess: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?endpointPrivateAccess.orValue(false)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointPrivateAccess
+                : schema.spec.resourcesVPCConfig.endpointPrivateAccess}
+          # Access configuration — authenticationMode governed; bootstrapClusterCreatorAdminPermissions instance-only.
+          accessConfig:
+            # Three-tier cascade: mandatory → instance → defaults; built-in fallback "API".
+            # EKSConfig CRD stores authenticationMode as a flat field (not nested under accessConfig).
+            authenticationMode: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?authenticationMode.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.authenticationMode
+                : (schema.spec.accessConfig.authenticationMode != ""
+                    ? schema.spec.accessConfig.authenticationMode
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?authenticationMode.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.authenticationMode
+                        : "API"))}
+            # Instance-only passthrough — default true (cluster creator gets admin access).
+            bootstrapClusterCreatorAdminPermissions: ${schema.spec.accessConfig.bootstrapClusterCreatorAdminPermissions}
+          # KMS encryption — conditional list: non-empty keyArn → [{provider: {keyARN:...}, resources: ["secrets"]}], empty → [].
+          # Three-tier cascade for key resolution: mandatory → instance → defaults.
+          # EKSConfig CRD stores this as flat field encryptionKeyArn (not nested under encryptionConfig).
+          encryptionConfig: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionKeyArn.orValue("") != ""
+              ? [{"provider": {"keyARN": rsrcCfg[0].status.effectiveConfig.mandatory.encryptionKeyArn}, "resources": ["secrets"]}]
+              : (schema.spec.encryptionConfig.keyArn != ""
+                  ? [{"provider": {"keyARN": schema.spec.encryptionConfig.keyArn}, "resources": ["secrets"]}]
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionKeyArn.orValue("") != ""
+                      ? [{"provider": {"keyARN": rsrcCfg[0].status.effectiveConfig.defaults.encryptionKeyArn}, "resources": ["secrets"]}]
+                      : []))}
+          # Control plane logging — conditional list: non-empty types → [{enabled: true, types: [...]}], empty → [].
+          # Three-tier cascade for types resolution: mandatory → instance → defaults.
+          # EKSConfig CRD stores this as flat field loggingTypes (not nested under logging).
+          logging:
+            clusterLogging: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingTypes.orValue([]).size() > 0
+                ? [{"enabled": true, "types": rsrcCfg[0].status.effectiveConfig.mandatory.loggingTypes}]
+                : (schema.spec.logging.types.size() > 0
+                    ? [{"enabled": true, "types": schema.spec.logging.types}]
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?loggingTypes.orValue([]).size() > 0
+                        ? [{"enabled": true, "types": rsrcCfg[0].status.effectiveConfig.defaults.loggingTypes}]
+                        : []))}
+          # Kubernetes service network configuration — instance-only passthrough.
+          kubernetesNetworkConfig:
+            serviceIPv4CIDR: ${schema.spec.kubernetesNetworkConfig.serviceIpv4Cidr}
+            ipFamily: ${schema.spec.kubernetesNetworkConfig.ipFamily}
+          # Upgrade support policy — three-tier cascade: mandatory → instance → defaults; built-in fallback "STANDARD".
+          # EKSConfig CRD stores this as flat field supportType (not nested under upgradePolicy).
+          upgradePolicy:
+            supportType: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?supportType.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.supportType
+                : (schema.spec.upgradePolicy.supportType != ""
+                    ? schema.spec.upgradePolicy.supportType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?supportType.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.supportType
+                        : "STANDARD"))}
+          # Deletion protection — instance-only passthrough; default false.
+          deletionProtection: ${schema.spec.deletionProtection}
+          # Cloud resource tags — direct map<string,string> passthrough (same format as CloudWatch Logs).
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+    - id: ackClusterNoVersion
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?version.orValue("") == "")
+            && schema.spec.version == ""
+            && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?version.orValue("") == "")}
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: eks.services.k8s.aws/v1alpha1
+        kind: Cluster
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EKSCluster
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cluster name — immutable; derived from naming cascade.
+          name: ${naming.data.effectiveName}
+          # IAM role for the cluster control plane.
+          roleARN: ${schema.spec.roleArn}
           # VPC configuration — subnet IDs and security groups are instance-only passthrough.
           # Endpoint access booleans are governed: mandatory → instance → defaults (nil=unset=fall through).
           resourcesVPCConfig:

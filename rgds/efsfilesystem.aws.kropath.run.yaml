@@ -70,13 +70,21 @@ spec:
 
     status:
       fileSystemId: >-
-        ${ackFileSystem.?status.?fileSystemID.orValue("")}
+        ${ackFileSystemWithKms.?status.?fileSystemID.orValue("") != ""
+          ? ackFileSystemWithKms.status.fileSystemID
+          : ackFileSystemNoKms.?status.?fileSystemID.orValue("")}
       fileSystemArn: >-
-        ${ackFileSystem.?status.?ackResourceMetadata.?arn.orValue("")}
+        ${ackFileSystemWithKms.?status.?ackResourceMetadata.?arn.orValue("") != ""
+          ? ackFileSystemWithKms.status.ackResourceMetadata.arn
+          : ackFileSystemNoKms.?status.?ackResourceMetadata.?arn.orValue("")}
       lifeCycleState: >-
-        ${ackFileSystem.?status.?lifeCycleState.orValue("")}
+        ${ackFileSystemWithKms.?status.?lifeCycleState.orValue("") != ""
+          ? ackFileSystemWithKms.status.lifeCycleState
+          : ackFileSystemNoKms.?status.?lifeCycleState.orValue("")}
       conditions: >-
-        ${ackFileSystem.?status.?conditions.orValue([])}
+        ${ackFileSystemWithKms.?status.?conditions.orValue([])}
+      noKmsConditions: >-
+        ${ackFileSystemNoKms.?status.?conditions.orValue([])}
 
     additionalPrinterColumns:
       - name: FileSystemId
@@ -101,7 +109,12 @@ spec:
               aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
 
     # ACK EFS FileSystem CR — primary cloud resource.
-    - id: ackFileSystem
+    - id: ackFileSystemWithKms
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyId.orValue("") != "")
+            || schema.spec.kmsKeyId != ""
+            || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyId.orValue("") != "")}
       template:
         apiVersion: efs.services.k8s.aws/v1alpha1
         kind: FileSystem
@@ -146,6 +159,142 @@ spec:
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)
                       ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyId.orValue("")
                       : ""))}
+          # performanceMode: mandatory → instance → defaults → "generalPurpose"
+          performanceMode: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?performanceMode.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.performanceMode
+              : (schema.spec.performanceMode != ""
+                  ? schema.spec.performanceMode
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?performanceMode.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.performanceMode
+                      : "generalPurpose"))}
+          # throughputMode: mandatory → instance → defaults → "elastic"
+          throughputMode: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?throughputMode.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.throughputMode
+              : (schema.spec.throughputMode != ""
+                  ? schema.spec.throughputMode
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?throughputMode.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.throughputMode
+                      : "elastic"))}
+          # provisionedThroughputInMiBps: pass through (0 = not applicable)
+          provisionedThroughputInMiBps: ${schema.spec.provisionedThroughputInMiBps}
+          # backup: mandatory → instance (has()) → defaults → false
+          backup: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.backupEnabled) && rsrcCfg[0].status.effectiveConfig.mandatory.backupEnabled)
+              ? true
+              : (has(schema.spec.backupEnabled)
+                  ? schema.spec.backupEnabled
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.backupEnabled)
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.backupEnabled
+                      : false))}
+          # availabilityZoneName: pass through (empty = Regional multi-AZ)
+          availabilityZoneName: ${schema.spec.availabilityZoneName}
+          # policy: pass through (empty = no policy)
+          policy: ${schema.spec.policy}
+          # fileSystemProtection.replicationOverwriteProtection: mandatory → instance → defaults → "ENABLED"
+          fileSystemProtection:
+            replicationOverwriteProtection: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?replicationOverwriteProtection.orValue("") != "")
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.replicationOverwriteProtection
+                : (schema.spec.replicationOverwriteProtection != ""
+                    ? schema.spec.replicationOverwriteProtection
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?replicationOverwriteProtection.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.replicationOverwriteProtection
+                        : "ENABLED"))}
+          # lifecyclePolicies: reconstruct array from three flat resolved fields.
+          # Each entry is a single-key object (ACK requirement). Empty string = omit that entry.
+          # Resolved inline from cascade: mandatory → instance → defaults.
+          # Uses list concatenation (+) rather than null-filtering (kro strict type alignment).
+          lifecyclePolicies: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?transitionToIA.orValue("") != "")
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.transitionToIA
+                : (schema.spec.transitionToIA != ""
+                    ? schema.spec.transitionToIA
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?transitionToIA.orValue("")
+                        : ""))) != ""
+              ? [{"transitionToIA": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?transitionToIA.orValue("") != "") ? rsrcCfg[0].status.effectiveConfig.mandatory.transitionToIA : (schema.spec.transitionToIA != "" ? schema.spec.transitionToIA : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?transitionToIA.orValue("") : ""))}]
+              : [])
+            + (((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?transitionToArchive.orValue("") != "")
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.transitionToArchive
+                : (schema.spec.transitionToArchive != ""
+                    ? schema.spec.transitionToArchive
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?transitionToArchive.orValue("")
+                        : ""))) != ""
+              ? [{"transitionToArchive": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?transitionToArchive.orValue("") != "") ? rsrcCfg[0].status.effectiveConfig.mandatory.transitionToArchive : (schema.spec.transitionToArchive != "" ? schema.spec.transitionToArchive : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?transitionToArchive.orValue("") : ""))}]
+              : [])
+            + (((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?transitionToPrimaryStorage.orValue("") != "")
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.transitionToPrimaryStorage
+                : (schema.spec.transitionToPrimaryStorage != ""
+                    ? schema.spec.transitionToPrimaryStorage
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?transitionToPrimaryStorage.orValue("")
+                        : ""))) != ""
+              ? [{"transitionToPrimaryStorageClass": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?transitionToPrimaryStorage.orValue("") != "") ? rsrcCfg[0].status.effectiveConfig.mandatory.transitionToPrimaryStorage : (schema.spec.transitionToPrimaryStorage != "" ? schema.spec.transitionToPrimaryStorage : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?transitionToPrimaryStorage.orValue("") : ""))}]
+              : [])}
+          # replicationConfiguration: wrap single spec object in array when region is set.
+          replicationConfiguration: >-
+            ${schema.spec.replicationConfiguration.region != ""
+              ? [{"region": schema.spec.replicationConfiguration.region, "availabilityZoneName": schema.spec.replicationConfiguration.availabilityZoneName, "kmsKeyID": schema.spec.replicationConfiguration.kmsKeyId}]
+              : []}
+          # tags: merge order defaults → spec → mandatory (mandatory wins on key conflict).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          # .merge() + .transformList() — never + on pre-transformed lists (breaks mandatory-wins).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+    - id: ackFileSystemNoKms
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyId.orValue("") == "")
+            && schema.spec.kmsKeyId == ""
+            && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyId.orValue("") == "")}
+      template:
+        apiVersion: efs.services.k8s.aws/v1alpha1
+        kind: FileSystem
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: EFSFileSystem
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # encrypted: mandatory → instance (has() detects explicit set) → defaults → false
+          # Note: kro v0.9.2 strips zero-value booleans; explicit false is indistinguishable from
+          # unset at admission time. has() works correctly for non-zero values (true).
+          encrypted: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.encrypted) && rsrcCfg[0].status.effectiveConfig.mandatory.encrypted)
+              ? true
+              : (has(schema.spec.encrypted)
+                  ? schema.spec.encrypted
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.encrypted)
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.encrypted
+                      : false))}
           # performanceMode: mandatory → instance → defaults → "generalPurpose"
           performanceMode: >-
             ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?performanceMode.orValue("") != "")
