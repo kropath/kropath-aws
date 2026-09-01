@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb dsql rds sns sqs ssm secretsmanager eks ecr cloudwatch cloudwatchlogs elbv2 eventbridge autoscaling cloudfront ecs apigateway apigatewayv2 lambda kafka elasticache efs memorydb sfn acm acmpca glue athena route53 route53resolver cognitoidentityprovider kinesis}"
+ACK_SERVICES="${ACK_SERVICES:-s3 iam kms ec2 dynamodb dsql rds sns sqs ssm secretsmanager eks ecr cloudwatch cloudwatchlogs elbv2 eventbridge autoscaling cloudfront ecs apigateway apigatewayv2 lambda kafka elasticache efs memorydb sfn acm acmpca glue athena route53 route53resolver cognitoidentityprovider kinesis cloudtrail}"
 SKIP_ACK="${SKIP_ACK:-false}"
 SKIP_KCC="${SKIP_KCC:-true}"
 SKIP_ASO="${SKIP_ASO:-true}"
