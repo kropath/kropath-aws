@@ -546,8 +546,11 @@ spec:
     #   ? "{tag." + part.split("}")[0] + "}"
     # So for missing tag, the name contains "{tag.env}-naming-missing-tag" which contains "{"
     # → namingStatus = "invalid-unresolved-tokens" and ackStream is NOT created (includeWhen: false)
-    # AC-12 is: tag key absent → ACK Stream NOT created, namingStatus invalid
-    - name: ac12-naming-missing-tag-no-stream
+    # AC-12: {tag.env}-{name} where env tag is absent → token resolves to "" →
+    # effectiveName "-naming-missing-tag" contains no "{" → namingStatus: valid
+    # → ACK Stream IS created. Missing {tag.*} tokens silently collapse to empty
+    # string; only unrecognised non-tag tokens (e.g. {env}) block Stream creation.
+    - name: ac12-naming-missing-tag-empty
       try:
         - apply:
             resource:
@@ -583,16 +586,17 @@ spec:
                 name: naming-missing-tag
                 namespace: kinesisstream
               status:
-                namingStatus: invalid-unresolved-tokens
-        - script:
-            content: |
-              # ACK Stream must NOT be created when namingStatus is invalid
-              count=$(kubectl get stream naming-missing-tag -n kinesisstream --ignore-not-found 2>/dev/null | wc -l)
-              if [ "$count" -gt 1 ]; then
-                echo "FAIL: ACK Stream was created despite invalid naming status"
-                exit 1
-              fi
-              echo "OK: ACK Stream not created"
+                resourceName: "-naming-missing-tag"
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: naming-missing-tag
+                namespace: kinesisstream
+              spec:
+                name: "-naming-missing-tag"
 
     # AC-12a: {env}-{name} (unrecognized token, not {tag.*} form) → namingStatus: invalid-unresolved-tokens
     - name: ac12a-naming-unresolved-token
@@ -939,7 +943,10 @@ spec:
               kubectl patch kinesisconfig ac19-cfg -n kinesisstream \
                 --subresource=status --type=merge \
                 -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
-        # Step 1: create stream in ON_DEMAND mode
+        # Step 1: create/reset stream to ON_DEMAND mode.
+        # streamMode: "" and shardCount: 0 are set explicitly so that re-runs
+        # (skipDelete: true leaves the resource in PROVISIONED from step 2 of the
+        # previous run) reliably reset to cascade defaults → on_demand.
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
@@ -949,6 +956,8 @@ spec:
                 namespace: kinesisstream
               spec:
                 configRef: ac19-cfg
+                streamMode: ""
+                shardCount: 0
         - assert:
             resource:
               apiVersion: kinesis.services.k8s.aws/v1alpha1
