@@ -1,0 +1,611 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ssmresourcedatasync
+spec:
+  namespace: ssmresourcedatasync
+  skipDelete: true
+  steps:
+    # ─── Purge stale leftovers from prior runs ───────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              kubectl delete ssmresourcedatasyncs --all -n ssmresourcedatasync --ignore-not-found=true --timeout=30s || true
+              kubectl delete ssmconfig --all -n ssmresourcedatasync --ignore-not-found=true --timeout=30s || true
+              kubectl delete configmap -l aws.kropath.run/kropath-type=ssmresourcedatasync-naming -n ssmresourcedatasync --ignore-not-found=true --timeout=30s || true
+
+    # ─── AC-1: Defaults-only — default namingTemplate "{namespace}-{name}" ──
+    - name: ac1-defaults-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac1-defaults
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-ssm-bucket
+                  region: ap-southeast-2
+                  syncFormat: JsonSerDe
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac1-defaults
+                namespace: ssmresourcedatasync
+              status:
+                resourceName: ssmresourcedatasync-ac1-defaults
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac1-defaults
+                namespace: ssmresourcedatasync
+              spec:
+                syncName: ssmresourcedatasync-ac1-defaults
+                syncType: SyncToDestination
+
+    # ─── AC-2: Mandatory namingTemplate overrides defaults ───────────────────
+    - name: ac2-mandatory-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"mand-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac2-mand-naming
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac2-mand-naming
+                namespace: ssmresourcedatasync
+              status:
+                resourceName: mand-ac2-mand-naming
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac2-mand-naming
+                namespace: ssmresourcedatasync
+              spec:
+                syncName: mand-ac2-mand-naming
+
+    # ─── AC-3: Tags merge order — mandatory > instance spec > defaults ────────
+    - name: ac3-tags-merge-order
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"env":"prod","shared":"mand-wins"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{"env":"dev","default-only":"yes"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac3-tags
+                namespace: ssmresourcedatasync
+              spec:
+                tags:
+                  shared: instance-wins
+                  instance-only: "yes"
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac3-tags
+                namespace: ssmresourcedatasync
+              status:
+                resourceName: ssmresourcedatasync-ac3-tags
+                namingStatus: valid
+        # Verify no cloud tags on ACK CR (ResourceDataSync has no spec.tags)
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac3-tags
+                namespace: ssmresourcedatasync
+              spec:
+                syncName: ssmresourcedatasync-ac3-tags
+
+    # ─── AC-4: syncedLabels propagate to ACK CR metadata.labels ─────────────
+    - name: ac4-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{"team":"platform"},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{"env":"staging"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac4-labels
+                namespace: ssmresourcedatasync
+              spec:
+                syncedLabels:
+                  app: my-app
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac4-labels
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/team: platform
+                  aws.kropath.run/app: my-app
+                  aws.kropath.run/env: staging
+
+    # ─── AC-5: syncedAnnotations propagate to ACK CR metadata.annotations ───
+    - name: ac5-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"costcenter":"platform-ops"}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{"project":"ssm"}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac5-annotations
+                namespace: ssmresourcedatasync
+              spec:
+                syncedAnnotations:
+                  owner: team-a
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac5-annotations
+                namespace: ssmresourcedatasync
+                annotations:
+                  aws.kropath.run/costcenter: platform-ops
+                  aws.kropath.run/owner: team-a
+                  aws.kropath.run/project: ssm
+
+    # ─── AC-6: nameOverride takes precedence over namingTemplate ─────────────
+    - name: ac6-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"mand-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac6-override
+                namespace: ssmresourcedatasync
+              spec:
+                nameOverride: explicit-sync-name
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac6-override
+                namespace: ssmresourcedatasync
+              status:
+                resourceName: explicit-sync-name
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac6-override
+                namespace: ssmresourcedatasync
+              spec:
+                syncName: explicit-sync-name
+
+    # ─── AC-7: deletionPolicy=delete wired to ACK annotation ─────────────────
+    - name: ac7-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac7-delete-policy
+                namespace: ssmresourcedatasync
+              spec:
+                deletionPolicy: delete
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac7-delete-policy
+                namespace: ssmresourcedatasync
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ─── AC-8: Unresolved naming token — ackResourceDataSync NOT created ──────
+    - name: ac8-unresolved-token-blocks-ack-cr
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"{tag.missing-tag}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac8-unresolved
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac8-unresolved
+                namespace: ssmresourcedatasync
+              status:
+                namingStatus: invalid-unresolved-tokens
+        # Verify the ACK CR was NOT created
+        - script:
+            content: |
+              count=$(kubectl get resourcedatasyncs -n ssmresourcedatasync \
+                --field-selector metadata.name=ac8-unresolved \
+                --ignore-not-found -o name 2>/dev/null | wc -l | tr -d ' ')
+              [ "$count" = "0" ] && echo "PASS: ACK CR not created" || (echo "FAIL: ACK CR was created unexpectedly"; exit 1)
+
+    # ─── AC-9: syncType=SyncToDestination — s3Destination wired ─────────────
+    - name: ac9-sync-to-destination
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac9-to-dest
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-compliance-bucket
+                  region: ap-southeast-2
+                  syncFormat: JsonSerDe
+                  prefix: ssm-data/
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac9-to-dest
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-compliance-bucket
+                  region: ap-southeast-2
+                  syncFormat: JsonSerDe
+                  prefix: ssm-data/
+
+    # ─── AC-10: syncType=SyncFromSource — syncSource wired ───────────────────
+    - name: ac10-sync-from-source
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac10-from-source
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncFromSource
+                syncSource:
+                  sourceType: SingleAccountMultiRegions
+                  sourceRegions:
+                    - ap-southeast-2
+                    - us-east-1
+                  includeFutureRegions: false
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac10-from-source
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncFromSource
+                syncSource:
+                  sourceType: SingleAccountMultiRegions
+                  includeFutureRegions: false
+
+    # ─── AC-11: Empty syncType defaults to SyncToDestination ─────────────────
+    - name: ac11-default-sync-type
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac11-default-type
+                namespace: ssmresourcedatasync
+              spec:
+                # syncType omitted — should default to SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac11-default-type
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncToDestination
+
+    # ─── AC-12: allCloudMetadata K8s labels/annotations (managed-by, instance) ─
+    - name: ac12-all-cloud-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: general-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig general-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac12-cloud-meta
+                namespace: ssmresourcedatasync
+              spec:
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac12-cloud-meta
+                namespace: ssmresourcedatasync
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac12-cloud-meta
+
+    # ─── AC-13: configRef resolves to named SSMConfig ─────────────────────────
+    - name: ac13-configref-resolution
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMConfig
+              metadata:
+                name: custom-ssm-policy
+                namespace: ssmresourcedatasync
+                labels:
+                  aws.kropath.run/resource-name: custom-ssm-policy
+        - script:
+            content: |
+              kubectl patch ssmconfig custom-ssm-policy -n ssmresourcedatasync \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"custom-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac13-custom-cfg
+                namespace: ssmresourcedatasync
+              spec:
+                configRef: custom-ssm-policy
+                syncType: SyncToDestination
+                s3Destination:
+                  bucketName: my-bucket
+                  region: ap-southeast-2
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SSMResourceDataSync
+              metadata:
+                name: ac13-custom-cfg
+                namespace: ssmresourcedatasync
+              status:
+                resourceName: custom-ac13-custom-cfg
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: ssm.services.k8s.aws/v1alpha1
+              kind: ResourceDataSync
+              metadata:
+                name: ac13-custom-cfg
+                namespace: ssmresourcedatasync
+              spec:
+                syncName: custom-ac13-custom-cfg
