@@ -87,7 +87,9 @@ spec:
         weight: integer | default=0
     status:
       conditions: >-
-        ${listener.?status.?conditions.orValue([])}
+        ${listenerWithSsl.?status.?conditions.orValue([])}
+      noSslConditions: >-
+        ${listenerNoSsl.?status.?conditions.orValue([])}
     additionalPrinterColumns:
       - name: Protocol
         type: string
@@ -111,7 +113,12 @@ spec:
     # No status.predictedArn: Listener ARNs embed LB hash + listener-specific hash, not predictable.
     # Use status.ackResourceMetadata.arn at runtime.
     # nameOverride is a no-op: ACK Listener has no name field.
-    - id: listener
+    - id: listenerWithSsl
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?sslPolicy.orValue("") != "")
+            || schema.spec.sslPolicy != ""
+            || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?sslPolicy.orValue("") != "")}
       template:
         apiVersion: elbv2.services.k8s.aws/v1alpha1
         kind: Listener
@@ -148,6 +155,101 @@ spec:
               : (schema.spec.sslPolicy != ""
                   ? schema.spec.sslPolicy
                   : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?sslPolicy.orValue("") : ""))}
+          # certificates — RGD wraps the scalar certificateArn to ACK's []Certificate format.
+          # When empty, pass empty list (HTTP/TCP listeners need no certificate).
+          certificates: >-
+            ${schema.spec.certificateArn != ""
+              ? [{"certificateARN": schema.spec.certificateArn, "isDefault": false}]
+              : []}
+          # alpnPolicy — RGD wraps the scalar to a single-element list for ACK.
+          # When empty (non-TLS listeners), pass empty list.
+          alpnPolicy: >-
+            ${schema.spec.alpnPolicy != ""
+              ? [schema.spec.alpnPolicy]
+              : []}
+          # defaultActions — type-conditional mapping avoids sending empty sub-config objects
+          # to ACK/AWS for action types that don't use them.
+          defaultActions: >-
+            ${schema.spec.defaultActions.map(a,
+              a.type == "forward" && a.weightedTargetGroups.size() > 0
+                ? {"type": "forward", "order": a.order, "forwardConfig": {
+                    "targetGroups": a.weightedTargetGroups.map(tg, {
+                      "targetGroupRef": {"from": {"name": tg.targetGroupRef}}, "weight": tg.weight}),
+                    "targetGroupStickinessConfig": {
+                      "enabled": a.forwardConfig.targetGroupStickinessConfig.enabled,
+                      "durationSeconds": a.forwardConfig.targetGroupStickinessConfig.durationSeconds}}}
+              : a.type == "forward"
+                ? {"type": "forward", "targetGroupRef": {"from": {"name": a.targetGroupRef}}, "order": a.order}
+              : a.type == "redirect"
+                ? {"type": "redirect", "order": a.order, "redirectConfig": {
+                    "protocol": a.redirectConfig.protocol,
+                    "host": a.redirectConfig.host,
+                    "path": a.redirectConfig.path,
+                    "port": a.redirectConfig.port,
+                    "query": a.redirectConfig.query,
+                    "statusCode": a.redirectConfig.statusCode
+                  }}
+              : a.type == "fixed-response"
+                ? {"type": "fixed-response", "order": a.order, "fixedResponseConfig": {
+                    "statusCode": a.fixedResponseConfig.statusCode,
+                    "contentType": a.fixedResponseConfig.contentType,
+                    "messageBody": a.fixedResponseConfig.messageBody
+                  }}
+              : {"type": a.type, "order": a.order, "targetGroupRef": {"from": {"name": a.targetGroupRef}}})}
+          # mutualAuthentication — mTLS for HTTPS listeners; pass mode=off (default) to disable.
+          mutualAuthentication:
+            mode: ${schema.spec.mutualAuthentication.mode}
+            trustStoreARN: ${schema.spec.mutualAuthentication.trustStoreArn}
+            ignoreClientCertificateExpiry: ${schema.spec.mutualAuthentication.ignoreClientCertificateExpiry}
+          # Cloud resource tags — ACK ELBv2 uses []Tag (key/value pairs), not map[string]string.
+          # Merge order: defaults (lowest) → spec → mandatory (highest).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+    - id: listenerNoSsl
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?sslPolicy.orValue("") == "")
+            && schema.spec.sslPolicy == ""
+            && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?sslPolicy.orValue("") == "")}
+      template:
+        apiVersion: elbv2.services.k8s.aws/v1alpha1
+        kind: Listener
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ELBListener
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          loadBalancerRef:
+            from:
+              name: ${schema.spec.loadBalancerRef}
+          protocol: ${schema.spec.protocol}
+          port: ${schema.spec.port}
           # certificates — RGD wraps the scalar certificateArn to ACK's []Certificate format.
           # When empty, pass empty list (HTTP/TCP listeners need no certificate).
           certificates: >-

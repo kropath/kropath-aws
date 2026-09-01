@@ -55,23 +55,33 @@ spec:
     status:
       # Per-resource separate fields (required — kro cannot merge list types across resources).
       conditions: >-
-        ${ackCertificate.?status.?conditions.orValue([])}
+        ${ackCertificateWithCA.?status.?conditions.orValue([])}
+      noCAConditions: >-
+        ${ackCertificateNoCA.?status.?conditions.orValue([])}
       importConditions: >-
         ${ackImportCertificate.?status.?conditions.orValue([])}
       importWithChainConditions: >-
         ${ackImportCertificateWithChain.?status.?conditions.orValue([])}
       certificateARN: >-
-        ${ackCertificate.?status.?ackResourceMetadata.?arn.orValue("")}
+        ${ackCertificateWithCA.?status.?ackResourceMetadata.?arn.orValue("")}
+      certificateARNNoCA: >-
+        ${ackCertificateNoCA.?status.?ackResourceMetadata.?arn.orValue("")}
       importCertificateARN: >-
         ${ackImportCertificate.?status.?ackResourceMetadata.?arn.orValue("")}
       importWithChainCertificateARN: >-
         ${ackImportCertificateWithChain.?status.?ackResourceMetadata.?arn.orValue("")}
       certificateStatus: >-
-        ${ackCertificate.?status.?status.orValue("")}
+        ${ackCertificateWithCA.?status.?status.orValue("")}
+      noCACertificateStatus: >-
+        ${ackCertificateNoCA.?status.?status.orValue("")}
       notAfter: >-
-        ${has(ackCertificate.status) && has(ackCertificate.status.notAfter) ? string(ackCertificate.status.notAfter) : ""}
+        ${ackCertificateWithCA.?status.?notAfter.hasValue() ? string(ackCertificateWithCA.?status.?notAfter.value()) : ""}
+      noCANotAfter: >-
+        ${ackCertificateNoCA.?status.?notAfter.hasValue() ? string(ackCertificateNoCA.?status.?notAfter.value()) : ""}
       domainValidations: >-
-        ${ackCertificate.?status.?domainValidations.orValue([])}
+        ${ackCertificateWithCA.?status.?domainValidations.orValue([])}
+      noCaDomainValidations: >-
+        ${ackCertificateNoCA.?status.?domainValidations.orValue([])}
       importDomainValidations: >-
         ${ackImportCertificate.?status.?domainValidations.orValue([])}
       importWithChainDomainValidations: >-
@@ -205,11 +215,15 @@ spec:
 
     # ACK Certificate CR — public or private CA certificate (no import workflow).
     # Only when: not an import cert, not a dual-CA error.
-    - id: ackCertificate
+    - id: ackCertificateWithCA
       includeWhen:
         - >-
           ${schema.spec.importCertificateSecret == ""
             && !(schema.spec.certificateAuthorityARN != "" && schema.spec.certificateAuthorityRef != "")}
+        - >-
+          ${schema.spec.certificateAuthorityARN != ""
+            || (schema.spec.certificateAuthorityRef != "" && caRefCr.size() > 0
+                && caRefCr[0].?status.?certificateAuthorityARN.orValue("") != "")}
       template:
         apiVersion: acm.services.k8s.aws/v1alpha1
         kind: Certificate
@@ -260,6 +274,74 @@ spec:
               : (schema.spec.certificateAuthorityRef != "" && caRefCr.size() > 0
                   ? caRefCr[0].status.certificateAuthorityARN
                   : "")}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK Certificate CR — import workflow, certificate chain not provided.
+    # Only when: import cert + private key set, no chain, no CA, no domain (valid import).
+    - id: ackCertificateNoCA
+      includeWhen:
+        - >-
+          ${schema.spec.importCertificateSecret == ""
+            && !(schema.spec.certificateAuthorityARN != "" && schema.spec.certificateAuthorityRef != "")}
+        - >-
+          ${schema.spec.certificateAuthorityARN == ""
+            && (schema.spec.certificateAuthorityRef == "" || caRefCr.size() == 0
+                || caRefCr[0].?status.?certificateAuthorityARN.orValue("") == "")}
+      template:
+        apiVersion: acm.services.k8s.aws/v1alpha1
+        kind: Certificate
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ACMCertificate
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          domainName: "${schema.spec.domainName}"
+          subjectAlternativeNames: ${schema.spec.subjectAlternativeNames}
+          keyAlgorithm: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?keyAlgorithm.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.keyAlgorithm
+              : (schema.spec.keyAlgorithm != ""
+                  ? schema.spec.keyAlgorithm
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?keyAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.keyAlgorithm
+                      : "RSA_2048"))}
+          options:
+            certificateTransparencyLoggingPreference: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?certificateTransparencyLogging.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.certificateTransparencyLogging
+                : (schema.spec.certificateTransparencyLogging != ""
+                    ? schema.spec.certificateTransparencyLogging
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?certificateTransparencyLogging.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.certificateTransparencyLogging
+                        : "ENABLED"))}
+          domainValidationOptions: ${schema.spec.domainValidationOptions}
           tags: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
               .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})

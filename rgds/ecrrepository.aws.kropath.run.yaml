@@ -55,11 +55,17 @@ spec:
           ? "arn:aws:ecr:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":repository/" + naming.data.effectiveName
           : ""}
       repositoryURI: >-
-        ${repository.?status.?repositoryURI.orValue("")}
+        ${ackRepositoryRef.size() > 0 ? ackRepositoryRef[0].?status.?repositoryURI.orValue("") : ""}
       validationError: >-
         ${has(mutualExclusionError.data) && has(mutualExclusionError.data.error) ? mutualExclusionError.data.error : ""}
       conditions: >-
-        ${repository.?status.?conditions.orValue([])}
+        ${repositoryWithKmsWithLcp.?status.?conditions.orValue([])}
+      withKmsNoLcpConditions: >-
+        ${repositoryWithKmsNoLcp.?status.?conditions.orValue([])}
+      noKmsWithLcpConditions: >-
+        ${repositoryNoKmsWithLcp.?status.?conditions.orValue([])}
+      noKmsNoLcpConditions: >-
+        ${repositoryNoKmsNoLcp.?status.?conditions.orValue([])}
     additionalPrinterColumns:
       - name: ResourceName
         type: string
@@ -71,6 +77,22 @@ spec:
         type: string
         jsonPath: .status.predictedArn
   resources:
+    # Always-bound lookup of this instance's own ACK child resource.
+    # The child is created by mutually exclusive includeWhen variants, so a status expression
+    # naming those variables is skipped whenever any of them is excluded — see
+    # docs/frequent-rgd-errors.md §"Variant-Split Resources Freeze Combined Status Expressions".
+    # An externalRef is never excluded (it resolves to [] until the child exists), so reading
+    # status through it keeps one stable status field per value whichever variant fired.
+    - id: ackRepositoryRef
+      externalRef:
+        apiVersion: ecr.services.k8s.aws/v1alpha1
+        kind: Repository
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
     # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
     # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
     - id: rsrcCfg
@@ -180,8 +202,16 @@ spec:
 
     # ACK ECR Repository CR — primary cloud resource.
     # Only created when namingStatus is valid (effectiveName has no unresolved tokens).
-    - id: repository
+    - id: repositoryWithKmsWithLcp
       includeWhen:
+        - >-
+          ${((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") != "")
+              || (kmsKey.size() > 0 && kmsKey[0].?status.?predictedArn.orValue("") != "")
+              || schema.spec.kmsKeyArn != ""
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") != ""))
+            && ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lifecyclePolicy.orValue("") != "")
+              || schema.spec.lifecyclePolicy != ""
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?lifecyclePolicy.orValue("") != ""))}
         - '${!naming.data.effectiveName.contains("{")}'
       template:
         apiVersion: ecr.services.k8s.aws/v1alpha1
@@ -249,6 +279,261 @@ spec:
                   ? schema.spec.lifecyclePolicy
                   : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?lifecyclePolicy.orValue("") : ""))}
           # policy — repository resource policy (JSON string); instance-level only, not governed
+          policy: "${schema.spec.policy}"
+          # registryID — passthrough; defaults to controller account when empty
+          registryID: "${schema.spec.registryID}"
+          # Cloud resource tags — convert map to {key, value} list required by ACK ECR.
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          # syncedLabels are also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+    - id: repositoryWithKmsNoLcp
+      includeWhen:
+        - >-
+          ${((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") != "")
+              || (kmsKey.size() > 0 && kmsKey[0].?status.?predictedArn.orValue("") != "")
+              || schema.spec.kmsKeyArn != ""
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") != ""))
+            && ((rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?lifecyclePolicy.orValue("") == "")
+              && schema.spec.lifecyclePolicy == ""
+              && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?lifecyclePolicy.orValue("") == ""))}
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: ecr.services.k8s.aws/v1alpha1
+        kind: Repository
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          # imageTagMutability — three-tier cascade: mandatory → spec → defaults → "MUTABLE" (AWS default)
+          imageTagMutability: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?imageTagMutability.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.imageTagMutability
+              : (schema.spec.imageTagMutability != ""
+                  ? schema.spec.imageTagMutability
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?imageTagMutability.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.imageTagMutability
+                      : "MUTABLE"))}
+          # imageTagMutabilityExclusionFilters — instance spec passthrough (not governed)
+          imageTagMutabilityExclusionFilters: >-
+            ${schema.spec.imageTagMutabilityExclusionFilters.map(f, {"filter": f.filter, "filterType": f.filterType})}
+          # imageScanningConfiguration — scanOnPush is deprecated at registry level but retained for CRD compat
+          imageScanningConfiguration:
+            scanOnPush: ${schema.spec.scanOnPush}
+          # encryptionConfiguration — encryptionType governed; kmsKey has three-tier cascade
+          encryptionConfiguration:
+            encryptionType: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                : (schema.spec.encryptionType != ""
+                    ? schema.spec.encryptionType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                        : "AES256"))}
+            kmsKey: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsKeyID
+                : (kmsKey.size() > 0 && kmsKey[0].?status.?predictedArn.orValue("") != ""
+                    ? kmsKey[0].status.predictedArn
+                    : (schema.spec.kmsKeyArn != ""
+                        ? schema.spec.kmsKeyArn
+                        : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") : "")))}
+          # policy — repository resource policy (JSON string); instance-level only, not governed
+          policy: "${schema.spec.policy}"
+          # registryID — passthrough; defaults to controller account when empty
+          registryID: "${schema.spec.registryID}"
+          # Cloud resource tags — convert map to {key, value} list required by ACK ECR.
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          # syncedLabels are also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+    - id: repositoryNoKmsWithLcp
+      includeWhen:
+        - >-
+          ${((rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") == "")
+              && (kmsKey.size() == 0 || kmsKey[0].?status.?predictedArn.orValue("") == "")
+              && schema.spec.kmsKeyArn == ""
+              && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") == ""))
+            && ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lifecyclePolicy.orValue("") != "")
+              || schema.spec.lifecyclePolicy != ""
+              || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?lifecyclePolicy.orValue("") != ""))}
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: ecr.services.k8s.aws/v1alpha1
+        kind: Repository
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          # imageTagMutability — three-tier cascade: mandatory → spec → defaults → "MUTABLE" (AWS default)
+          imageTagMutability: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?imageTagMutability.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.imageTagMutability
+              : (schema.spec.imageTagMutability != ""
+                  ? schema.spec.imageTagMutability
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?imageTagMutability.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.imageTagMutability
+                      : "MUTABLE"))}
+          # imageTagMutabilityExclusionFilters — instance spec passthrough (not governed)
+          imageTagMutabilityExclusionFilters: >-
+            ${schema.spec.imageTagMutabilityExclusionFilters.map(f, {"filter": f.filter, "filterType": f.filterType})}
+          # imageScanningConfiguration — scanOnPush is deprecated at registry level but retained for CRD compat
+          imageScanningConfiguration:
+            scanOnPush: ${schema.spec.scanOnPush}
+          # encryptionConfiguration — encryptionType governed; kmsKey has three-tier cascade
+          encryptionConfiguration:
+            encryptionType: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                : (schema.spec.encryptionType != ""
+                    ? schema.spec.encryptionType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                        : "AES256"))}
+          # lifecyclePolicy — three-tier cascade: mandatory → spec → defaults
+          lifecyclePolicy: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lifecyclePolicy.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.lifecyclePolicy
+              : (schema.spec.lifecyclePolicy != ""
+                  ? schema.spec.lifecyclePolicy
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?lifecyclePolicy.orValue("") : ""))}
+          # policy — repository resource policy (JSON string); instance-level only, not governed
+          policy: "${schema.spec.policy}"
+          # registryID — passthrough; defaults to controller account when empty
+          registryID: "${schema.spec.registryID}"
+          # Cloud resource tags — convert map to {key, value} list required by ACK ECR.
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on collision).
+          # syncedLabels are also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+    - id: repositoryNoKmsNoLcp
+      includeWhen:
+        - >-
+          ${((rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") == "")
+              && (kmsKey.size() == 0 || kmsKey[0].?status.?predictedArn.orValue("") == "")
+              && schema.spec.kmsKeyArn == ""
+              && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") == ""))
+            && ((rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?lifecyclePolicy.orValue("") == "")
+              && schema.spec.lifecyclePolicy == ""
+              && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?lifecyclePolicy.orValue("") == ""))}
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: ecr.services.k8s.aws/v1alpha1
+        kind: Repository
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRRepository
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          # imageTagMutability — three-tier cascade: mandatory → spec → defaults → "MUTABLE" (AWS default)
+          imageTagMutability: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?imageTagMutability.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.imageTagMutability
+              : (schema.spec.imageTagMutability != ""
+                  ? schema.spec.imageTagMutability
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?imageTagMutability.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.imageTagMutability
+                      : "MUTABLE"))}
+          # imageTagMutabilityExclusionFilters — instance spec passthrough (not governed)
+          imageTagMutabilityExclusionFilters: >-
+            ${schema.spec.imageTagMutabilityExclusionFilters.map(f, {"filter": f.filter, "filterType": f.filterType})}
+          # imageScanningConfiguration — scanOnPush is deprecated at registry level but retained for CRD compat
+          imageScanningConfiguration:
+            scanOnPush: ${schema.spec.scanOnPush}
+          # encryptionConfiguration — encryptionType governed; kmsKey has three-tier cascade
+          encryptionConfiguration:
+            encryptionType: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                : (schema.spec.encryptionType != ""
+                    ? schema.spec.encryptionType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                        : "AES256"))}
+          # lifecyclePolicy — three-tier cascade: mandatory → spec → defaults          # policy — repository resource policy (JSON string); instance-level only, not governed
           policy: "${schema.spec.policy}"
           # registryID — passthrough; defaults to controller account when empty
           registryID: "${schema.spec.registryID}"

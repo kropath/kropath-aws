@@ -96,14 +96,16 @@ spec:
       namingStatus: >-
         ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
       restApiId: >-
-        ${restApi.?status.?id.orValue("")}
+        ${ackRestApiRef.size() > 0 ? ackRestApiRef[0].?status.?id.orValue("") : ""}
       rootResourceId: >-
-        ${restApi.?status.?rootResourceID.orValue("")}
+        ${ackRestApiRef.size() > 0 ? ackRestApiRef[0].?status.?rootResourceID.orValue("") : ""}
       # restApiId is system-assigned; predictedArn uses region only — use ackResourceMetadata.arn at runtime
       predictedArn: >-
         ${"arn:aws:apigateway:" + (rsrcCfg.size() > 0 ? rsrcCfg[0].?status.?effectiveConfig.?aws.?region.orValue("") : "") + "::/restapis/<pending>"}
       conditions: >-
-        ${restApi.?status.?conditions.orValue([])}
+        ${restApiWithSecurityPolicy.?status.?conditions.orValue([])}
+      noSecurityPolicyConditions: >-
+        ${restApiNoSecurityPolicy.?status.?conditions.orValue([])}
       validationError: >-
         ${has(mutualExclusionError.data) && mutualExclusionError.data.error != "" ? mutualExclusionError.data.error : ""}
     additionalPrinterColumns:
@@ -118,6 +120,23 @@ spec:
         jsonPath: .status.validationError
 
   resources:
+    # Always-bound lookup of this instance's own ACK RestAPI child.
+    # The RestAPI is created by two mutually exclusive includeWhen variants, so a status
+    # expression naming those variables is skipped whenever either is excluded — see
+    # docs/frequent-rgd-errors.md §"Variant-Split Resources Freeze Combined Status Expressions".
+    # An externalRef is never excluded (it resolves to [] until the child exists), so status
+    # exposes ONE stable restApiId/rootResourceId whichever variant fired. Consumers in other
+    # RGDs (APIGatewayAuthorizer, APIGatewayDeployment) read those single fields.
+    - id: ackRestApiRef
+      externalRef:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: RestAPI
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
     # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
     - id: rsrcCfg
       externalRef:
@@ -222,8 +241,11 @@ spec:
               : ""}
 
     # ── ACK RestAPI (single static resource) ──────────────────────────────────
-    - id: restApi
+    - id: restApiWithSecurityPolicy
       includeWhen:
+        - >-
+          ${(rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?minimumTlsVersion.orValue("") != "")
+            || (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?minimumTlsVersion.orValue("") != "")}
         - >-
           ${!naming.data.effectiveName.contains("{")
             && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
@@ -318,6 +340,103 @@ spec:
 
     # ── ACK Resource CRs (forEach over spec.resources) ───────────────────────
     # pathSlug: (parentPath + "." + pathPart or pathPart).lowerAscii().strip-braces().dot-to-hyphen
+    - id: restApiNoSecurityPolicy
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() == 0 || rsrcCfg[0].?status.?effectiveConfig.?mandatory.?minimumTlsVersion.orValue("") == "")
+            && (rsrcCfg.size() == 0 || rsrcCfg[0].?status.?effectiveConfig.?defaults.?minimumTlsVersion.orValue("") == "")}
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
+      template:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: RestAPI
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: APIGatewayRestAPI
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          description: ${schema.spec.description}
+          # apiKeySource: mandatory -> instance -> defaults -> HEADER
+          apiKeySource: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?apiKeySource.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.apiKeySource
+              : (schema.spec.apiKeySource != ""
+                ? schema.spec.apiKeySource
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?apiKeySource.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.defaults.apiKeySource
+                  : "HEADER"))}
+          # endpointConfiguration: mandatory -> instance -> defaults -> REGIONAL
+          endpointConfiguration:
+            types:
+              - >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?endpointType.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointType
+                  : (schema.spec.endpointType != ""
+                    ? schema.spec.endpointType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?endpointType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.endpointType
+                      : "REGIONAL"))}
+            # vpcEndpointIDs populated only when effective endpoint type is PRIVATE
+            vpcEndpointIDs: >-
+              ${(rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?endpointType.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointType
+                  : (schema.spec.endpointType != ""
+                    ? schema.spec.endpointType
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?endpointType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.endpointType
+                      : "REGIONAL"))) == "PRIVATE" ? schema.spec.vpcEndpointIds : []}
+          # ACK field: disableExecuteAPIEndpoint (capital API — confirmed in crd-cache)
+          disableExecuteAPIEndpoint: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?disableExecuteApiEndpoint.orValue(false))
+              ? true
+              : (has(schema.spec.disableExecuteApiEndpoint)
+                  ? schema.spec.disableExecuteApiEndpoint
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?disableExecuteApiEndpoint.orValue(false)))}
+          # policy: resourcePolicyRef (via policyDocCr sentinel) -> inline policy
+          policy: >-
+            ${policyDocCr.size() > 0 && schema.spec.resourcePolicyRef != ""
+              ? policyDocCr[0].status.resolvedDocumentJSON
+              : schema.spec.policy}
+          binaryMediaTypes: ${schema.spec.binaryMediaTypes}
+          minimumCompressionSize: ${schema.spec.minimumCompressionSize}
+          # Cloud tags: only RestAPI supports tags among API Gateway sub-resources.
+          # Cascade order: defaults (syncedAnnotations, syncedLabels, tags) -> spec -> mandatory
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags) ? rsrcCfg[0].status.effectiveConfig.defaults.tags : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags : {})}
+
+    # ── ACK Resource CRs — variant-split mirrors restApi variants ────────────────
+    # Each variant co-fires with its restApi counterpart so parentID only references
+    # the active variant (kro propagates "excluded" from inactive variants to any
+    # resource whose template body references them; splitting avoids that).
+    # pathSlug: (parentPath + "." + pathPart or pathPart).lowerAscii().strip-braces().dot-to-hyphen
+    # Root resources (parentPath == "") take parentID from the always-bound ackRestApiRef;
+    # nested resources use parentRef pointing at the parent Resource CR by computed name.
     - id: apiResources
       includeWhen:
         - >-
@@ -354,14 +473,12 @@ spec:
           restAPIRef:
             from:
               name: ${schema.metadata.name}
-          # Root resources (parentPath == "") use parentID from restApi.status.rootResourceID.
-          # Nested resources use parentRef pointing to the parent Resource CR by computed name.
-          parentID: "${res.parentPath == '' ? restApi.?status.?rootResourceID.orValue('') : ''}"
+          parentID: >-
+            ${res.parentPath == '' && ackRestApiRef.size() > 0 ? ackRestApiRef[0].?status.?rootResourceID.orValue('') : ''}
           parentRef:
             from:
               name: "${res.parentPath != '' ? schema.metadata.name + '-res-' + res.parentPath.lowerAscii().replace('{','').replace('}','').replace('.','-') : ''}"
 
-    # ── ACK Method CRs (forEach over flattened resources x methods) ───────────
     - id: apiMethods
       includeWhen:
         - >-

@@ -42,9 +42,11 @@ spec:
       namingStatus: >-
         ${naming.data.namingStatus}
       id: >-
-        ${ackOAC.?status.?id.orValue("")}
+        ${ackOACRef.size() > 0 ? ackOACRef[0].?status.?id.orValue("") : ""}
       conditions: >-
-        ${ackOAC.?status.?conditions.orValue([])}
+        ${ackOACWithSigningBehavior.?status.?conditions.orValue([])}
+      noSigningBehaviorConditions: >-
+        ${ackOACNoSigningBehavior.?status.?conditions.orValue([])}
     additionalPrinterColumns:
       - name: ResourceName
         type: string
@@ -54,6 +56,22 @@ spec:
         jsonPath: .status.namingStatus
 
   resources:
+    # Always-bound lookup of this instance's own ACK child resource.
+    # The child is created by mutually exclusive includeWhen variants, so a status expression
+    # naming those variables is skipped whenever any of them is excluded — see
+    # docs/frequent-rgd-errors.md §"Variant-Split Resources Freeze Combined Status Expressions".
+    # An externalRef is never excluded (it resolves to [] until the child exists), so reading
+    # status through it keeps one stable status field per value whichever variant fired.
+    - id: ackOACRef
+      externalRef:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: OriginAccessControl
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
     # Single governance config lookup (ADR-010 D-1, Theme 28/KRO-221).
     - id: rsrcCfg
       externalRef:
@@ -163,8 +181,12 @@ spec:
               : "valid"}
 
     # ACK OriginAccessControl CR — only created when naming has no unresolved tokens.
-    - id: ackOAC
+    - id: ackOACWithSigningBehavior
       includeWhen:
+        - >-
+          ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?oacSigningBehavior.orValue("") != "")
+            || schema.spec.signingBehavior != ""
+            || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?oacSigningBehavior.orValue("") != "")}
         - '${!naming.data.resourceName.contains("{")}'
       template:
         apiVersion: cloudfront.services.k8s.aws/v1alpha1
@@ -201,4 +223,41 @@ spec:
                 : (schema.spec.signingBehavior != ""
                     ? schema.spec.signingBehavior
                     : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?oacSigningBehavior.orValue("") : ""))}
+            signingProtocol: "${schema.spec.signingProtocol}"
+    - id: ackOACNoSigningBehavior
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?oacSigningBehavior.orValue("") == "")
+            && schema.spec.signingBehavior == ""
+            && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?oacSigningBehavior.orValue("") == "")}
+        - '${!naming.data.resourceName.contains("{")}'
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: OriginAccessControl
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontOriginAccessControl
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          originAccessControlConfig:
+            name: ${naming.data.resourceName}
+            description: "${schema.spec.description}"
+            originAccessControlOriginType: "${schema.spec.originAccessControlOriginType}"
             signingProtocol: "${schema.spec.signingProtocol}"

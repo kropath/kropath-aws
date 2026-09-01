@@ -170,6 +170,90 @@ This document tracks technical friction points, syntax limitations, and runtime 
                   aws.kropath.run/resource-name: ${schema.spec.trustPolicyRef != "" ? schema.spec.trustPolicyRef : "kro-empty-fallback-sentinel"}
         ```
 
+### Variant-Split Resources Freeze Combined Status Expressions — Use an Always-Bound Self-Lookup
+
+* **What Fails:** An RGD splits one ACK child into several mutually exclusive `includeWhen`
+  variants (the standard way to *omit* an optional field rather than send `""`), and the `status:`
+  block coalesces across them:
+    ```yaml
+    - id: clusterWithKms      # includeWhen: KMS configured
+    - id: clusterNoKms        # includeWhen: no KMS
+    status:
+      arn: >-
+        ${clusterWithKms.?status.?ackResourceMetadata.?arn.orValue("") != ""
+          ? clusterWithKms.status.ackResourceMetadata.arn
+          : clusterNoKms.?status.?ackResourceMetadata.?arn.orValue("")}
+    ```
+  The instance reconciles, the ACK child is created and healthy, and `status` comes back **`{}`** —
+  the field is never written and there is no error anywhere. Chainsaw reports
+  `* status.arn: Required value: field not found in the input object` after a full assert timeout.
+
+* **Why:** Exactly one variant is ever included, so at least one of the names in that expression is
+  always excluded. This is the [Unbound Variable Freeze](#the-unbound-variable-freeze) applied to the
+  `status:` block: kro's initialization pass sees a token that is not in the active memory context and
+  **skips the whole field** — silently, per field, rather than raising. CEL ternary short-circuiting does
+  not save you; the token only has to be *mentioned*. The trap is worse than in a `template:` block
+  because nothing fails loudly: the resource still reaches `ACTIVE`.
+
+* **Blast radius is cross-RGD.** A consumer RGD that reads the producer's `status.<field>` via
+  `externalRef` inherits the empty value and passes `""` to its own ACK child. In KRO-925 this made
+  `APIGatewayAuthorizer` send `spec.restAPIID: ""` and made `EFSAccessPoint`/`EFSMountTarget` fail,
+  none of which touch the variant-split RGD themselves.
+
+* **What Works Instead — the always-bound self-lookup.** Add an `externalRef` that looks the RGD's
+  **own** ACK child up by the `app.kubernetes.io/instance` label every variant already sets. An
+  `externalRef` is never excluded — it resolves to `[]` until the child exists — so status keeps
+  **one stable field per value** no matter which variant fired, and consumers keep reading one name:
+    ```yaml
+    resources:
+      # Always-bound lookup of this instance's own ACK child.
+      - id: ackClusterRef
+        externalRef:
+          apiVersion: dsql.services.k8s.aws/v1alpha1
+          kind: Cluster
+          metadata:
+            namespace: ${schema.metadata.namespace}
+            selector:
+              matchLabels:
+                app.kubernetes.io/instance: ${schema.metadata.name}
+    status:
+      arn: >-
+        ${ackClusterRef.size() > 0 ? ackClusterRef[0].?status.?ackResourceMetadata.?arn.orValue("") : ""}
+    ```
+  Guard every access with `.size() > 0` ([Empty External Reference Index Crash](#the-empty-external-reference-index-crash)).
+  This works because all variants render the same `metadata.name` and the same
+  `app.kubernetes.io/instance` label, and the `externalRef` is scoped by `apiVersion` + `kind` +
+  namespace, so it can only match this instance's own child. It also collapses `forEach` blocks that
+  were duplicated per variant purely to reference `rootResourceID` (see `rgds/apigatewayrestapi.aws.kropath.run.yaml`).
+
+* **Do NOT split the status field per variant** (`restApiId` + `noPolicyRestApiId`,
+  `arn` + `noKmsArn`, …). It compiles and each field does populate, but it leaks graph-internal
+  variant structure into the public CRD status, and every consumer must remember to coalesce — miss
+  one and you get a silent `""`. That is precisely how KRO-925 shipped a broken
+  `APIGatewayAuthorizer` while `APIGatewayDeployment` was fixed. Per-variant `*Conditions` fields are
+  the one acceptable exception: `conditions` is a list that genuinely differs per variant and has no
+  cross-RGD consumers.
+
+* **How to audit an RGD for this:** any `status:` expression naming **more than one** `includeWhen`-gated
+  resource id is broken. Mechanical check:
+    ```python
+    # python3 - <<'PY'  (run from the repo root)
+    import re, glob, yaml
+    for f in glob.glob('rgds/*.yaml'):
+        d = yaml.safe_load(open(f))
+        gated = {r['id'] for r in d['spec']['resources'] if 'includeWhen' in r}
+        for k, v in (d['spec']['schema'].get('status') or {}).items():
+            if not isinstance(v, str):
+                continue
+            hit = {g for g in gated if re.search(r'\b' + re.escape(g) + r'\b', v)}
+            if len(hit) > 1:
+                print(f, k, '->', sorted(hit))
+    # PY
+    ```
+  A green Chainsaw suite is **not** evidence the RGD is clean — the field only fails when a test both
+  exercises a non-first variant *and* asserts that status field. Seven of the eight RGDs found by this
+  check in KRO-925 had passing suites.
+
 ### The Cold-Start "Missing Key" Crash (Chainsaw / Mock Testing)
 * **What Fails:** Running validation workflows on uninitialized instances crashes early with:
     ```log
