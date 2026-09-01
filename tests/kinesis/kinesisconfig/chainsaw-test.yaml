@@ -1,0 +1,205 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-kinesis-01 Chainsaw tests — one scenario per acceptance criterion.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: kinesisconfig
+spec:
+  skipDelete: true
+  namespace: kinesisconfig
+  steps:
+    - name: ac1-general-policy-accepted
+      try:
+        - apply:
+            file: 00-kinesisconfig-namespace.yaml
+        - apply:
+            file: 01-config-create-general-policy.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: general-policy
+                namespace: kro-system
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                defaults:
+                  streamMode: "on_demand"
+                  namingTemplate: "{namespace}-{name}"
+
+    - name: ac2-high-throughput-accepted
+      try:
+        - apply:
+            file: 02-config-create-high-throughput.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: high-throughput
+                namespace: kinesisconfig
+                labels:
+                  aws.kropath.run/resource-name: high-throughput
+              spec:
+                defaults:
+                  streamMode: "provisioned"
+                  shardCount: 4
+
+    - name: ac3-reject-dual-tier-streammode
+      try:
+        - apply:
+            file: 03-config-dual-tier-streammode.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: KinesisConfig
+                check:
+                  ($error != null): true
+
+    - name: ac4-reject-dual-tier-shardcount
+      try:
+        - apply:
+            file: 04-config-dual-tier-shardcount.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: KinesisConfig
+                check:
+                  ($error != null): true
+
+    - name: ac5-reject-dual-tier-naming
+      try:
+        - apply:
+            file: 05-config-dual-tier-naming.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: KinesisConfig
+                check:
+                  ($error != null): true
+
+    - name: ac6-effective-config-cascade
+      try:
+        - apply:
+            file: 06-config-effective-cascade.yaml
+        - script:
+            content: |
+              # Simulate controller cascade: KropathConfig mandatory.kinesis.streamMode "on_demand"
+              # cascades into effectiveConfig.mandatory.streamMode; KinesisConfig defaults preserved.
+              kubectl patch kinesisconfig cascade-config -n kinesisconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: cascade-config
+                namespace: kinesisconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    streamMode: "on_demand"
+                  defaults:
+                    streamMode: "on_demand"
+                    namingTemplate: "{namespace}-{name}"
+                  aws:
+                    region: "us-east-1"
+                    accountId: "123456789012"
+            timeout: 60s
+
+    - name: ac7-naming-template-in-effective-config
+      try:
+        - apply:
+            file: 07-config-naming-template.yaml
+        - script:
+            content: |
+              # Simulate controller writing effectiveConfig with defaults.namingTemplate.
+              kubectl patch kinesisconfig naming-config -n kinesisconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: naming-config
+                namespace: kinesisconfig
+              status:
+                effectiveConfig:
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+            timeout: 60s
+
+    - name: ac8-tags-merge-in-effective-config
+      try:
+        - apply:
+            file: 08-config-tag-merge.yaml
+        - script:
+            content: |
+              # Simulate controller cascade: KropathConfig mandatory.tags {cost-centre: infra}
+              # merged with KinesisConfig mandatory.tags {stream-type: kinesis}.
+              # KinesisConfig defaults.tags {team: platform} preserved in defaults tier.
+              kubectl patch kinesisconfig tags-config -n kinesisconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{"stream-type":"kinesis","cost-centre":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{"team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: tags-config
+                namespace: kinesisconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    tags:
+                      stream-type: "kinesis"
+                      cost-centre: "infra"
+                  defaults:
+                    tags:
+                      team: "platform"
+            timeout: 60s
+
+    - name: ac9-synced-labels-in-effective-config
+      try:
+        - apply:
+            file: 09-config-synced-labels.yaml
+        - script:
+            content: |
+              # Simulate controller writing effectiveConfig with mandatory.syncedLabels.
+              # RGD will apply data-class: streaming as both K8s label and cloud tag.
+              kubectl patch kinesisconfig synced-labels-config -n kinesisconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{"data-class":"streaming"},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: synced-labels-config
+                namespace: kinesisconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    syncedLabels:
+                      data-class: "streaming"
+            timeout: 60s
