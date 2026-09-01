@@ -1,0 +1,1375 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates uniquely-named KinesisConfig + KinesisStream
+# resources and deletes nothing between steps. skipDelete: true stops chainsaw's
+# end-of-test cascade; the ephemeral kind cluster is discarded after the suite.
+#
+# Implementation note: kro CEL prohibits int/null mixed ternary branches, so the
+# shardCount field returns 0 as a sentinel for ON_DEMAND mode (not absent). Tests
+# assert shardCount: 0 for ON_DEMAND scenarios. This is a known kro limitation
+# documented in docs/troubleshooting-logs/.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: kinesisstream
+spec:
+  skipDelete: true
+  namespace: kinesisstream
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: defaults.streamMode "on_demand"; instance streamMode empty
+    # → ACK Stream streamModeDetails.streamMode: ON_DEMAND; shardCount: 0 (sentinel)
+    - name: ac1-streammode-default-ondemand
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac1-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac1-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac1-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac1-stream
+                namespace: kinesisstream
+              spec:
+                name: kinesisstream-ac1-stream
+                streamModeDetails:
+                  streamMode: ON_DEMAND
+                shardCount: 0
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac1-stream
+                namespace: kinesisstream
+              status:
+                resourceName: kinesisstream-ac1-stream
+                namingStatus: valid
+                predictedArn: arn:aws:kinesis:ap-southeast-2:123456789012:stream/kinesisstream-ac1-stream
+
+    # AC-2: defaults on_demand; instance streamMode "provisioned", shardCount 4 → instance wins
+    # → PROVISIONED, shardCount: 4
+    - name: ac2-streammode-instance-provisioned
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac2-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac2-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac2-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac2-cfg
+                streamMode: provisioned
+                shardCount: 4
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac2-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 4
+
+    # AC-3: mandatory.streamMode "on_demand"; instance streamMode "provisioned"
+    # → mandatory wins → ON_DEMAND; shardCount: 0 (sentinel)
+    - name: ac3-streammode-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac3-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac3-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac3-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac3-cfg
+                streamMode: provisioned
+                shardCount: 4
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac3-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: ON_DEMAND
+                shardCount: 0
+
+    # AC-4: defaults.streamMode "provisioned", defaults.shardCount 2; instance empty
+    # → defaults applied → PROVISIONED, shardCount: 2
+    - name: ac4-streammode-provisioned-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac4-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "provisioned"
+                  shardCount: 2
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac4-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"provisioned","shardCount":2,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac4-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac4-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac4-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 2
+
+    # AC-5: mandatory.shardCount 4; instance shardCount 8; streamMode provisioned
+    # → mandatory wins → shardCount: 4
+    - name: ac5-shardcount-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac5-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  streamMode: "provisioned"
+                  shardCount: 4
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac5-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"provisioned","shardCount":4,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac5-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac5-cfg
+                streamMode: provisioned
+                shardCount: 8
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac5-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 4
+
+    # AC-6: defaults.shardCount 2; instance shardCount 0; streamMode provisioned
+    # → default applied → shardCount: 2
+    - name: ac6-shardcount-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac6-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "provisioned"
+                  shardCount: 2
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac6-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"provisioned","shardCount":2,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac6-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac6-cfg
+                streamMode: provisioned
+                shardCount: 0
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac6-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 2
+
+    # AC-7: No shardCount in any tier; streamMode provisioned → built-in default → shardCount: 1
+    - name: ac7-shardcount-builtin-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac7-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "provisioned"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac7-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"provisioned","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac7-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac7-cfg
+                streamMode: provisioned
+                shardCount: 0
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac7-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 1
+
+    # AC-8: defaults.shardCount 4; streamMode on_demand → shardCount 0 sentinel (ON_DEMAND ignores it)
+    - name: ac8-shardcount-ignored-ondemand
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac8-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 4
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac8-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":4,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac8-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac8-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac8-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: ON_DEMAND
+                shardCount: 0
+
+    # AC-9: defaults.namingTemplate "{namespace}-{name}"; ns=kinesisstream, name=ac9-stream
+    # → resourceName: "kinesisstream-ac9-stream"; predictedArn correct
+    - name: ac9-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac9-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac9-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac9-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac9-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac9-stream
+                namespace: kinesisstream
+              status:
+                resourceName: kinesisstream-ac9-stream
+                namingStatus: valid
+                predictedArn: arn:aws:kinesis:ap-southeast-2:123456789012:stream/kinesisstream-ac9-stream
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac9-stream
+                namespace: kinesisstream
+              spec:
+                name: kinesisstream-ac9-stream
+
+    # AC-10: mandatory.namingTemplate "corp-{namespace}-{name}" → mandatory template used
+    - name: ac10-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac10-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: "corp-{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac10-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac10-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac10-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac10-stream
+                namespace: kinesisstream
+              status:
+                resourceName: corp-kinesisstream-ac10-stream
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac10-stream
+                namespace: kinesisstream
+              spec:
+                name: corp-kinesisstream-ac10-stream
+
+    # AC-11: spec.nameOverride "my-custom-stream" → naming template bypassed
+    - name: ac11-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac11-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac11-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac11-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac11-cfg
+                nameOverride: my-custom-stream
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac11-stream
+                namespace: kinesisstream
+              status:
+                resourceName: my-custom-stream
+                namingStatus: valid
+                predictedArn: arn:aws:kinesis:ap-southeast-2:123456789012:stream/my-custom-stream
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac11-stream
+                namespace: kinesisstream
+              spec:
+                name: my-custom-stream
+
+    # AC-12: namingTemplate "{tag.env}-{name}"; env tag absent → resolves to "" prefix;
+    # namingStatus: "valid" (no unresolved literal {..} tokens)
+    - name: ac12-naming-missing-tag-empty
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac12-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{tag.env}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac12-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac12-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac12-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac12-stream
+                namespace: kinesisstream
+              status:
+                resourceName: "-ac12-stream"
+                namingStatus: valid
+
+    # AC-12a: namingTemplate "{env}-{name}" (unrecognized token, not {tag.env})
+    # → effectiveName contains literal "{env}"; namingStatus: "invalid-unresolved-tokens"
+    - name: ac12a-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac12a-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac12a-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{env}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac12a-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac12a-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac12a-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac12a-stream
+                namespace: kinesisstream
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-13: mandatory.tags + defaults.tags + instance tags → all merged in ACK Stream spec.tags;
+    # mandatory wins on conflict. Use jq script for order-independent verification.
+    - name: ac13-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac13-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags:
+                    cost-center: eng
+                    environment: mandatory
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    environment: dev
+                    team: platform
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac13-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{"cost-center":"eng","environment":"mandatory"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{"environment":"dev","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac13-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac13-cfg
+                tags:
+                  project: alpha
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac13-stream
+                namespace: kinesisstream
+        - script:
+            content: |
+              TAGS=$(kubectl get stream ac13-stream -n kinesisstream -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e '."cost-center" == "eng"' >/dev/null || { echo "FAIL: cost-center missing or wrong"; exit 1; }
+              echo "$TAGS" | jq -e '."environment" == "mandatory"' >/dev/null || { echo "FAIL: environment should be mandatory (mandatory tier wins)"; exit 1; }
+              echo "$TAGS" | jq -e '."team" == "platform"' >/dev/null || { echo "FAIL: team missing"; exit 1; }
+              echo "$TAGS" | jq -e '."project" == "alpha"' >/dev/null || { echo "FAIL: project missing"; exit 1; }
+              echo "PASS: all tags verified"
+
+    # AC-14: mandatory.syncedLabels {environment: production}; defaults.syncedLabels {data-class: streaming}
+    # → ACK Stream metadata.labels has aws.kropath.run/ prefixed keys AND allCloudMetadata in spec.tags
+    - name: ac14-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac14-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels:
+                    environment: production
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels:
+                    data-class: streaming
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac14-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{"data-class":"streaming"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac14-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac14-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac14-stream
+                namespace: kinesisstream
+        - script:
+            content: |
+              LABELS=$(kubectl get stream ac14-stream -n kinesisstream -o json | jq '.metadata.labels')
+              echo "$LABELS" | jq -e '."aws.kropath.run/environment" == "production"' >/dev/null || { echo "FAIL: aws.kropath.run/environment missing"; exit 1; }
+              echo "$LABELS" | jq -e '."aws.kropath.run/data-class" == "streaming"' >/dev/null || { echo "FAIL: aws.kropath.run/data-class missing"; exit 1; }
+              TAGS=$(kubectl get stream ac14-stream -n kinesisstream -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e '."environment" == "production"' >/dev/null || { echo "FAIL: environment missing from spec.tags (allCloudMetadata)"; exit 1; }
+              echo "$TAGS" | jq -e '."data-class" == "streaming"' >/dev/null || { echo "FAIL: data-class missing from spec.tags (allCloudMetadata)"; exit 1; }
+              echo "PASS: syncedLabels verified in metadata.labels and spec.tags"
+
+    # AC-15: mandatory.syncedAnnotations {team: data-platform}
+    # → ACK Stream metadata.annotations has aws.kropath.run/team: data-platform
+    - name: ac15-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac15-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations:
+                    team: data-platform
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac15-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"data-platform"}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac15-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac15-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac15-stream
+                namespace: kinesisstream
+                annotations:
+                  aws.kropath.run/team: data-platform
+
+    # AC-16: Any stream CR → standard metadata wiring
+    - name: ac16-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac16-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac16-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac16-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac16-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac16-stream
+                namespace: kinesisstream
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac16-stream
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-17: spec.deletionPolicy "delete" → ACK Stream annotation services.k8s.aws/deletion-policy: delete
+    - name: ac17-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac17-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac17-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac17-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac17-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac17-stream
+                namespace: kinesisstream
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-18: spec.deletionPolicy "retain" (default) → services.k8s.aws/deletion-policy: retain
+    - name: ac18-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac18-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac18-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac18-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac18-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac18-stream
+                namespace: kinesisstream
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-19: Existing on_demand stream; updated to streamMode "provisioned", shardCount 4
+    # → ACK Stream updated to PROVISIONED, shardCount 4
+    # Lifecycle test: one resource name across both phases.
+    - name: ac19-mode-switch-ondemand-to-provisioned
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac19-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac19-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac19-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac19-cfg
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac19-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: ON_DEMAND
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac19-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac19-cfg
+                streamMode: provisioned
+                shardCount: 4
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac19-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 4
+
+    # AC-20: Existing provisioned stream; updated to streamMode "on_demand"
+    # → ACK Stream updated to ON_DEMAND; shardCount: 0 (sentinel)
+    # Lifecycle test: one resource name across both phases.
+    - name: ac20-mode-switch-provisioned-to-ondemand
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: ac20-cfg
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig ac20-cfg -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac20-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac20-cfg
+                streamMode: provisioned
+                shardCount: 3
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac20-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 3
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac20-stream
+                namespace: kinesisstream
+              spec:
+                configRef: ac20-cfg
+                streamMode: ""
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac20-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: ON_DEMAND
+                shardCount: 0
+
+    # AC-21: configRef "high-throughput" with defaults.streamMode "provisioned", defaults.shardCount 8
+    # → uses high-throughput profile → PROVISIONED, shardCount 8
+    - name: ac21-configref-profile-selection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: high-throughput
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: high-throughput
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "provisioned"
+                  shardCount: 8
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig high-throughput -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"provisioned","shardCount":8,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac21-stream
+                namespace: kinesisstream
+              spec:
+                configRef: high-throughput
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac21-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: PROVISIONED
+                shardCount: 8
+
+    # AC-22: instance spec.configRef "" (empty) → falls through to general-policy default
+    # general-policy configRef default is "general-policy" (RGD schema default)
+    - name: ac22-configref-default-fallthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisConfig
+              metadata:
+                name: general-policy
+                namespace: kinesisstream
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                mandatory:
+                  streamMode: ""
+                  shardCount: 0
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  streamMode: "on_demand"
+                  shardCount: 0
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch kinesisconfig general-policy -n kinesisstream \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"streamMode":"","shardCount":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"streamMode":"on_demand","shardCount":0,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KinesisStream
+              metadata:
+                name: ac22-stream
+                namespace: kinesisstream
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: kinesis.services.k8s.aws/v1alpha1
+              kind: Stream
+              metadata:
+                name: ac22-stream
+                namespace: kinesisstream
+              spec:
+                streamModeDetails:
+                  streamMode: ON_DEMAND
+                name: kinesisstream-ac22-stream
