@@ -63,6 +63,7 @@ ACK_BARE_NAMES=(
   route
   serverlesscache
   snapshot
+  streams
   subnetgroup
   table
   taskdefinition
