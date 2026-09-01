@@ -96,13 +96,9 @@ spec:
       namingStatus: >-
         ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
       restApiId: >-
-        ${restApiWithSecurityPolicy.?status.?id.orValue("")}
-      noPolicyRestApiId: >-
-        ${restApiNoSecurityPolicy.?status.?id.orValue("")}
+        ${ackRestApiRef.size() > 0 ? ackRestApiRef[0].?status.?id.orValue("") : ""}
       rootResourceId: >-
-        ${restApiWithSecurityPolicy.?status.?rootResourceID.orValue("")}
-      noPolicyRootResourceId: >-
-        ${restApiNoSecurityPolicy.?status.?rootResourceID.orValue("")}
+        ${ackRestApiRef.size() > 0 ? ackRestApiRef[0].?status.?rootResourceID.orValue("") : ""}
       # restApiId is system-assigned; predictedArn uses region only — use ackResourceMetadata.arn at runtime
       predictedArn: >-
         ${"arn:aws:apigateway:" + (rsrcCfg.size() > 0 ? rsrcCfg[0].?status.?effectiveConfig.?aws.?region.orValue("") : "") + "::/restapis/<pending>"}
@@ -124,6 +120,23 @@ spec:
         jsonPath: .status.validationError
 
   resources:
+    # Always-bound lookup of this instance's own ACK RestAPI child.
+    # The RestAPI is created by two mutually exclusive includeWhen variants, so a status
+    # expression naming those variables is skipped whenever either is excluded — see
+    # docs/frequent-rgd-errors.md §"Variant-Split Resources Freeze Combined Status Expressions".
+    # An externalRef is never excluded (it resolves to [] until the child exists), so status
+    # exposes ONE stable restApiId/rootResourceId whichever variant fired. Consumers in other
+    # RGDs (APIGatewayAuthorizer, APIGatewayDeployment) read those single fields.
+    - id: ackRestApiRef
+      externalRef:
+        apiVersion: apigateway.services.k8s.aws/v1alpha1
+        kind: RestAPI
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
     # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
     - id: rsrcCfg
       externalRef:
@@ -422,12 +435,12 @@ spec:
     # the active variant (kro propagates "excluded" from inactive variants to any
     # resource whose template body references them; splitting avoids that).
     # pathSlug: (parentPath + "." + pathPart or pathPart).lowerAscii().strip-braces().dot-to-hyphen
-    - id: apiResourcesWithPolicy
+    # Root resources (parentPath == "") take parentID from the always-bound ackRestApiRef;
+    # nested resources use parentRef pointing at the parent Resource CR by computed name.
+    - id: apiResources
       includeWhen:
         - >-
-          ${((rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?mandatory.?minimumTlsVersion.orValue("") != "")
-            || (rsrcCfg.size() > 0 && rsrcCfg[0].?status.?effectiveConfig.?defaults.?minimumTlsVersion.orValue("") != ""))
-            && schema.spec.resources.size() > 0
+          ${schema.spec.resources.size() > 0
             && !naming.data.effectiveName.contains("{")
             && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
       forEach:
@@ -461,56 +474,11 @@ spec:
             from:
               name: ${schema.metadata.name}
           parentID: >-
-            ${res.parentPath == '' ? restApiWithSecurityPolicy.?status.?rootResourceID.orValue('') : ''}
+            ${res.parentPath == '' && ackRestApiRef.size() > 0 ? ackRestApiRef[0].?status.?rootResourceID.orValue('') : ''}
           parentRef:
             from:
               name: "${res.parentPath != '' ? schema.metadata.name + '-res-' + res.parentPath.lowerAscii().replace('{','').replace('}','').replace('.','-') : ''}"
 
-    - id: apiResourcesNoPolicy
-      includeWhen:
-        - >-
-          ${((rsrcCfg.size() == 0 || rsrcCfg[0].?status.?effectiveConfig.?mandatory.?minimumTlsVersion.orValue("") == "")
-            && (rsrcCfg.size() == 0 || rsrcCfg[0].?status.?effectiveConfig.?defaults.?minimumTlsVersion.orValue("") == ""))
-            && schema.spec.resources.size() > 0
-            && !naming.data.effectiveName.contains("{")
-            && !(schema.spec.policy != "" && schema.spec.resourcePolicyRef != "")}
-      forEach:
-        - res: "${schema.spec.resources}"
-      template:
-        apiVersion: apigateway.services.k8s.aws/v1alpha1
-        kind: Resource
-        metadata:
-          name: "${schema.metadata.name}-res-${(res.parentPath != '' ? res.parentPath + '.' + res.pathPart : res.pathPart).lowerAscii().replace('{','').replace('}','').replace('.','-')}"
-          namespace: ${schema.metadata.namespace}
-          labels: >-
-            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
-              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
-              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
-              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
-          annotations: >-
-            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
-              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
-              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
-              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
-          ownerReferences:
-            - apiVersion: aws.kropath.run/v1alpha1
-              kind: APIGatewayRestAPI
-              name: ${schema.metadata.name}
-              uid: ${schema.metadata.uid}
-              controller: true
-              blockOwnerDeletion: true
-        spec:
-          pathPart: ${res.pathPart}
-          restAPIRef:
-            from:
-              name: ${schema.metadata.name}
-          parentID: >-
-            ${res.parentPath == '' ? restApiNoSecurityPolicy.?status.?rootResourceID.orValue('') : ''}
-          parentRef:
-            from:
-              name: "${res.parentPath != '' ? schema.metadata.name + '-res-' + res.parentPath.lowerAscii().replace('{','').replace('}','').replace('.','-') : ''}"
-
-    # ── ACK Method CRs (forEach over flattened resources x methods) ───────────
     - id: apiMethods
       includeWhen:
         - >-
