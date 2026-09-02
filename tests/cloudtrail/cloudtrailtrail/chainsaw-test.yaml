@@ -1,0 +1,1619 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named CloudTrailConfig + CloudTrailTrail
+# and deletes nothing between steps. skipDelete: true stops chainsaw's end-of-test
+# cascade delete (the test cluster has kro but no ACK controllers, so ACK finalizers
+# are never removed and any delete would hang).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cloudtrailtrail
+spec:
+  skipDelete: true
+  namespace: cloudtrailtrail
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # ─── AC-1: s3BucketName direct ───────────────────────────────────────────
+    - name: ac1-s3-bucket-direct
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac1-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac1-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac1-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac1-cfg
+                s3BucketName: "my-audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac1-trail
+                namespace: cloudtrailtrail
+              spec:
+                s3BucketName: "my-audit-logs"
+
+    # ─── AC-2: s3BucketRef cross-RGD lookup ──────────────────────────────────
+    - name: ac2-s3-bucket-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac2-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac2-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: shared-audit-bucket
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: shared-audit-bucket
+              spec:
+                configRef: ac2-cfg
+                nameOverride: "org-audit-logs-123"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac2-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac2-cfg
+                s3BucketRef: "shared-audit-bucket"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac2-trail
+                namespace: cloudtrailtrail
+              spec:
+                s3BucketName: "org-audit-logs-123"
+
+    # ─── AC-3: mandatory s3BucketName overrides instance ─────────────────────
+    - name: ac3-s3-bucket-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac3-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  s3BucketName: "central-audit-logs"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac3-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"central-audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac3-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac3-cfg
+                s3BucketName: "team-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac3-trail
+                namespace: cloudtrailtrail
+              spec:
+                s3BucketName: "central-audit-logs"
+
+    # ─── AC-4: defaults s3BucketName when instance empty ─────────────────────
+    - name: ac4-s3-bucket-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac4-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  s3BucketName: "default-audit-logs"
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac4-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"default-audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac4-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac4-cfg
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac4-trail
+                namespace: cloudtrailtrail
+              spec:
+                s3BucketName: "default-audit-logs"
+
+    # ─── AC-5: s3KeyPrefix passthrough ───────────────────────────────────────
+    - name: ac5-s3-key-prefix
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac5-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac5-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac5-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac5-cfg
+                s3BucketName: "my-audit-logs"
+                s3KeyPrefix: "trails/prod/"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac5-trail
+                namespace: cloudtrailtrail
+              spec:
+                s3KeyPrefix: "trails/prod/"
+
+    # ─── AC-6: mandatory isMultiRegionTrail wins ──────────────────────────────
+    - name: ac6-multi-region-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac6-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  isMultiRegionTrail: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac6-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":true,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac6-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac6-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac6-trail
+                namespace: cloudtrailtrail
+              spec:
+                isMultiRegionTrail: true
+
+    # ─── AC-7: instance isMultiRegionTrail overrides defaults ────────────────
+    - name: ac7-multi-region-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac7-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  isMultiRegionTrail: false
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac7-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac7-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac7-cfg
+                s3BucketName: "audit-logs"
+                isMultiRegionTrail: true
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac7-trail
+                namespace: cloudtrailtrail
+              spec:
+                isMultiRegionTrail: true
+
+    # ─── AC-8: defaults isMultiRegionTrail when instance nil ─────────────────
+    - name: ac8-multi-region-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac8-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  isMultiRegionTrail: true
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac8-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":true,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac8-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac8-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac8-trail
+                namespace: cloudtrailtrail
+              spec:
+                isMultiRegionTrail: true
+
+    # ─── AC-9: mandatory isOrganizationTrail wins ─────────────────────────────
+    - name: ac9-org-trail-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac9-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory:
+                  isOrganizationTrail: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac9-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":true,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac9-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac9-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac9-trail
+                namespace: cloudtrailtrail
+              spec:
+                isOrganizationTrail: true
+
+    # ─── AC-10: instance isOrganizationTrail: false respected ────────────────
+    - name: ac10-org-trail-instance-false
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac10-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac10-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac10-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac10-cfg
+                s3BucketName: "audit-logs"
+                isOrganizationTrail: false
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac10-trail
+                namespace: cloudtrailtrail
+              spec:
+                isOrganizationTrail: false
+
+    # ─── AC-11: defaults includeGlobalServiceEvents applied ──────────────────
+    - name: ac11-global-events-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac11-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  includeGlobalServiceEvents: true
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac11-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":true,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac11-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac11-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac11-trail
+                namespace: cloudtrailtrail
+              spec:
+                includeGlobalServiceEvents: true
+
+    # ─── AC-12: instance includeGlobalServiceEvents: false overrides defaults ─
+    - name: ac12-global-events-instance-false
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac12-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac12-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac12-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac12-cfg
+                s3BucketName: "audit-logs"
+                includeGlobalServiceEvents: false
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac12-trail
+                namespace: cloudtrailtrail
+              spec:
+                includeGlobalServiceEvents: false
+
+    # ─── AC-13: mandatory enableLogFileValidation wins ────────────────────────
+    - name: ac13-log-validation-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac13-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory:
+                  enableLogFileValidation: true
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac13-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":true,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac13-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac13-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac13-trail
+                namespace: cloudtrailtrail
+              spec:
+                enableLogFileValidation: true
+
+    # ─── AC-14: instance enableLogFileValidation: false overrides defaults ────
+    - name: ac14-log-validation-instance-false
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac14-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  enableLogFileValidation: true
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac14-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":true,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac14-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac14-cfg
+                s3BucketName: "audit-logs"
+                enableLogFileValidation: false
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac14-trail
+                namespace: cloudtrailtrail
+              spec:
+                enableLogFileValidation: false
+
+    # ─── AC-15: mandatory kmsKeyID overrides instance ────────────────────────
+    - name: ac15-kms-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac15-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory:
+                  kmsKeyID: "arn:aws:kms:ap-southeast-2:123:key/org-key"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac15-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"arn:aws:kms:ap-southeast-2:123:key/org-key","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac15-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac15-cfg
+                s3BucketName: "audit-logs"
+                kmsKeyID: "alias/team-key"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac15-trail
+                namespace: cloudtrailtrail
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123:key/org-key"
+
+    # ─── AC-16: kmsKeyRef cross-RGD lookup ───────────────────────────────────
+    - name: ac16-kms-key-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac16-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac16-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: my-kms-key
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: my-kms-key
+              spec:
+                configRef: ac16-cfg
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Key
+              metadata:
+                name: my-kms-key
+                namespace: cloudtrailtrail
+        - script:
+            content: |
+              kubectl patch key my-kms-key -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"keyID":"arn:aws:kms:ap-southeast-2:123:key/abc"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac16-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac16-cfg
+                s3BucketName: "audit-logs"
+                kmsKeyRef: "my-kms-key"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac16-trail
+                namespace: cloudtrailtrail
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123:key/abc"
+
+    # ─── AC-17: no KMS encryption when kmsKeyID/Ref both empty ───────────────
+    - name: ac17-kms-no-encryption
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac17-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac17-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac17-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac17-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac17-trail
+                namespace: cloudtrailtrail
+              spec:
+                s3BucketName: "audit-logs"
+
+    # ─── AC-18: CloudWatch Logs delivery direct ───────────────────────────────
+    - name: ac18-cwl-delivery-direct
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac18-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac18-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac18-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac18-cfg
+                s3BucketName: "audit-logs"
+                cloudWatchLogsLogGroupARN: "arn:aws:logs:ap-southeast-2:123456789012:log-group:trail-logs"
+                cloudWatchLogsRoleARN: "arn:aws:iam::123456789012:role/ct-to-cwl"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac18-trail
+                namespace: cloudtrailtrail
+              spec:
+                cloudWatchLogsLogGroupARN: "arn:aws:logs:ap-southeast-2:123456789012:log-group:trail-logs"
+                cloudWatchLogsRoleARN: "arn:aws:iam::123456789012:role/ct-to-cwl"
+
+    # ─── AC-19: CloudWatch Logs roleRef cross-RGD lookup ─────────────────────
+    - name: ac19-cwl-delivery-role-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac19-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac19-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - script:
+            content: |
+              kubectl apply -f - <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMConfig
+              metadata:
+                name: ac19-iam-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+              EOF
+        - script:
+            content: |
+              kubectl patch iamconfig ac19-iam-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - script:
+            content: |
+              kubectl apply -f - <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMRole
+              metadata:
+                name: ct-delivery-role
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ct-delivery-role
+              spec:
+                configRef: ac19-cfg
+                type: lambda
+                nameOverride: ct-delivery-role
+              EOF
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac19-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac19-cfg
+                s3BucketName: "audit-logs"
+                cloudWatchLogsLogGroupARN: "arn:aws:logs:ap-southeast-2:123456789012:log-group:trail-logs"
+                cloudWatchLogsRoleRef: "ct-delivery-role"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac19-trail
+                namespace: cloudtrailtrail
+              spec:
+                cloudWatchLogsLogGroupARN: "arn:aws:logs:ap-southeast-2:123456789012:log-group:trail-logs"
+                cloudWatchLogsRoleARN: "arn:aws:iam::123456789012:role/ct-delivery-role"
+
+    # ─── AC-20: no CloudWatch Logs delivery when ARNs empty ──────────────────
+    - name: ac20-cwl-delivery-none
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac20-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac20-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac20-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac20-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac20-trail
+                namespace: cloudtrailtrail
+              status:
+                resourceName: "cloudtrailtrail-ac20-trail"
+                namingStatus: "valid"
+        # Wait for the ACK child itself before the script reads it — asserting the parent's
+        # status is not sufficient, as the instance status is written before the child
+        # becomes visible and a bare script step does not retry.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac20-trail
+                namespace: cloudtrailtrail
+        # AC-20 proper: with no cloudWatchLogsLogGroupARN on the instance, the RGD must
+        # omit BOTH CloudWatch Logs fields from the ACK Trail. ACK rejects a trail that
+        # carries only one of the pair, so absence of both is the behaviour under test.
+        # Uses a jq script rather than a declarative assert: chainsaw's assertion engine
+        # is JMESPath-style and has no reliable "field is absent" construct.
+        - script:
+            content: |
+              SPEC=$(kubectl get trail.cloudtrail.services.k8s.aws ac20-trail \
+                -n cloudtrailtrail -o jsonpath='{.spec}')
+              echo "spec: $SPEC"
+              echo "$SPEC" | jq -e 'has("cloudWatchLogsLogGroupARN") | not' \
+                || { echo "FAIL: cloudWatchLogsLogGroupARN must be omitted when unset"; exit 1; }
+              echo "$SPEC" | jq -e 'has("cloudWatchLogsRoleARN") | not' \
+                || { echo "FAIL: cloudWatchLogsRoleARN must be omitted when unset"; exit 1; }
+              echo "PASS: CloudWatch Logs delivery fields omitted"
+
+    # ─── AC-21: SNS topic passthrough ────────────────────────────────────────
+    - name: ac21-sns-topic
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac21-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac21-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac21-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac21-cfg
+                s3BucketName: "audit-logs"
+                snsTopicName: "trail-notifications"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac21-trail
+                namespace: cloudtrailtrail
+              spec:
+                snsTopicName: "trail-notifications"
+
+    # ─── AC-22: no SNS when snsTopicName empty ───────────────────────────────
+    - name: ac22-sns-none
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac22-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac22-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac22-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac22-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac22-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac22-trail
+                namespace: cloudtrailtrail
+              status:
+                resourceName: "cloudtrailtrail-ac22-trail"
+                namingStatus: "valid"
+        # AC-22 proper: snsTopicName left unset on the instance must reach ACK as the
+        # empty sentinel, i.e. no SNS notification topic is configured on the trail.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac22-trail
+                namespace: cloudtrailtrail
+              spec:
+                snsTopicName: ""
+
+    # ─── AC-23: standard naming template {namespace}-{name} ──────────────────
+    - name: ac23-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac23-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac23-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac23-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: api-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac23-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: api-trail
+                namespace: cloudtrailtrail
+              status:
+                resourceName: "cloudtrailtrail-api-trail"
+                namingStatus: "valid"
+                predictedArn: "arn:aws:cloudtrail:ap-southeast-2:123456789012:trail/cloudtrailtrail-api-trail"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: api-trail
+                namespace: cloudtrailtrail
+              spec:
+                name: "cloudtrailtrail-api-trail"
+
+    # ─── AC-24: mandatory naming template overrides defaults ─────────────────
+    - name: ac24-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac24-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac24-cfg
+              spec:
+                # namingTemplate is declared in the mandatory tier ONLY: the CloudTrailConfig
+                # CRD carries an x-kubernetes-validations mutual-exclusion rule ("namingTemplate
+                # cannot be set in both mandatory and defaults") that rejects the CR outright if
+                # both tiers set it explicitly. The mandatory-wins precedence under test is
+                # exercised through the status.effectiveConfig patch below, which is what the
+                # RGD actually reads (no controller runs in the test cluster).
+                mandatory:
+                  namingTemplate: "corp-{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac24-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"corp-{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac24-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac24-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac24-trail
+                namespace: cloudtrailtrail
+              status:
+                resourceName: "corp-cloudtrailtrail-ac24-trail"
+                namingStatus: "valid"
+
+    # ─── AC-25: nameOverride bypasses naming template ─────────────────────────
+    - name: ac25-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac25-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac25-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac25-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac25-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac25-cfg
+                s3BucketName: "audit-logs"
+                nameOverride: "legacy-audit-trail"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac25-trail
+                namespace: cloudtrailtrail
+              status:
+                resourceName: "legacy-audit-trail"
+                namingStatus: "valid"
+
+    # ─── AC-26: unresolved naming template token → invalid status ─────────────
+    - name: ac26-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac26-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac26-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac26-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{tag.env}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac26-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac26-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac26-trail
+                namespace: cloudtrailtrail
+              status:
+                namingStatus: "invalid-unresolved-tokens"
+
+    # ─── AC-27: tags merge — mandatory wins on conflict ────────────────────────
+    - name: ac27-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac27-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac27-cfg
+              spec:
+                mandatory:
+                  tags:
+                    resource-type: audit
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac27-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{"resource-type":"audit"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac27-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac27-cfg
+                s3BucketName: "audit-logs"
+                tags:
+                  app: api-trail
+        # Wait for kro to materialise the ACK child before the jq script reads it —
+        # a bare script step does not retry, so without this assert the kubectl get
+        # races reconciliation and returns NotFound.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac27-trail
+                namespace: cloudtrailtrail
+        # Order-independent tag assertions via jq (docs/frequent-rgd-errors.md §6): the
+        # CEL .merge().transformList() chain has unstable list order, and chainsaw's
+        # assertion engine cannot express an order-independent list match. Failures are
+        # signalled with a non-zero exit, NOT a `check:` block — `(contains(@, ...))`
+        # errors out with "invalid type for: <nil>" whenever the script writes no stdout.
+        - script:
+            content: |
+              TAGS=$(kubectl get trail.cloudtrail.services.k8s.aws ac27-trail \
+                -n cloudtrailtrail -o json | jq '.spec.tags')
+              echo "tags: $TAGS"
+              echo "$TAGS" | jq -e '.[] | select(.key == "resource-type" and .value == "audit")' > /dev/null \
+                || { echo "FAIL: mandatory tag resource-type:audit not found"; exit 1; }
+              echo "$TAGS" | jq -e '.[] | select(.key == "app" and .value == "api-trail")' > /dev/null \
+                || { echo "FAIL: instance tag app:api-trail not found"; exit 1; }
+              echo "PASS: mandatory and instance tags both merged onto the ACK Trail"
+
+    # ─── AC-28: syncedLabels applied to K8s labels and cloud tags ────────────
+    - name: ac28-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac28-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac28-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    compliance: pci
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac28-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{"compliance":"pci"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac28-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac28-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac28-trail
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/environment: production
+                  aws.kropath.run/compliance: pci
+        # The assert above confirms the ACK Trail child exists with labels.
+        # Now verify the same synced labels appear in spec.tags as {key,value} entries
+        # (ADR-015 §6.1) — order-independent via jq (docs/frequent-rgd-errors.md §6).
+        - script:
+            content: |
+              TAGS=$(kubectl get trail.cloudtrail.services.k8s.aws ac28-trail \
+                -n cloudtrailtrail -o json | jq '.spec.tags')
+              echo "tags: $TAGS"
+              echo "$TAGS" | jq -e '.[] | select(.key == "environment" and .value == "production")' > /dev/null \
+                || { echo "FAIL: synced label environment:production not found in spec.tags"; exit 1; }
+              echo "$TAGS" | jq -e '.[] | select(.key == "compliance" and .value == "pci")' > /dev/null \
+                || { echo "FAIL: synced label compliance:pci not found in spec.tags"; exit 1; }
+              echo "PASS: synced labels forwarded to ACK Trail spec.tags"
+
+    # ─── AC-29: syncedAnnotations applied to K8s annotations ─────────────────
+    - name: ac29-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac29-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac29-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac29-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"security"}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac29-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac29-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac29-trail
+                namespace: cloudtrailtrail
+                annotations:
+                  aws.kropath.run/team: security
+
+    # ─── AC-30: tags array conversion (map → [{key,value}]) ──────────────────
+    - name: ac30-tags-array-conversion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac30-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac30-cfg
+              spec:
+                mandatory:
+                  tags:
+                    cost-centre: security
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac30-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{"cost-centre":"security"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac30-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac30-cfg
+                s3BucketName: "audit-logs"
+                tags:
+                  app: api-trail
+        # Wait for the ACK child before reading it — see AC-27 for why this assert
+        # is required ahead of any kubectl-based script step.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac30-trail
+                namespace: cloudtrailtrail
+        - script:
+            content: |
+              TAGS=$(kubectl get trail.cloudtrail.services.k8s.aws ac30-trail \
+                -n cloudtrailtrail -o json | jq '.spec.tags')
+              echo "tags: $TAGS"
+              # ACK expects a list of {key,value} objects, not the map form the config uses.
+              echo "$TAGS" | jq -e 'type == "array"' > /dev/null \
+                || { echo "FAIL: tags is not an array"; exit 1; }
+              echo "$TAGS" | jq -e '.[] | select(.key == "cost-centre" and .value == "security")' > /dev/null \
+                || { echo "FAIL: mandatory tag cost-centre:security not found"; exit 1; }
+              echo "$TAGS" | jq -e '.[] | select(.key == "app" and .value == "api-trail")' > /dev/null \
+                || { echo "FAIL: instance tag app:api-trail not found"; exit 1; }
+              echo "PASS: tags converted to the ACK key/value array form"
+
+    # ─── AC-31: standard metadata on ACK Trail child ─────────────────────────
+    - name: ac31-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac31-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac31-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac31-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac31-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac31-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac31-trail
+                namespace: cloudtrailtrail
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac31-trail
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                # ownerReferences live under metadata, not spec — asserting them under
+                # spec makes chainsaw compare the expression against an empty spec and
+                # fail after the full 5m assert timeout.
+                (ownerReferences[0].kind): CloudTrailTrail
+                (ownerReferences[0].name): ac31-trail
+
+    # ─── AC-32: deletion policy delete ───────────────────────────────────────
+    - name: ac32-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac32-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac32-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac32-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac32-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac32-cfg
+                s3BucketName: "audit-logs"
+                deletionPolicy: "delete"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac32-trail
+                namespace: cloudtrailtrail
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ─── AC-33: deletion policy retain (default) ──────────────────────────────
+    - name: ac33-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac33-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac33-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac33-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac33-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac33-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac33-trail
+                namespace: cloudtrailtrail
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ─── AC-34: immutable trail name (status.resourceName stable) ────────────
+    - name: ac34-immutable-name
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailConfig
+              metadata:
+                name: ac34-cfg
+                namespace: cloudtrailtrail
+                labels:
+                  aws.kropath.run/resource-name: ac34-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch cloudtrailconfig ac34-cfg -n cloudtrailtrail \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"isMultiRegionTrail":false,"isOrganizationTrail":false,"includeGlobalServiceEvents":false,"enableLogFileValidation":false,"s3BucketName":"audit-logs","s3KeyPrefix":"","kmsKeyID":"","namingTemplate":"{namespace}-{name}","multiRegionEnabled":false,"organizationEnabled":false,"terminationProtectionEnabled":false,"retentionPeriod":0,"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac34-trail
+                namespace: cloudtrailtrail
+              spec:
+                configRef: ac34-cfg
+                s3BucketName: "audit-logs"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              metadata:
+                name: ac34-trail
+                namespace: cloudtrailtrail
+              status:
+                resourceName: "cloudtrailtrail-ac34-trail"
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac34-trail
+                namespace: cloudtrailtrail
+              spec:
+                name: "cloudtrailtrail-ac34-trail"

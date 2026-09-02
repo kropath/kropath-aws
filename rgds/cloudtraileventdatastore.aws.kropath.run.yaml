@@ -1,0 +1,132 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cloudtraileventdatastore.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: CloudTrailEventDataStore
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Multi-region and organization scope — tri-state boolean (nil=follow cascade).
+      # DO NOT add | default=false — see cloudtrailtrail.aws.kropath.run.yaml for rationale.
+      multiRegionEnabled: boolean
+      organizationEnabled: boolean
+      terminationProtectionEnabled: boolean
+      # Retention — 0 means "follow cascade"; builtin fallback 2557 days when all tiers are 0/nil.
+      retentionPeriod: integer | default=0
+      # Advanced event selectors — instance-only, passed through directly to ACK.
+      advancedEventSelectors: "[]AdvancedEventSelector | default=[]"
+    types:
+      AdvancedEventSelector:
+        name: string | default=""
+        fieldSelectors: "[]AdvancedFieldSelector | default=[]"
+      AdvancedFieldSelector:
+        field: string | default=""
+        equals: "[]string | default=[]"
+        notEquals: "[]string | default=[]"
+        startsWith: "[]string | default=[]"
+        notStartsWith: "[]string | default=[]"
+        endsWith: "[]string | default=[]"
+        notEndsWith: "[]string | default=[]"
+    status:
+      # KRO-236 naming exemption: CloudTrailEventDataStore has no provider name field
+      # (it is identified by a UUID ARN). No resourceName, namingStatus, or predictedArn.
+      #
+      # status.status collision: the ACK EventDataStore exposes status.status (e.g. "ENABLED").
+      # Surfaced here as storeStatus to avoid a name collision with the K8s status sub-resource.
+      storeStatus: >-
+        ${ackEventDataStore.?status.?status.orValue("")}
+      conditions: >-
+        ${ackEventDataStore.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: StoreStatus
+        type: string
+        jsonPath: .status.storeStatus
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudTrailConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACK CloudTrail EventDataStore CR.
+    # spec.name is derived from "${namespace}-${name}" — KRO-236 naming exemption applies;
+    # no effectiveName, namingTemplate, or nameOverride. ACK identifies the EDS by UUID ARN.
+    - id: ackEventDataStore
+      template:
+        apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+        kind: EventDataStore
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailEventDataStore
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # ACK derives the EDS name from spec.name; no cloud-side renaming support.
+          name: ${schema.metadata.namespace + "-" + schema.metadata.name}
+          multiRegionEnabled: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?multiRegionEnabled.orValue(false)
+              ? true
+              : (has(schema.spec.multiRegionEnabled)
+                  ? schema.spec.multiRegionEnabled
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?multiRegionEnabled.orValue(false) : false))}
+          organizationEnabled: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?organizationEnabled.orValue(false)
+              ? true
+              : (has(schema.spec.organizationEnabled)
+                  ? schema.spec.organizationEnabled
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?organizationEnabled.orValue(false) : false))}
+          terminationProtectionEnabled: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?terminationProtectionEnabled.orValue(false)
+              ? true
+              : (has(schema.spec.terminationProtectionEnabled)
+                  ? schema.spec.terminationProtectionEnabled
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?terminationProtectionEnabled.orValue(false) : false))}
+          retentionPeriod: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?retentionPeriod.orValue(0) > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.retentionPeriod
+              : (schema.spec.retentionPeriod > 0
+                  ? schema.spec.retentionPeriod
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?retentionPeriod.orValue(0) > 0
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.retentionPeriod
+                      : 2557))}
+          advancedEventSelectors: ${schema.spec.advancedEventSelectors}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}

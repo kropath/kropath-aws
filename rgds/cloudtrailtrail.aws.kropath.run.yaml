@@ -1,0 +1,364 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cloudtrailtrail.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: CloudTrailTrail
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # S3 delivery — either s3BucketName (direct ARN/name) or s3BucketRef (cross-RGD lookup).
+      s3BucketName: string | default=""
+      s3BucketRef: string | default=""
+      s3KeyPrefix: string | default=""
+      # Trail scope — tri-state boolean (nil=follow cascade, true=enable, false=disable).
+      # DO NOT add | default=false: kro materialises false on every instance and has()
+      # always returns true, defeating the nil-fallthrough cascade logic.
+      isMultiRegionTrail: boolean
+      isOrganizationTrail: boolean
+      includeGlobalServiceEvents: boolean
+      enableLogFileValidation: boolean
+      # KMS encryption — either kmsKeyID (direct ARN) or kmsKeyRef (cross-RGD lookup).
+      kmsKeyID: string | default=""
+      kmsKeyRef: string | default=""
+      # CloudWatch Logs delivery — all three fields together; only emitted to ACK when
+      # cloudWatchLogsLogGroupARN is non-empty (ACK rejects the trail if only one is set).
+      cloudWatchLogsLogGroupARN: string | default=""
+      cloudWatchLogsRoleARN: string | default=""
+      cloudWatchLogsRoleRef: string | default=""
+      # SNS notification
+      snsTopicName: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && !naming.data.effectiveName.contains("{") && naming.data.effectiveName != ""
+          ? "arn:aws:cloudtrail:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":trail/" + naming.data.effectiveName
+          : ""}
+      conditions: >-
+        ${ackTrailRef.size() > 0 ? ackTrailRef[0].?status.?conditions.orValue([]) : []}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudTrailConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Cross-RGD S3Bucket lookup — returns [] when s3BucketRef is empty (sentinel).
+    - id: s3BucketCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: S3Bucket
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.s3BucketRef != "" ? schema.spec.s3BucketRef : "kro-empty-fallback-sentinel"}'
+
+    # Cross-RGD KMSKey lookup — returns [] when kmsKeyRef is empty (sentinel).
+    - id: kmsKeyCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KMSKey
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.kmsKeyRef != "" ? schema.spec.kmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # Cross-RGD IAMRole lookup for CloudWatch Logs role — returns [] when cloudWatchLogsRoleRef is empty.
+    - id: iamRoleCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMRole
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.cloudWatchLogsRoleRef != "" ? schema.spec.cloudWatchLogsRoleRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+    # Any {tag.X} token whose key is absent in all tiers is kept verbatim so that
+    # namingStatus (computed in status block) reports "invalid-unresolved-tokens".
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}"))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # Always-bound self-lookup for the Trail's own ACK child (either variant).
+    # externalRef is never gated by includeWhen, so resolves to [] until the child exists —
+    # prevents Unbound Variable Freeze on status.conditions (KRO-925 pattern).
+    - id: ackTrailRef
+      externalRef:
+        apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+        kind: Trail
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # ACK CloudTrail Trail CR — variant WITH CloudWatch Logs delivery.
+    # Created when naming is valid AND spec.cloudWatchLogsLogGroupARN is non-empty.
+    # AWS requires both cloudWatchLogsLogGroupArn and cloudWatchLogsRoleArn together.
+    - id: ackTrailWithCwl
+      includeWhen:
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+            && schema.spec.cloudWatchLogsLogGroupARN != ""}
+      template:
+        apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+        kind: Trail
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name, "aws.kropath.run/resource-name": naming.data.effectiveName}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          s3BucketName: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?s3BucketName.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.s3BucketName
+              : (schema.spec.s3BucketRef != "" && s3BucketCr.size() > 0 && s3BucketCr[0].?status.?resourceName.orValue("") != ""
+                  ? s3BucketCr[0].status.resourceName
+                  : (schema.spec.s3BucketName != ""
+                      ? schema.spec.s3BucketName
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?s3BucketName.orValue("") : "")))}
+          s3KeyPrefix: >-
+            ${schema.spec.s3KeyPrefix != ""
+              ? schema.spec.s3KeyPrefix
+              : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?s3KeyPrefix.orValue("") : "")}
+          isMultiRegionTrail: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?isMultiRegionTrail.orValue(false)
+              ? true
+              : (has(schema.spec.isMultiRegionTrail)
+                  ? schema.spec.isMultiRegionTrail
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?isMultiRegionTrail.orValue(false) : false))}
+          isOrganizationTrail: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?isOrganizationTrail.orValue(false)
+              ? true
+              : (has(schema.spec.isOrganizationTrail)
+                  ? schema.spec.isOrganizationTrail
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?isOrganizationTrail.orValue(false) : false))}
+          includeGlobalServiceEvents: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?includeGlobalServiceEvents.orValue(false)
+              ? true
+              : (has(schema.spec.includeGlobalServiceEvents)
+                  ? schema.spec.includeGlobalServiceEvents
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?includeGlobalServiceEvents.orValue(false) : false))}
+          enableLogFileValidation: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?enableLogFileValidation.orValue(false)
+              ? true
+              : (has(schema.spec.enableLogFileValidation)
+                  ? schema.spec.enableLogFileValidation
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?enableLogFileValidation.orValue(false) : false))}
+          kmsKeyID: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsKeyID
+              : (schema.spec.kmsKeyRef != "" && kmsKeyCr.size() > 0 && kmsKeyCr[0].?status.?keyID.orValue("") != ""
+                  ? kmsKeyCr[0].status.keyID
+                  : (schema.spec.kmsKeyID != ""
+                      ? schema.spec.kmsKeyID
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") : "")))}
+          cloudWatchLogsLogGroupARN: ${schema.spec.cloudWatchLogsLogGroupARN}
+          cloudWatchLogsRoleARN: >-
+            ${schema.spec.cloudWatchLogsRoleRef != "" && iamRoleCr.size() > 0 && iamRoleCr[0].?status.?predictedArn.orValue("") != ""
+              ? iamRoleCr[0].status.predictedArn
+              : schema.spec.cloudWatchLogsRoleARN}
+          snsTopicName: ${schema.spec.snsTopicName}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
+
+    # ACK CloudTrail Trail CR — variant WITHOUT CloudWatch Logs delivery.
+    # Created when naming is valid AND spec.cloudWatchLogsLogGroupARN is empty.
+    - id: ackTrailNoCwl
+      includeWhen:
+        - >-
+          ${!naming.data.effectiveName.contains("{")
+            && schema.spec.cloudWatchLogsLogGroupARN == ""}
+      template:
+        apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+        kind: Trail
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name, "aws.kropath.run/resource-name": naming.data.effectiveName}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudTrailTrail
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          s3BucketName: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?s3BucketName.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.s3BucketName
+              : (schema.spec.s3BucketRef != "" && s3BucketCr.size() > 0 && s3BucketCr[0].?status.?resourceName.orValue("") != ""
+                  ? s3BucketCr[0].status.resourceName
+                  : (schema.spec.s3BucketName != ""
+                      ? schema.spec.s3BucketName
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?s3BucketName.orValue("") : "")))}
+          s3KeyPrefix: >-
+            ${schema.spec.s3KeyPrefix != ""
+              ? schema.spec.s3KeyPrefix
+              : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?s3KeyPrefix.orValue("") : "")}
+          isMultiRegionTrail: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?isMultiRegionTrail.orValue(false)
+              ? true
+              : (has(schema.spec.isMultiRegionTrail)
+                  ? schema.spec.isMultiRegionTrail
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?isMultiRegionTrail.orValue(false) : false))}
+          isOrganizationTrail: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?isOrganizationTrail.orValue(false)
+              ? true
+              : (has(schema.spec.isOrganizationTrail)
+                  ? schema.spec.isOrganizationTrail
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?isOrganizationTrail.orValue(false) : false))}
+          includeGlobalServiceEvents: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?includeGlobalServiceEvents.orValue(false)
+              ? true
+              : (has(schema.spec.includeGlobalServiceEvents)
+                  ? schema.spec.includeGlobalServiceEvents
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?includeGlobalServiceEvents.orValue(false) : false))}
+          enableLogFileValidation: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?enableLogFileValidation.orValue(false)
+              ? true
+              : (has(schema.spec.enableLogFileValidation)
+                  ? schema.spec.enableLogFileValidation
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?enableLogFileValidation.orValue(false) : false))}
+          kmsKeyID: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyID.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsKeyID
+              : (schema.spec.kmsKeyRef != "" && kmsKeyCr.size() > 0 && kmsKeyCr[0].?status.?keyID.orValue("") != ""
+                  ? kmsKeyCr[0].status.keyID
+                  : (schema.spec.kmsKeyID != ""
+                      ? schema.spec.kmsKeyID
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyID.orValue("") : "")))}
+          snsTopicName: ${schema.spec.snsTopicName}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
