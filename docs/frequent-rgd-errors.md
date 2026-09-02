@@ -234,6 +234,22 @@ This document tracks technical friction points, syntax limitations, and runtime 
   the one acceptable exception: `conditions` is a list that genuinely differs per variant and has no
   cross-RGD consumers.
 
+* **Building the variants is not the fix — deleting the key is.** KRO-925 shipped `dsqlcluster`
+  with a `WithWitness`/`NoWitness` variant pair where the `NoWitness` variants — selected precisely
+  when `witnessRegion == ""` — still rendered `witnessRegion: ""`. The split existed; the field was
+  never removed from the templates the split was created to remove it from. After adding a negative
+  variant, assert the key is **absent** from it.
+
+* **When you gate the whole resource instead (option 3), the gate must cover ref *readiness*.**
+  `lambdaalias` is correct: `includeWhen: ${fnCr.size() > 0 && has(fnCr[0].status.resourceName)}`
+  makes the `: ""` arm unreachable. `acmprivatecertificate` was not: its gate enforced "exactly one
+  of ARN/Ref is set" but not "the referenced CA resolved", so an unresolved `caRefCr` fell through
+  to `""`. Mutual-exclusion validation is not readiness validation.
+
+* **A `!= ""` test whose false branch is `""` guards nothing.** `${schema.spec.x != "" ? schema.spec.x : ""}`
+  is a no-op that renders `x: ""` in exactly the case it looks like it prevents. 27 fields shipped in
+  this shape under KRO-932. Grep for it directly: `grep -rn '!= "" ? [^:]* : ""' rgds/`.
+
 * **How to audit an RGD for this:** any `status:` expression naming **more than one** `includeWhen`-gated
   resource id is broken. Mechanical check:
     ```python
