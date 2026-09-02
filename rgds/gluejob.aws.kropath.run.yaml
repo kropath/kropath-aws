@@ -82,9 +82,9 @@ spec:
           ? "arn:aws:glue:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":job/" + naming.data.resourceName
           : ""}
       lastCommitID: >-
-        ${ackJob.?spec.?sourceControlDetails.?lastCommitID.orValue("")}
+        ${ackJobRef.size() > 0 ? ackJobRef[0].?spec.?sourceControlDetails.?lastCommitID.orValue("") : ""}
       conditions: >-
-        ${ackJob.?status.?conditions.orValue([])}
+        ${ackJobRef.size() > 0 ? ackJobRef[0].?status.?conditions.orValue([]) : []}
     additionalPrinterColumns:
       - name: ResourceName
         type: string
@@ -216,11 +216,24 @@ spec:
               ? "invalid-unresolved-tokens"
               : "valid"}
 
-    # ACK Glue Job CR — primary cloud resource.
-    # Only created when resourceName has no unresolved {tag.X} tokens.
-    - id: ackJob
+    # Always-bound self-lookup for status expressions — resolves to [] until the child Job exists,
+    # so status.lastCommitID and status.conditions never freeze when includeWhen excludes ackJob variants.
+    - id: ackJobRef
+      externalRef:
+        apiVersion: glue.services.k8s.aws/v1alpha1
+        kind: Job
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # ACK Glue Job CR — with securityConfiguration (mandatory -> instance -> defaults cascade).
+    # Only created when resourceName has no unresolved tokens AND effective securityConfiguration is non-empty.
+    - id: ackJobWithSecurityConfig
       includeWhen:
         - '${!naming.data.resourceName.contains("{")}'
+        - '${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?securityConfiguration.orValue("") != "") || schema.spec.securityConfiguration != "" || (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?securityConfiguration.orValue("") != "")}'
       template:
         apiVersion: glue.services.k8s.aws/v1alpha1
         kind: Job
@@ -246,15 +259,12 @@ spec:
               blockOwnerDeletion: true
         spec:
           name: ${naming.data.resourceName}
-          # Command — required fields for job execution
           command:
             name: ${schema.spec.command.name}
             scriptLocation: ${schema.spec.command.scriptLocation}
             pythonVersion: ${schema.spec.command.pythonVersion}
             runtime: ${schema.spec.command.runtime}
-          # IAM role ARN
           role: ${schema.spec.role}
-          # Glue version — mandatory -> instance -> defaults -> built-in fallback (4.0)
           glueVersion: >-
             ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?glueVersion.orValue("") != ""
               ? rsrcCfg[0].status.effectiveConfig.mandatory.?glueVersion.orValue("")
@@ -263,7 +273,6 @@ spec:
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?glueVersion.orValue("") != ""
                       ? rsrcCfg[0].status.effectiveConfig.defaults.?glueVersion.orValue("")
                       : "4.0"))}
-          # Worker type — mandatory -> instance -> defaults -> G.1X; set "" when maxCapacity > 0
           workerType: >-
             ${schema.spec.maxCapacity > 0.0 ? "" :
               (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?workerType.orValue("") != ""
@@ -273,7 +282,6 @@ spec:
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?workerType.orValue("") != ""
                         ? rsrcCfg[0].status.effectiveConfig.defaults.?workerType.orValue("")
                         : "G.1X")))}
-          # Number of workers — mandatory -> instance -> defaults -> 2; 0 when maxCapacity > 0
           numberOfWorkers: >-
             ${schema.spec.maxCapacity > 0.0 ? 0 :
               (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?numberOfWorkers.orValue(0) > 0
@@ -283,10 +291,8 @@ spec:
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?numberOfWorkers.orValue(0) > 0
                         ? rsrcCfg[0].status.effectiveConfig.defaults.?numberOfWorkers.orValue(0)
                         : 2)))}
-          # Max DPU capacity (legacy Glue v1.0) — 0 means not set; mutually exclusive with workerType+numberOfWorkers
           maxCapacity: >-
             ${schema.spec.maxCapacity > 0.0 ? schema.spec.maxCapacity : 0.0}
-          # Execution class — mandatory -> instance -> defaults -> "STANDARD" (Glue API default)
           executionClass: >-
             ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?executionClass.orValue("") != ""
               ? rsrcCfg[0].status.effectiveConfig.mandatory.?executionClass.orValue("")
@@ -294,22 +300,19 @@ spec:
                   ? schema.spec.executionClass
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?executionClass.orValue("") != ""
                       ? rsrcCfg[0].status.effectiveConfig.defaults.?executionClass.orValue("")
-                      : "STANDARD"))}
-          # Timeout in minutes — mandatory -> instance -> defaults; 0 = Glue service default (2880)
+                      : ""))}
           timeout: >-
             ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?timeout.orValue(0) > 0
               ? rsrcCfg[0].status.effectiveConfig.mandatory.?timeout.orValue(0)
               : (schema.spec.timeout > 0
                   ? schema.spec.timeout
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?timeout.orValue(0) : 0))}
-          # Max retries — mandatory -> instance -> defaults; 0 = no retries
           maxRetries: >-
             ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?maxRetries.orValue(0) > 0
               ? rsrcCfg[0].status.effectiveConfig.mandatory.?maxRetries.orValue(0)
               : (schema.spec.maxRetries > 0
                   ? schema.spec.maxRetries
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?maxRetries.orValue(0) : 0))}
-          # Execution property — concurrency limit (mandatory -> instance -> defaults -> 1)
           executionProperty:
             maxConcurrentRuns: >-
               ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?maxConcurrentRuns.orValue(0) > 0
@@ -319,19 +322,16 @@ spec:
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?maxConcurrentRuns.orValue(0) > 0
                         ? rsrcCfg[0].status.effectiveConfig.defaults.?maxConcurrentRuns.orValue(0)
                         : 1))}
-          # Job run queuing — passed through from instance spec
           jobRunQueuingEnabled: ${schema.spec.jobRunQueuingEnabled}
-          # Security configuration — mandatory -> instance -> defaults (non-"") -> "".
-          # "" causes ACK to reject. Full fix: 2-variant (ackJobWithSecurityConfig/WithoutSecurityConfig).
+          # securityConfiguration: mandatory -> instance -> defaults (guaranteed non-empty by includeWhen)
           securityConfiguration: >-
             ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?securityConfiguration.orValue("") != ""
               ? rsrcCfg[0].status.effectiveConfig.mandatory.?securityConfiguration.orValue("")
               : (schema.spec.securityConfiguration != ""
                   ? schema.spec.securityConfiguration
-                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?securityConfiguration.orValue("") != ""
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)
                       ? rsrcCfg[0].status.effectiveConfig.defaults.?securityConfiguration.orValue("")
                       : ""))}
-          # Notification property — 0 means no notification
           notificationProperty:
             notifyDelayAfter: >-
               ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?notifyDelayAfter.orValue(0) > 0
@@ -339,16 +339,13 @@ spec:
                 : (schema.spec.notifyDelayAfter > 0
                     ? schema.spec.notifyDelayAfter
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?notifyDelayAfter.orValue(0) : 0))}
-          # Optional fields — passed through verbatim; "" = not set (ACK omits empty strings)
           description: ${schema.spec.description}
           connections:
             connections: ${schema.spec.connections}
           jobMode: ${schema.spec.jobMode}
           maintenanceWindow: ${schema.spec.maintenanceWindow}
-          # Job arguments — passed through verbatim from instance spec
           defaultArguments: ${schema.spec.defaultArguments}
           nonOverridableArguments: ${schema.spec.nonOverridableArguments}
-          # Source control (optional) — all "" when not used; ACK omits empty optional strings
           sourceControlDetails:
             provider: ${schema.spec.sourceControlDetails.provider}
             repository: ${schema.spec.sourceControlDetails.repository}
@@ -357,10 +354,134 @@ spec:
             folder: ${schema.spec.sourceControlDetails.folder}
             authStrategy: ${schema.spec.sourceControlDetails.authStrategy}
             authToken: ${schema.spec.sourceControlDetails.authToken}
-          # Cloud resource tags — ACK Glue Job spec.tags is map[string]string (not array).
-          # Merge order: defaults -> instance spec -> mandatory (mandatory wins on collision).
-          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
-          # No transformList needed — Glue tags are already a map type.
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+
+    # ACK Glue Job CR — without securityConfiguration (omit field so ACK never sees "").
+    # Only created when resourceName has no unresolved tokens AND effective securityConfiguration is empty.
+    - id: ackJobWithoutSecurityConfig
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+        - '${!(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?securityConfiguration.orValue("") != "") && schema.spec.securityConfiguration == "" && !(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?securityConfiguration.orValue("") != "")}'
+      template:
+        apiVersion: glue.services.k8s.aws/v1alpha1
+        kind: Job
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: GlueJob
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          command:
+            name: ${schema.spec.command.name}
+            scriptLocation: ${schema.spec.command.scriptLocation}
+            pythonVersion: ${schema.spec.command.pythonVersion}
+            runtime: ${schema.spec.command.runtime}
+          role: ${schema.spec.role}
+          glueVersion: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?glueVersion.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?glueVersion.orValue("")
+              : (schema.spec.glueVersion != ""
+                  ? schema.spec.glueVersion
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?glueVersion.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?glueVersion.orValue("")
+                      : "4.0"))}
+          workerType: >-
+            ${schema.spec.maxCapacity > 0.0 ? "" :
+              (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?workerType.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?workerType.orValue("")
+                : (schema.spec.workerType != ""
+                    ? schema.spec.workerType
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?workerType.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?workerType.orValue("")
+                        : "G.1X")))}
+          numberOfWorkers: >-
+            ${schema.spec.maxCapacity > 0.0 ? 0 :
+              (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?numberOfWorkers.orValue(0) > 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?numberOfWorkers.orValue(0)
+                : (schema.spec.numberOfWorkers > 0
+                    ? schema.spec.numberOfWorkers
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?numberOfWorkers.orValue(0) > 0
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?numberOfWorkers.orValue(0)
+                        : 2)))}
+          maxCapacity: >-
+            ${schema.spec.maxCapacity > 0.0 ? schema.spec.maxCapacity : 0.0}
+          executionClass: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?executionClass.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?executionClass.orValue("")
+              : (schema.spec.executionClass != ""
+                  ? schema.spec.executionClass
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?executionClass.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?executionClass.orValue("")
+                      : ""))}
+          timeout: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?timeout.orValue(0) > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?timeout.orValue(0)
+              : (schema.spec.timeout > 0
+                  ? schema.spec.timeout
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?timeout.orValue(0) : 0))}
+          maxRetries: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?maxRetries.orValue(0) > 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?maxRetries.orValue(0)
+              : (schema.spec.maxRetries > 0
+                  ? schema.spec.maxRetries
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?maxRetries.orValue(0) : 0))}
+          executionProperty:
+            maxConcurrentRuns: >-
+              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?maxConcurrentRuns.orValue(0) > 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?maxConcurrentRuns.orValue(0)
+                : (schema.spec.maxConcurrentRuns > 0
+                    ? schema.spec.maxConcurrentRuns
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?maxConcurrentRuns.orValue(0) > 0
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.?maxConcurrentRuns.orValue(0)
+                        : 1))}
+          jobRunQueuingEnabled: ${schema.spec.jobRunQueuingEnabled}
+          notificationProperty:
+            notifyDelayAfter: >-
+              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?notifyDelayAfter.orValue(0) > 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.?notifyDelayAfter.orValue(0)
+                : (schema.spec.notifyDelayAfter > 0
+                    ? schema.spec.notifyDelayAfter
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?notifyDelayAfter.orValue(0) : 0))}
+          description: ${schema.spec.description}
+          connections:
+            connections: ${schema.spec.connections}
+          jobMode: ${schema.spec.jobMode}
+          maintenanceWindow: ${schema.spec.maintenanceWindow}
+          defaultArguments: ${schema.spec.defaultArguments}
+          nonOverridableArguments: ${schema.spec.nonOverridableArguments}
+          sourceControlDetails:
+            provider: ${schema.spec.sourceControlDetails.provider}
+            repository: ${schema.spec.sourceControlDetails.repository}
+            owner: ${schema.spec.sourceControlDetails.owner}
+            branch: ${schema.spec.sourceControlDetails.branch}
+            folder: ${schema.spec.sourceControlDetails.folder}
+            authStrategy: ${schema.spec.sourceControlDetails.authStrategy}
+            authToken: ${schema.spec.sourceControlDetails.authToken}
           tags: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
               .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
