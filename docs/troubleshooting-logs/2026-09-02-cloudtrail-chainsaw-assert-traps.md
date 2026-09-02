@@ -144,3 +144,66 @@ by an earlier partial run:
 --- PASS: chainsaw/cloudtrail/cloudtrailtrail           (28.57s / 37.65s / 34.70s)
 - Passed  tests 2 ; Failed tests 0     (x3)
 ```
+
+## Addendum: inherited `main` regression (KRO-813) that kept the pipeline red
+
+With both CloudTrail suites green, PR #204's CI still failed — in `cloudtrailconfig`, a suite the
+PR does not touch:
+
+```
+KropathConfig.aws.kropath.run "cluster" is invalid: <nil>: Invalid value: "object":
+no such key: allowedDocumentTypes evaluating rule:
+spec.mandatory.ssm.allowedDocumentTypes and spec.defaults.ssm.allowedDocumentTypes
+cannot both be set. Set the field in exactly one tier.
+```
+
+This is a `main` regression, not a PR defect. `main` had been red since
+`a0d88b1 feat(KRO-813)` (run 33618110858 shows the identical error), and PR CI tests the branch
+**merged with main**, so every open PR inherited it.
+
+**Root cause.** KRO-813 correctly removed the scalar `default:` values from `KropathConfig`'s
+`spec.mandatory.*` / `spec.defaults.*` fields, per `kropath-rgd-cel-traps` §2. But 27 of the CRD's
+117 `x-kubernetes-validations` rules read those fields *without* a `has()` guard:
+
+```cel
+!(has(self.spec.mandatory) && has(self.spec.mandatory.ssm) &&
+  size(self.spec.mandatory.ssm.allowedDocumentTypes) > 0 && ...)
+```
+
+While the defaults existed, Kubernetes materialised `[]` / `""` / `false` on every instance, so the
+unguarded access always resolved and the omission was invisible. Once the defaults were removed the
+key is genuinely absent, CEL raises `no such key`, and **every** `KropathConfig` apply is rejected —
+including ones that set none of the fields in question.
+
+**Fix.** Add the missing field-level guard before each access (54 insertions across 27 rules):
+
+```cel
+!(has(self.spec.mandatory) && has(self.spec.mandatory.ssm) &&
+  has(self.spec.mandatory.ssm.allowedDocumentTypes) &&
+  size(self.spec.mandatory.ssm.allowedDocumentTypes) > 0 && ...)
+```
+
+The change is strictly *loosening*: a guard can only make a rule evaluate `false` (no violation)
+where it previously threw. It cannot introduce a new rejection. Verified against a live API server:
+
+| Case | Expected | Result |
+|---|---|---|
+| Minimal config, no family fields (the failing one) | accepted | accepted |
+| `ssm.allowedDocumentTypes` set in both tiers | rejected | rejected |
+| `ec2.imdsv2Required: true` in both tiers | rejected | rejected |
+| Fields set in the mandatory tier only | accepted | accepted |
+
+Then re-ran the suites that consume `KropathConfig`: `cloudtrail` (3), `elasticache` + `memorydb`
+(15), `kms` + `lambda` + `iam` (19) — 37 suites, 0 failures.
+
+### Related latent occurrence — NOT fixed here
+
+`crds/secretsmanagerconfig.yaml` has the same unguarded shape in 4 rules
+(`kmsKeyID`, `replicaRegions`, `forceOverwriteReplicaSecret`, `namingTemplate`). It does not fail
+today only because that CRD still carries the scalar `default:` values that cel-traps §2 prohibits.
+Whoever removes those defaults must add the `has()` guards in the same change, or secretsmanager
+will break exactly as KropathConfig did.
+
+**Rule of thumb:** removing a `default:` from a field that any `x-kubernetes-validations` rule reads
+is a breaking change unless every read of that field is `has()`-guarded. Audit the rules in the same
+commit that removes the default.
