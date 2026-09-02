@@ -61,6 +61,8 @@ ACK_BARE_NAMES=(
   restapi
   role
   route
+  scalabletargets
+  scalingpolicies
   serverlesscache
   snapshot
   streams
