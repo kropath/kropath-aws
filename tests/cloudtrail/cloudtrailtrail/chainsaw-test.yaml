@@ -922,8 +922,35 @@ spec:
               kind: CloudTrailTrail
               metadata:
                 name: ac20-trail
+                namespace: cloudtrailtrail
               status:
-                resourceName: (contains(@, 'cloudtrailtrail'))
+                resourceName: "cloudtrailtrail-ac20-trail"
+                namingStatus: "valid"
+        # Wait for the ACK child itself before the script reads it — asserting the parent's
+        # status is not sufficient, as the instance status is written before the child
+        # becomes visible and a bare script step does not retry.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac20-trail
+                namespace: cloudtrailtrail
+        # AC-20 proper: with no cloudWatchLogsLogGroupARN on the instance, the RGD must
+        # omit BOTH CloudWatch Logs fields from the ACK Trail. ACK rejects a trail that
+        # carries only one of the pair, so absence of both is the behaviour under test.
+        # Uses a jq script rather than a declarative assert: chainsaw's assertion engine
+        # is JMESPath-style and has no reliable "field is absent" construct.
+        - script:
+            content: |
+              SPEC=$(kubectl get trail.cloudtrail.services.k8s.aws ac20-trail \
+                -n cloudtrailtrail -o jsonpath='{.spec}')
+              echo "spec: $SPEC"
+              echo "$SPEC" | jq -e 'has("cloudWatchLogsLogGroupARN") | not' \
+                || { echo "FAIL: cloudWatchLogsLogGroupARN must be omitted when unset"; exit 1; }
+              echo "$SPEC" | jq -e 'has("cloudWatchLogsRoleARN") | not' \
+                || { echo "FAIL: cloudWatchLogsRoleARN must be omitted when unset"; exit 1; }
+              echo "PASS: CloudWatch Logs delivery fields omitted"
 
     # ─── AC-21: SNS topic passthrough ────────────────────────────────────────
     - name: ac21-sns-topic
@@ -1002,8 +1029,21 @@ spec:
               kind: CloudTrailTrail
               metadata:
                 name: ac22-trail
+                namespace: cloudtrailtrail
               status:
-                resourceName: (contains(@, 'cloudtrailtrail'))
+                resourceName: "cloudtrailtrail-ac22-trail"
+                namingStatus: "valid"
+        # AC-22 proper: snsTopicName left unset on the instance must reach ACK as the
+        # empty sentinel, i.e. no SNS notification topic is configured on the trail.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac22-trail
+                namespace: cloudtrailtrail
+              spec:
+                snsTopicName: ""
 
     # ─── AC-23: standard naming template {namespace}-{name} ──────────────────
     - name: ac23-naming-standard
@@ -1069,10 +1109,14 @@ spec:
                 labels:
                   aws.kropath.run/resource-name: ac24-cfg
               spec:
+                # namingTemplate is declared in the mandatory tier ONLY: the CloudTrailConfig
+                # CRD carries an x-kubernetes-validations mutual-exclusion rule ("namingTemplate
+                # cannot be set in both mandatory and defaults") that rejects the CR outright if
+                # both tiers set it explicitly. The mandatory-wins precedence under test is
+                # exercised through the status.effectiveConfig patch below, which is what the
+                # RGD actually reads (no controller runs in the test cluster).
                 mandatory:
                   namingTemplate: "corp-{namespace}-{name}"
-                defaults:
-                  namingTemplate: "{namespace}-{name}"
         - script:
             content: |
               kubectl patch cloudtrailconfig ac24-cfg -n cloudtrailtrail \
@@ -1216,15 +1260,31 @@ spec:
                 s3BucketName: "audit-logs"
                 tags:
                   app: api-trail
+        # Wait for kro to materialise the ACK child before the jq script reads it —
+        # a bare script step does not retry, so without this assert the kubectl get
+        # races reconciliation and returns NotFound.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac27-trail
+                namespace: cloudtrailtrail
+        # Order-independent tag assertions via jq (docs/frequent-rgd-errors.md §6): the
+        # CEL .merge().transformList() chain has unstable list order, and chainsaw's
+        # assertion engine cannot express an order-independent list match. Failures are
+        # signalled with a non-zero exit, NOT a `check:` block — `(contains(@, ...))`
+        # errors out with "invalid type for: <nil>" whenever the script writes no stdout.
         - script:
             content: |
-              TAGS=$(kubectl get trail ac27-trail -n cloudtrailtrail -o json | jq '.spec.tags')
-              echo "$TAGS"
-              echo "$TAGS" | jq -e '.[] | select(.key == "resource-type" and .value == "audit")' > /dev/null && echo "mandatory-tag-found"
-              echo "$TAGS" | jq -e '.[] | select(.key == "app" and .value == "api-trail")' > /dev/null && echo "instance-tag-found"
-            check:
-              (contains(@, 'mandatory-tag-found')): true
-              (contains(@, 'instance-tag-found')): true
+              TAGS=$(kubectl get trail.cloudtrail.services.k8s.aws ac27-trail \
+                -n cloudtrailtrail -o json | jq '.spec.tags')
+              echo "tags: $TAGS"
+              echo "$TAGS" | jq -e '.[] | select(.key == "resource-type" and .value == "audit")' > /dev/null \
+                || { echo "FAIL: mandatory tag resource-type:audit not found"; exit 1; }
+              echo "$TAGS" | jq -e '.[] | select(.key == "app" and .value == "api-trail")' > /dev/null \
+                || { echo "FAIL: instance tag app:api-trail not found"; exit 1; }
+              echo "PASS: mandatory and instance tags both merged onto the ACK Trail"
 
     # ─── AC-28: syncedLabels applied to K8s labels and cloud tags ────────────
     - name: ac28-synced-labels-dual
@@ -1344,18 +1404,28 @@ spec:
                 s3BucketName: "audit-logs"
                 tags:
                   app: api-trail
+        # Wait for the ACK child before reading it — see AC-27 for why this assert
+        # is required ahead of any kubectl-based script step.
+        - assert:
+            resource:
+              apiVersion: cloudtrail.services.k8s.aws/v1alpha1
+              kind: Trail
+              metadata:
+                name: ac30-trail
+                namespace: cloudtrailtrail
         - script:
             content: |
-              TAGS=$(kubectl get trail ac30-trail -n cloudtrailtrail -o json | jq '.spec.tags')
+              TAGS=$(kubectl get trail.cloudtrail.services.k8s.aws ac30-trail \
+                -n cloudtrailtrail -o json | jq '.spec.tags')
               echo "tags: $TAGS"
-              # Verify it is an array, not a map
-              echo "$TAGS" | jq -e 'type == "array"' && echo "is-array"
-              echo "$TAGS" | jq -e '.[] | select(.key == "cost-centre" and .value == "security")' > /dev/null && echo "cost-centre-found"
-              echo "$TAGS" | jq -e '.[] | select(.key == "app" and .value == "api-trail")' > /dev/null && echo "app-found"
-            check:
-              (contains(@, 'is-array')): true
-              (contains(@, 'cost-centre-found')): true
-              (contains(@, 'app-found')): true
+              # ACK expects a list of {key,value} objects, not the map form the config uses.
+              echo "$TAGS" | jq -e 'type == "array"' > /dev/null \
+                || { echo "FAIL: tags is not an array"; exit 1; }
+              echo "$TAGS" | jq -e '.[] | select(.key == "cost-centre" and .value == "security")' > /dev/null \
+                || { echo "FAIL: mandatory tag cost-centre:security not found"; exit 1; }
+              echo "$TAGS" | jq -e '.[] | select(.key == "app" and .value == "api-trail")' > /dev/null \
+                || { echo "FAIL: instance tag app:api-trail not found"; exit 1; }
+              echo "PASS: tags converted to the ACK key/value array form"
 
     # ─── AC-31: standard metadata on ACK Trail child ─────────────────────────
     - name: ac31-standard-metadata
@@ -1399,7 +1469,9 @@ spec:
                   app.kubernetes.io/instance: ac31-trail
                 annotations:
                   services.k8s.aws/deletion-policy: retain
-              spec:
+                # ownerReferences live under metadata, not spec — asserting them under
+                # spec makes chainsaw compare the expression against an empty spec and
+                # fail after the full 5m assert timeout.
                 (ownerReferences[0].kind): CloudTrailTrail
                 (ownerReferences[0].name): ac31-trail
 
