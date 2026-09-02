@@ -1,0 +1,159 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: appscalingtarget.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: AppScalingTarget
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Naming-exempt: AppScalingTarget has no provider name field.
+      # AWS Application Auto Scaling identifies scalable targets by composite key:
+      # serviceNamespace + scalableDimension + resourceID. No effectiveName, nameOverride,
+      # predictedArn, or namingStatus fields (see spec aws-appscaling-02).
+
+      # Target registration (required — all three form the composite identifier)
+      serviceNamespace: string | required=true
+      scalableDimension: string | required=true
+      resourceID: string | required=true
+
+      # Capacity bounds — governed by effectiveConfig cascade
+      minCapacity: integer | required=true
+      maxCapacity: integer | required=true
+
+      # Optional IAM role (mutually exclusive: roleARN xor roleRef)
+      # roleARN: direct IAM role ARN (required for services without service-linked role support, e.g. EMR)
+      roleARN: string | default=""
+      # roleRef: reference to a local kropath IAMRole CR name; RGD resolves roleARN from its status
+      roleRef: string | default=""
+
+      # Optional — suspended scaling state
+      suspendedState:
+        dynamicScalingInSuspended: boolean | default=false
+        dynamicScalingOutSuspended: boolean | default=false
+        scheduledScalingSuspended: boolean | default=false
+
+    status:
+      scalableTargetARN: ${scalableTarget.status.?ackResourceMetadata.?arn.orValue("")}
+      conditions: ${scalableTarget.status.?conditions.orValue([])}
+
+    additionalPrinterColumns:
+      - name: ServiceNamespace
+        type: string
+        jsonPath: .spec.serviceNamespace
+      - name: ScalableDimension
+        type: string
+        jsonPath: .spec.scalableDimension
+      - name: ScalableTargetARN
+        type: string
+        jsonPath: .status.scalableTargetARN
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # kro returns externalRef as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: AppScalingConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # IAM Role CR reference — sentinel selector resolves to [] when roleRef is empty.
+    # Reads kropath IAMRole status.ackResourceMetadata.arn for roleARN resolution.
+    - id: iamRoleCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMRole
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.roleRef != "" ? schema.spec.roleRef : "kro-empty-fallback-sentinel"}'
+
+    # ACK ScalableTarget CR — registers the resource with Application Auto Scaling.
+    - id: scalableTarget
+      template:
+        apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+        kind: ScalableTarget
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingTarget
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          serviceNamespace: ${schema.spec.serviceNamespace}
+          scalableDimension: ${schema.spec.scalableDimension}
+          resourceID: ${schema.spec.resourceID}
+
+          # Capacity governance (mandatory > 0 sentinel → override instance; else pass-through).
+          # minCapacity: 0 on the instance is valid (scale-to-zero for ECS/DynamoDB/Lambda/etc.)
+          # and passes through unchanged when mandatory tier is not enforced (mandatory.minCapacity == 0).
+          minCapacity: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?minCapacity.orValue(0) > 0)
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.minCapacity
+              : schema.spec.minCapacity}
+          maxCapacity: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxCapacity.orValue(0) > 0)
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxCapacity
+              : schema.spec.maxCapacity}
+
+          # IAM role ARN: prefer direct roleARN; fall back to resolved roleRef → IAMRole status ARN.
+          # When both are empty, omits the field (service-linked role used automatically by AWS).
+          roleARN: >-
+            ${schema.spec.roleARN != ""
+              ? schema.spec.roleARN
+              : (schema.spec.roleRef != "" && iamRoleCr.size() > 0
+                  ? iamRoleCr[0].status.predictedArn
+                  : "")}
+
+          # Suspended state — controls which scaling activity types are paused
+          suspendedState:
+            dynamicScalingInSuspended: ${schema.spec.suspendedState.dynamicScalingInSuspended}
+            dynamicScalingOutSuspended: ${schema.spec.suspendedState.dynamicScalingOutSuspended}
+            scheduledScalingSuspended: ${schema.spec.suspendedState.scheduledScalingSuspended}
+
+          # ACK ScalableTarget CRD (applicationautoscaling v1.7.0) has no spec.tags field.
+          # Cloud metadata (tags/syncedLabels/syncedAnnotations) are propagated via K8s
+          # metadata.labels/annotations only (see ADR-015 §6.1).

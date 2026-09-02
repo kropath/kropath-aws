@@ -1,0 +1,208 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: appscalingpolicy.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: AppScalingPolicy
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Naming-exempt: policyName is user-defined and immutable; AWS generates the policy ARN
+      # including a server-generated policyId. No effectiveName, nameOverride, predictedArn, or
+      # namingStatus fields (see spec aws-appscaling-03, naming-convention.md exemption).
+      policyName: string | required=true
+
+      # Policy type — determines which configuration block ACK forwards to AWS
+      policyType: string | default=TargetTrackingScaling
+
+      # Scalable target identification — set directly or resolved from resourceRef
+      serviceNamespace: string | default=""
+      scalableDimension: string | default=""
+      resourceID: string | default=""
+      # resourceRef: name of a local kropath AppScalingTarget CR whose
+      # serviceNamespace/scalableDimension/resourceID are resolved at runtime
+      resourceRef: string | default=""
+
+      # Target tracking configuration (required when policyType=TargetTrackingScaling)
+      targetTracking:
+        # targetValue: NOT governed — instance value always used (float, > 0 required for TT)
+        targetValue: float | default=0
+        # Governed by AppScalingConfig cascade (mandatory > 0 overrides instance; else instance; else defaults)
+        scaleInCooldown: integer | default=300
+        scaleOutCooldown: integer | default=60
+        # Governed: OR-logic — disabled if ANY tier requests disabling
+        disableScaleIn: boolean | default=false
+        predefinedMetricSpecification:
+          predefinedMetricType: string | default=""
+          resourceLabel: string | default=""
+        customizedMetricSpecification:
+          metricName: string | default=""
+          namespace: string | default=""
+          statistic: string | default=""
+          unit: string | default=""
+          dimensions: "[]AppScalingDimension | default=[]"
+
+      # Step scaling configuration (required when policyType=StepScaling)
+      stepScaling:
+        adjustmentType: string | default=""
+        cooldown: integer | default=0
+        metricAggregationType: string | default=Average
+        minAdjustmentMagnitude: integer | default=0
+        stepAdjustments: "[]AppScalingStepAdjustment | default=[]"
+
+    types:
+      AppScalingDimension:
+        name: string | default=""
+        value: string | default=""
+      AppScalingStepAdjustment:
+        metricIntervalLowerBound: float | default=0
+        metricIntervalUpperBound: float | default=0
+        scalingAdjustment: integer | default=0
+
+    status:
+      policyARN: ${scalingPolicy.status.?ackResourceMetadata.?arn.orValue("")}
+      alarms: ${scalingPolicy.status.?alarms.orValue([])}
+      conditions: ${scalingPolicy.status.?conditions.orValue([])}
+
+    additionalPrinterColumns:
+      - name: PolicyName
+        type: string
+        jsonPath: .spec.policyName
+      - name: PolicyType
+        type: string
+        jsonPath: .spec.policyType
+      - name: PolicyARN
+        type: string
+        jsonPath: .status.policyARN
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers.
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: AppScalingConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # AppScalingTarget CR reference — sentinel selector resolves to [] when resourceRef is empty.
+    # Reads serviceNamespace/scalableDimension/resourceID from the referenced AppScalingTarget.
+    - id: appScalingTargetCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: AppScalingTarget
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.resourceRef != "" ? schema.spec.resourceRef : "kro-empty-fallback-sentinel"}'
+
+    # ACK ScalingPolicy CR — creates the scaling policy via Application Auto Scaling.
+    # Both targetTrackingScalingPolicyConfiguration and stepScalingPolicyConfiguration are
+    # always serialized; AWS uses the one matching policyType and ignores the other.
+    - id: scalingPolicy
+      template:
+        apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+        kind: ScalingPolicy
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          policyName: ${schema.spec.policyName}
+          policyType: ${schema.spec.policyType}
+
+          # Scalable target identification — resolved from resourceRef or set directly.
+          serviceNamespace: >-
+            ${schema.spec.resourceRef != "" && appScalingTargetCr.size() > 0
+              ? appScalingTargetCr[0].spec.serviceNamespace
+              : schema.spec.serviceNamespace}
+          scalableDimension: >-
+            ${schema.spec.resourceRef != "" && appScalingTargetCr.size() > 0
+              ? appScalingTargetCr[0].spec.scalableDimension
+              : schema.spec.scalableDimension}
+          resourceID: >-
+            ${schema.spec.resourceRef != "" && appScalingTargetCr.size() > 0
+              ? appScalingTargetCr[0].spec.resourceID
+              : schema.spec.resourceID}
+
+          # Target tracking configuration.
+          # targetValue: NOT governed (always instance value per spec aws-appscaling-03).
+          # scaleInCooldown, scaleOutCooldown, disableScaleIn: governed by AppScalingConfig cascade.
+          targetTrackingScalingPolicyConfiguration:
+            targetValue: ${schema.spec.targetTracking.targetValue}
+            scaleInCooldown: >-
+              ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?scaleInCooldown.orValue(0) > 0)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.scaleInCooldown
+                : schema.spec.targetTracking.scaleInCooldown}
+            scaleOutCooldown: >-
+              ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?scaleOutCooldown.orValue(0) > 0)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.scaleOutCooldown
+                : schema.spec.targetTracking.scaleOutCooldown}
+            disableScaleIn: >-
+              ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?disableScaleIn.orValue(false))
+                || schema.spec.targetTracking.disableScaleIn
+                || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?disableScaleIn.orValue(false))}
+            predefinedMetricSpecification:
+              predefinedMetricType: ${schema.spec.targetTracking.predefinedMetricSpecification.predefinedMetricType}
+              resourceLabel: ${schema.spec.targetTracking.predefinedMetricSpecification.resourceLabel}
+            customizedMetricSpecification:
+              metricName: ${schema.spec.targetTracking.customizedMetricSpecification.metricName}
+              namespace: ${schema.spec.targetTracking.customizedMetricSpecification.namespace}
+              statistic: ${schema.spec.targetTracking.customizedMetricSpecification.statistic}
+              unit: ${schema.spec.targetTracking.customizedMetricSpecification.unit}
+              dimensions: ${schema.spec.targetTracking.customizedMetricSpecification.dimensions}
+
+          # Step scaling configuration — all pass-through from instance spec (not governed).
+          stepScalingPolicyConfiguration:
+            adjustmentType: ${schema.spec.stepScaling.adjustmentType}
+            cooldown: ${schema.spec.stepScaling.cooldown}
+            metricAggregationType: ${schema.spec.stepScaling.metricAggregationType}
+            minAdjustmentMagnitude: ${schema.spec.stepScaling.minAdjustmentMagnitude}
+            stepAdjustments: ${schema.spec.stepScaling.stepAdjustments}
+
+          # ACK ScalingPolicy CRD (applicationautoscaling v1.7.0) has no spec.tags field.
+          # Cloud metadata (tags/syncedLabels/syncedAnnotations) are propagated via K8s
+          # metadata.labels/annotations only (see ADR-015 §6.1).
