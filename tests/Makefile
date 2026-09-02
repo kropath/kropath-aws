@@ -24,7 +24,7 @@ CLUSTER_NAME ?= kropath-aws-test
 	test-bedrock test-cloudtrail test-cloudwatch test-cloudwatchlogs test-cognito test-documentdb test-dsql test-dynamodb test-ec2 test-ecr test-ecs test-efs \
 	test-eks test-elasticache test-elb test-eventbridge test-glue test-iam test-keyspaces test-kinesis test-kms \
 	test-lambda test-memorydb test-mq test-msk test-opensearch test-pipes test-policy test-rds test-route53 test-s3 test-secretsmanager \
-	test-sns test-sqs test-ssm test-stepfunctions test-waf
+	test-sagemaker test-sns test-sqs test-ssm test-stepfunctions test-waf
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -185,3 +185,6 @@ test-glue:
 
 test-waf:
 	chainsaw test waf/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-sagemaker:
+	chainsaw test sagemaker/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
