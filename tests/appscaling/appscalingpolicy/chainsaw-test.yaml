@@ -1,0 +1,666 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-appscaling-03 Chainsaw tests — AppScalingPolicy, one scenario per AC.
+# Canonical pattern: unique resource name per step, skipDelete: true.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: appscalingpolicy
+spec:
+  skipDelete: true
+  namespace: appscalingpolicy
+  steps:
+    # Setup: namespace and shared config
+    - name: setup
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 01-general-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig general-policy -n appscalingpolicy \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 1,
+                        "maxCapacity": 10,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 300,
+                        "scaleOutCooldown": 60,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+
+    # AC-1: Basic target-tracking policy with predefined metric passes spec fields through.
+    - name: ac1-basic-target-tracking
+      try:
+        - apply:
+            file: 02-basic-target-tracking.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac1-basic-tt-policy
+                namespace: appscalingpolicy
+              spec:
+                policyName: scale-by-cpu
+                policyType: TargetTrackingScaling
+                serviceNamespace: ecs
+                scalableDimension: ecs:service:DesiredCount
+                resourceID: service/default/my-svc
+
+    # AC-2: targetValue passes through unchanged (not governed).
+    - name: ac2-target-value-passthrough
+      try:
+        - apply:
+            file: 03-target-value-passthrough.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac2-target-value
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  targetValue: 75.0
+
+    # AC-3: scaleInCooldown passes through when mandatory.scaleInCooldown is zero.
+    - name: ac3-scale-in-cooldown-passthrough
+      try:
+        - apply:
+            file: 04-cooldown-passthrough.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac3-cooldown-passthrough
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  scaleInCooldown: 120
+                  scaleOutCooldown: 30
+
+    # AC-4: mandatory.scaleInCooldown > 0 overrides instance value.
+    - name: ac4-mandatory-scale-in-cooldown-override
+      try:
+        - apply:
+            file: 05-mandatory-cooldown-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig mandatory-cooldown -n appscalingpolicy \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 600,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 06-mandatory-scale-in-override.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac4-mandatory-scale-in
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  scaleInCooldown: 600
+
+    # AC-5: mandatory.scaleOutCooldown > 0 overrides instance value.
+    - name: ac5-mandatory-scale-out-cooldown-override
+      try:
+        - script:
+            content: |
+              kubectl patch appscalingconfig mandatory-cooldown -n appscalingpolicy \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 120,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 07-mandatory-scale-out-override.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac5-mandatory-scale-out
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  scaleOutCooldown: 120
+
+    # AC-6: disableScaleIn=false when no tier requests it.
+    - name: ac6-disable-scale-in-false
+      try:
+        - apply:
+            file: 08-disable-scale-in-false.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac6-disable-scale-in-false
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  disableScaleIn: false
+
+    # AC-7: mandatory.disableScaleIn=true forces true regardless of instance value.
+    - name: ac7-mandatory-disable-scale-in
+      try:
+        - apply:
+            file: 09-mandatory-disable-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig mandatory-disable -n appscalingpolicy \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": true,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 10-mandatory-disable-scale-in.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac7-mandatory-disable
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  disableScaleIn: true
+
+    # AC-8: instance.disableScaleIn=false overrides defaults.disableScaleIn=true (cascade logic).
+    # With cascade (mandatory > instance > defaults): instance explicitly sets false → result is false.
+    # The defaults tier is NOT reached because the instance explicitly set the field.
+    - name: ac8-defaults-disable-scale-in
+      try:
+        - apply:
+            file: 11-defaults-disable-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig defaults-disable -n appscalingpolicy \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": true,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 12-defaults-disable-scale-in.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac8-defaults-disable
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  disableScaleIn: false
+
+    # AC-9: instance.disableScaleIn=true applies (OR-logic; no config override).
+    - name: ac9-instance-disable-scale-in
+      try:
+        - apply:
+            file: 13-instance-disable-scale-in.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac9-instance-disable
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  disableScaleIn: true
+
+    # AC-10: Customized metric specification with dimensions.
+    - name: ac10-customized-metric
+      try:
+        - apply:
+            file: 14-customized-metric.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac10-custom-metric
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  customizedMetricSpecification:
+                    metricName: RequestCount
+                    namespace: AWS/ApplicationELB
+                    statistic: Average
+
+    # AC-11: Step scaling policy — policyType=StepScaling with stepAdjustments.
+    - name: ac11-step-scaling
+      try:
+        - apply:
+            file: 15-step-scaling.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac11-step-scaling
+                namespace: appscalingpolicy
+              spec:
+                policyType: StepScaling
+                stepScalingPolicyConfiguration:
+                  adjustmentType: ChangeInCapacity
+                  cooldown: 60
+                  metricAggregationType: Average
+
+    # AC-12: resourceID/serviceNamespace/scalableDimension pass through directly.
+    - name: ac12-direct-resource-id
+      try:
+        - apply:
+            file: 16-direct-resource-id.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac12-direct-resource
+                namespace: appscalingpolicy
+              spec:
+                serviceNamespace: dynamodb
+                scalableDimension: dynamodb:table:WriteCapacityUnits
+                resourceID: table/MyTable
+
+    # AC-13: resourceRef resolves serviceNamespace/scalableDimension/resourceID from AppScalingTarget.
+    - name: ac13-resource-ref-resolution
+      try:
+        - apply:
+            file: 17-appscaling-target-stub.yaml
+        - apply:
+            file: 18-resource-ref-resolution.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac13-resource-ref
+                namespace: appscalingpolicy
+              spec:
+                serviceNamespace: ecs
+                scalableDimension: ecs:service:DesiredCount
+                resourceID: service/default/ref-svc
+
+    # AC-14: deletionPolicy=retain propagates annotation to ACK ScalingPolicy.
+    - name: ac14-deletion-policy-retain
+      try:
+        - apply:
+            file: 19-deletion-policy-retain.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac14-retention
+                namespace: appscalingpolicy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-15: deletionPolicy=delete propagates annotation to ACK ScalingPolicy.
+    - name: ac15-deletion-policy-delete
+      try:
+        - apply:
+            file: 20-deletion-policy-delete.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac15-deletion
+                namespace: appscalingpolicy
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-16: syncedLabels propagate to ACK child with aws.kropath.run/ prefix.
+    - name: ac16-synced-labels
+      try:
+        - apply:
+            file: 21-synced-labels.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac16-synced-labels
+                namespace: appscalingpolicy
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac16-synced-labels
+                  aws.kropath.run/team: platform
+
+    # AC-17: configRef resolves the correct AppScalingConfig by label selector.
+    - name: ac17-configref-lookup
+      try:
+        - apply:
+            file: 22-custom-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig custom-policy -n appscalingpolicy \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 900,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 23-configref-lookup.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac17-configref-lookup
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  scaleInCooldown: 900
+
+    # AC-18: ECS ALBRequestCountPerTarget predefined metric — validates predefinedMetricType.
+    - name: ac18-predefined-alb-metric
+      try:
+        - apply:
+            file: 24-predefined-alb-metric.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac18-alb-metric
+                namespace: appscalingpolicy
+              spec:
+                targetTrackingScalingPolicyConfiguration:
+                  predefinedMetricSpecification:
+                    predefinedMetricType: ALBRequestCountPerTarget
+
+    # AC-19: Lambda function concurrency target type.
+    - name: ac19-lambda-concurrency
+      try:
+        - apply:
+            file: 25-lambda-target.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac19-lambda-policy
+                namespace: appscalingpolicy
+              spec:
+                serviceNamespace: lambda
+                scalableDimension: lambda:function:ProvisionedConcurrency
+                resourceID: function:my-lambda:BLUE
+
+    # AC-20: DynamoDB write capacity unit target type.
+    - name: ac20-dynamodb-write
+      try:
+        - apply:
+            file: 26-dynamodb-write.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac20-dynamodb-write
+                namespace: appscalingpolicy
+              spec:
+                serviceNamespace: dynamodb
+                scalableDimension: dynamodb:table:WriteCapacityUnits
+
+    # AC-21: policyName field passes through to ACK ScalingPolicy spec.
+    - name: ac21-policy-name-passthrough
+      try:
+        - apply:
+            file: 27-policy-name.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac21-policy-name
+                namespace: appscalingpolicy
+              spec:
+                policyName: my-custom-scaling-policy
+
+    # AC-22: Step scaling stepAdjustments pass through to ACK ScalingPolicy.
+    - name: ac22-step-adjustments
+      try:
+        - apply:
+            file: 28-step-adjustments.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalingPolicy
+              metadata:
+                name: ac22-step-adjustments
+                namespace: appscalingpolicy
+              spec:
+                policyType: StepScaling
+                stepScalingPolicyConfiguration:
+                  adjustmentType: PercentChangeInCapacity
+
+    # Negative AC-11: resourceID and resourceRef both set — advisory ConfigMap error is created.
+    - name: ac-neg11-resource-mutual-exclusion
+      try:
+        - apply:
+            file: 29-resource-conflict.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac-neg11-resource-conflict-resource-conflict-error
+                namespace: appscalingpolicy
+              data:
+                error: "resourceID and resourceRef are mutually exclusive — set exactly one"
+
+    # Negative AC-12: predefinedMetricSpecification and customizedMetricSpecification both set.
+    - name: ac-neg12-metric-mutual-exclusion
+      try:
+        - apply:
+            file: 30-metric-conflict.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac-neg12-metric-conflict-metric-conflict-error
+                namespace: appscalingpolicy
+              data:
+                error: "predefinedMetricSpecification and customizedMetricSpecification are mutually exclusive — set exactly one"
+
+    # Negative AC-13: TargetTrackingScaling with no metric specification.
+    - name: ac-neg13-no-metric-specification
+      try:
+        - apply:
+            file: 31-no-metric-spec.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac-neg13-no-metric-no-metric-error
+                namespace: appscalingpolicy
+              data:
+                error: "TargetTrackingScaling requires either predefinedMetricSpecification or customizedMetricSpecification"
+
+    # Negative AC-14: serviceNamespace missing when resourceRef is not set.
+    - name: ac-neg14-missing-service-namespace
+      try:
+        - apply:
+            file: 32-missing-service-namespace.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac-neg14-missing-ns-missing-namespace-error
+                namespace: appscalingpolicy
+              data:
+                error: "serviceNamespace is required when resourceRef is not set"

@@ -1,0 +1,482 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-appscaling-02 Chainsaw tests — AppScalingTarget, one scenario per AC.
+# Canonical pattern: unique resource name per step, skipDelete: true.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: appscalingtarget
+spec:
+  skipDelete: true
+  namespace: appscalingtarget
+  steps:
+    # Setup: namespace and shared config
+    - name: setup
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 01-general-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig general-policy -n appscalingtarget \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 1,
+                        "maxCapacity": 10,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 300,
+                        "scaleOutCooldown": 60,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        # IAMConfig required by the IAMRole stub: kro's IAMRole RGD reads IAMConfig
+        # effectiveConfig.aws.accountId to compute status.predictedArn. Without an
+        # IAMConfig in this namespace kro computes predictedArn="" and overwrites the
+        # previously manual-patched value, causing ac6 roleARN to resolve to "".
+        - apply:
+            file: 08b-iamconfig.yaml
+        - script:
+            content: |
+              kubectl patch iamconfig general-policy -n appscalingtarget \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "permissionsBoundaryArn": "",
+                        "blockIamUserAccessKeys": false,
+                        "maxSessionDurationSeconds": 0,
+                        "namingTemplate": "",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "permissionsBoundaryArn": "",
+                        "blockIamUserAccessKeys": false,
+                        "maxSessionDurationSeconds": 3600,
+                        "namingTemplate": "{namespace}-{name}",
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        # Pre-create IAMRole stub used by ac6 during setup (lower cluster load).
+        # nameOverride: appscaling-role → effectiveName="appscaling-role" → kro computes
+        # predictedArn="arn:aws:iam::123456789012:role/appscaling-role" from IAMConfig above.
+        - apply:
+            file: 08-iam-role-stub.yaml
+        # Wait for kro to compute predictedArn from IAMConfig effectiveConfig.aws.accountId.
+        # (kro overwrites any manual status patch; must let kro reconcile the value.)
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMRole
+              metadata:
+                name: appscaling-role-stub
+                namespace: appscalingtarget
+              status:
+                predictedArn: "arn:aws:iam::123456789012:role/appscaling-role"
+
+    # AC-1: Happy-path: basic target registration with ECS service namespace.
+    # Verifies AppScalingTarget CR is accepted and ACK ScalableTarget is created
+    # with the correct serviceNamespace, scalableDimension, and resourceID.
+    - name: ac1-basic-target-registration
+      try:
+        - apply:
+            file: 02-basic-target-registration.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac1-ecs-target
+                namespace: appscalingtarget
+              spec:
+                serviceNamespace: ecs
+                scalableDimension: ecs:service:DesiredCount
+                resourceID: service/default/my-service
+
+    # AC-2: Instance minCapacity/maxCapacity passed through when mandatory is zero (not enforced).
+    - name: ac2-capacity-passthrough
+      try:
+        - apply:
+            file: 03-capacity-passthrough.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac2-capacity-passthrough
+                namespace: appscalingtarget
+              spec:
+                minCapacity: 2
+                maxCapacity: 20
+
+    # AC-3: mandatory.minCapacity > 0 overrides instance minCapacity.
+    - name: ac3-mandatory-min-capacity-override
+      try:
+        - apply:
+            file: 04-mandatory-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig mandatory-policy -n appscalingtarget \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 5,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 05-mandatory-min-override.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac3-mandatory-min-override
+                namespace: appscalingtarget
+              spec:
+                minCapacity: 5
+
+    # AC-4: mandatory.maxCapacity > 0 overrides instance maxCapacity.
+    - name: ac4-mandatory-max-capacity-override
+      try:
+        - script:
+            content: |
+              kubectl patch appscalingconfig mandatory-policy -n appscalingtarget \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 0,
+                        "maxCapacity": 50,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 06-mandatory-max-override.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac4-mandatory-max-override
+                namespace: appscalingtarget
+              spec:
+                maxCapacity: 50
+
+    # AC-5: roleARN passed through to ACK ScalableTarget when set directly.
+    - name: ac5-role-arn-passthrough
+      try:
+        - apply:
+            file: 07-role-arn-passthrough.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac5-role-arn
+                namespace: appscalingtarget
+              spec:
+                roleARN: "arn:aws:iam::123456789012:role/my-scaling-role"
+
+    # AC-6: roleRef resolves IAMRole predictedArn and sets roleARN.
+    # IAMRole stub (08-iam-role-stub.yaml) and its predictedArn status patch are applied
+    # in the setup step to avoid the 60s apply-timeout under peak parallel-test API load.
+    - name: ac6-role-ref-resolution
+      try:
+        - apply:
+            file: 09-role-ref-resolution.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac6-role-ref
+                namespace: appscalingtarget
+              spec:
+                roleARN: "arn:aws:iam::123456789012:role/appscaling-role"
+
+    # AC-7: When roleARN is set and roleRef is empty, roleARN takes precedence (no resolution conflict).
+    - name: ac7-role-arn-precedence
+      try:
+        - apply:
+            file: 10-role-arn-precedence.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac7-role-arn-precedence
+                namespace: appscalingtarget
+              spec:
+                roleARN: "arn:aws:iam::123456789012:role/direct-role"
+
+    # AC-8: suspendedState.dynamicScalingInSuspended=true propagates to ACK child.
+    - name: ac8-suspend-dynamic-scale-in
+      try:
+        - apply:
+            file: 11-suspend-dynamic-scale-in.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac8-suspend-dynamic-in
+                namespace: appscalingtarget
+              spec:
+                suspendedState:
+                  dynamicScalingInSuspended: true
+                  dynamicScalingOutSuspended: false
+                  scheduledScalingSuspended: false
+
+    # AC-9: suspendedState.dynamicScalingOutSuspended=true propagates to ACK child.
+    - name: ac9-suspend-dynamic-scale-out
+      try:
+        - apply:
+            file: 12-suspend-dynamic-scale-out.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac9-suspend-dynamic-out
+                namespace: appscalingtarget
+              spec:
+                suspendedState:
+                  dynamicScalingInSuspended: false
+                  dynamicScalingOutSuspended: true
+                  scheduledScalingSuspended: false
+
+    # AC-10: suspendedState.scheduledScalingSuspended=true propagates to ACK child.
+    - name: ac10-suspend-scheduled
+      try:
+        - apply:
+            file: 13-suspend-scheduled.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac10-suspend-scheduled
+                namespace: appscalingtarget
+              spec:
+                suspendedState:
+                  dynamicScalingInSuspended: false
+                  dynamicScalingOutSuspended: false
+                  scheduledScalingSuspended: true
+
+    # AC-11: configRef resolves the correct AppScalingConfig by label selector.
+    # Uses a non-default configRef named "custom-policy".
+    - name: ac11-configref-lookup
+      try:
+        - apply:
+            file: 14-custom-config.yaml
+        - script:
+            content: |
+              kubectl patch appscalingconfig custom-policy -n appscalingtarget \
+                --subresource status --type merge -p '{
+                  "status": {
+                    "effectiveConfig": {
+                      "mandatory": {
+                        "minCapacity": 3,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "defaults": {
+                        "minCapacity": 0,
+                        "maxCapacity": 0,
+                        "disableScaleIn": false,
+                        "scaleInCooldown": 0,
+                        "scaleOutCooldown": 0,
+                        "tags": {},
+                        "syncedLabels": {},
+                        "syncedAnnotations": {}
+                      },
+                      "aws": {
+                        "accountId": "123456789012",
+                        "region": "us-east-1"
+                      }
+                    }
+                  }
+                }'
+        - apply:
+            file: 15-configref-lookup.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac11-configref-lookup
+                namespace: appscalingtarget
+              spec:
+                minCapacity: 3
+
+    # AC-12: deletionPolicy=retain propagates as services.k8s.aws/deletion-policy annotation.
+    - name: ac12-deletion-policy-retain
+      try:
+        - apply:
+            file: 16-deletion-policy-retain.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac12-retention
+                namespace: appscalingtarget
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-13: deletionPolicy=delete propagates as services.k8s.aws/deletion-policy annotation.
+    - name: ac13-deletion-policy-delete
+      try:
+        - apply:
+            file: 17-deletion-policy-delete.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac13-deletion
+                namespace: appscalingtarget
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-14: syncedLabels propagate to ACK child metadata.labels with aws.kropath.run/ prefix.
+    - name: ac14-synced-labels
+      try:
+        - apply:
+            file: 18-synced-labels.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac14-synced-labels
+                namespace: appscalingtarget
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac14-synced-labels
+                  aws.kropath.run/team: platform
+                  aws.kropath.run/env: staging
+
+    # Negative AC-8: roleARN and roleRef both set — advisory ConfigMap error is created.
+    - name: ac-neg8-role-mutual-exclusion
+      try:
+        - apply:
+            file: 20-role-mutual-exclusion.yaml
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac-neg8-role-conflict-role-conflict-error
+                namespace: appscalingtarget
+              data:
+                error: "roleARN and roleRef are mutually exclusive — set exactly one"
+
+    # AC-15: DynamoDB target type (different serviceNamespace/scalableDimension).
+    - name: ac15-dynamodb-target
+      try:
+        - apply:
+            file: 19-dynamodb-target.yaml
+        - assert:
+            resource:
+              apiVersion: applicationautoscaling.services.k8s.aws/v1alpha1
+              kind: ScalableTarget
+              metadata:
+                name: ac15-dynamodb-target
+                namespace: appscalingtarget
+              spec:
+                serviceNamespace: dynamodb
+                scalableDimension: dynamodb:table:ReadCapacityUnits
+                resourceID: table/MyDynamoDBTable
