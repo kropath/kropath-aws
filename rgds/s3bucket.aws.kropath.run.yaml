@@ -36,6 +36,9 @@ spec:
         bucketKeyEnabled: boolean | default=true
       blockPublicAccess: boolean
       versioning: string | default=""
+      objectLockEnabled: boolean | default=false
+      objectLockMode: string | default=""
+      objectLockRetentionDays: integer | default=0
       enforceHttpsOnly: boolean
       objectOwnership: string | default=BucketOwnerEnforced
       logging:
@@ -189,9 +192,24 @@ spec:
               .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
               .replace("{configRef}", schema.spec.configRef)
             )}
+          # Effective object lock mode resolved from cascade:
+          # mandatory.objectLockMode > instance.objectLockMode > defaults.objectLockMode
+          effectiveObjectLockMode: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?objectLockMode.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?objectLockMode.orValue("")
+              : (schema.spec.objectLockMode != ""
+                  ? schema.spec.objectLockMode
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?objectLockMode.orValue("") : "")}
+          # Retention days as string; convert with int() in variant specs.
+          effectiveObjectLockRetentionDays: >-
+            ${string(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?objectLockRetentionDays.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.?objectLockRetentionDays.orValue(0)
+              : (schema.spec.objectLockRetentionDays != 0
+                  ? schema.spec.objectLockRetentionDays
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?objectLockRetentionDays.orValue(0) : 0))}
 
-    # Bucket variant: HTTPS policy AND logging both active. KRO-920: never emit empty objects —
-    # 4 variants cover 2×2 combinations of https×logging so neither field is conditionally emptied.
+    # Bucket variant: HTTPS policy AND logging both active, object lock inactive. KRO-920: never emit
+    # empty objects — variants cover combination matrix so no field is conditionally emptied.
     - id: bucketHttpsLogging
       includeWhen:
         - >-
@@ -205,7 +223,8 @@ spec:
               ? true
               : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
                   ? true
-                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))}
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            && naming.data.effectiveObjectLockMode == ""}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -285,11 +304,13 @@ spec:
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
           versioning:
             status: >-
-              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
-                ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
-                : (schema.spec.versioning != ""
-                    ? schema.spec.versioning
-                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : "")}
+              ${schema.spec.?objectLockEnabled.orValue(false)
+                ? "Enabled"
+                : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
+                    : (schema.spec.versioning != ""
+                        ? schema.spec.versioning
+                        : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : ""))}
           policy: >-
             ${(policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
               ? (policyDoc[0].status.resolvedDocumentJSON
@@ -298,6 +319,7 @@ spec:
                   .replace("__BNAME__", naming.data.effectiveName))
               : "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
                   .replace("__BNAME__", naming.data.effectiveName))}
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
           tagging:
             tagSet: >-
               ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
@@ -329,7 +351,8 @@ spec:
                           : ""))}
               targetPrefix: ${naming.data.effectiveLoggingPrefix}
 
-    # Bucket variant: HTTPS policy only (logging disabled). includeWhen: httpsEnabled AND NOT loggingEnabled.
+    # Bucket variant: HTTPS policy only, logging disabled, object lock inactive.
+    # includeWhen: httpsEnabled AND NOT loggingEnabled AND objectLockMode=="".
     - id: bucketHttpsOnly
       includeWhen:
         - >-
@@ -343,7 +366,8 @@ spec:
               ? true
               : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
                   ? true
-                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))}
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            && naming.data.effectiveObjectLockMode == ""}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -423,11 +447,13 @@ spec:
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
           versioning:
             status: >-
-              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
-                ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
-                : (schema.spec.versioning != ""
-                    ? schema.spec.versioning
-                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : "")}
+              ${schema.spec.?objectLockEnabled.orValue(false)
+                ? "Enabled"
+                : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
+                    : (schema.spec.versioning != ""
+                        ? schema.spec.versioning
+                        : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : ""))}
           policy: >-
             ${(policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
               ? (policyDoc[0].status.resolvedDocumentJSON
@@ -436,6 +462,7 @@ spec:
                   .replace("__BNAME__", naming.data.effectiveName))
               : "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
                   .replace("__BNAME__", naming.data.effectiveName))}
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
           tagging:
             tagSet: >-
               ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
@@ -456,7 +483,8 @@ spec:
               - objectOwnership: >-
                   ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
 
-    # Bucket variant: logging only (HTTPS disabled, no policyRef). includeWhen: NOT httpsEnabled AND loggingEnabled AND policyRef=="".
+    # Bucket variant: logging only, HTTPS disabled, no policyRef, object lock inactive.
+    # includeWhen: NOT httpsEnabled AND loggingEnabled AND policyRef=="" AND objectLockMode=="".
     - id: bucketLoggingOnly
       includeWhen:
         - >-
@@ -472,7 +500,8 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             &&
-            schema.spec.?bucketPolicyRef.orValue("") == ""}
+            schema.spec.?bucketPolicyRef.orValue("") == ""
+            && naming.data.effectiveObjectLockMode == ""}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -552,11 +581,14 @@ spec:
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
           versioning:
             status: >-
-              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
-                ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
-                : (schema.spec.versioning != ""
-                    ? schema.spec.versioning
-                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : "")}
+              ${schema.spec.?objectLockEnabled.orValue(false)
+                ? "Enabled"
+                : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
+                    : (schema.spec.versioning != ""
+                        ? schema.spec.versioning
+                        : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : ""))}
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
           tagging:
             tagSet: >-
               ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
@@ -588,7 +620,8 @@ spec:
                           : ""))}
               targetPrefix: ${naming.data.effectiveLoggingPrefix}
 
-    # Bucket variant: user-supplied policy doc AND logging (HTTPS disabled). includeWhen: NOT httpsEnabled AND loggingEnabled AND policyRef!="".
+    # Bucket variant: user-supplied policy doc AND logging, HTTPS disabled, object lock inactive.
+    # includeWhen: NOT httpsEnabled AND loggingEnabled AND policyRef!="" AND objectLockMode=="".
     - id: bucketWithUserPolicyAndLogging
       includeWhen:
         - >-
@@ -604,7 +637,8 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             &&
-            schema.spec.?bucketPolicyRef.orValue("") != ""}
+            schema.spec.?bucketPolicyRef.orValue("") != ""
+            && naming.data.effectiveObjectLockMode == ""}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -684,11 +718,816 @@ spec:
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
           versioning:
             status: >-
-              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
-                ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
-                : (schema.spec.versioning != ""
-                    ? schema.spec.versioning
-                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : "")}
+              ${schema.spec.?objectLockEnabled.orValue(false)
+                ? "Enabled"
+                : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
+                    : (schema.spec.versioning != ""
+                        ? schema.spec.versioning
+                        : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : ""))}
+          policy: >-
+            ${policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
+              ? policyDoc[0].status.resolvedDocumentJSON
+              : ""}
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          tagging:
+            tagSet: >-
+              ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.spec.tags)
+                .merge(schema.spec.syncedLabels)
+                .merge(schema.spec.syncedAnnotations)
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v})
+                .sortBy(x, x.key)}
+          objectOwnership: >-
+            ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          ownershipControls:
+            rules:
+              - objectOwnership: >-
+                  ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          logging:
+            loggingEnabled:
+              targetBucket: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?logDeliveryBucket.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.?logDeliveryBucket.orValue("")
+                  : (has(schema.spec.logging) && schema.spec.logging.targetBucket != ""
+                      ? schema.spec.logging.targetBucket
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?logDeliveryBucket.orValue("") != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.?logDeliveryBucket.orValue("")
+                          : ""))}
+              targetPrefix: ${naming.data.effectiveLoggingPrefix}
+
+    # Bucket variant: no HTTPS policy, no logging, no policyRef, object lock inactive (baseline).
+    # includeWhen: NOT httpsEnabled AND NOT loggingEnabled AND policyRef=="" AND objectLockMode=="".
+    - id: bucket
+      includeWhen:
+        - >-
+          ${!((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
+              ? true
+              : (schema.spec.?enforceHttpsOnly.orValue(false)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enforceHttpsOnly.orValue(false))))
+            &&
+            !((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingEnabled.orValue(false))
+              ? true
+              : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            &&
+            schema.spec.?bucketPolicyRef.orValue("") == ""
+            && naming.data.effectiveObjectLockMode == ""}
+      template:
+        apiVersion: s3.services.k8s.aws/v1alpha1
+        kind: Bucket
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          createBucketConfiguration:
+            locationConstraint: >-
+              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
+                ? schema.spec.region
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
+                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+                    : "")}
+          encryption:
+            rules:
+              - applyServerSideEncryptionByDefault:
+                  sseAlgorithm: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("")
+                      : (schema.spec.encryption.algorithm != ""
+                          ? schema.spec.encryption.algorithm
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("")
+                              : "aws:kms"))}
+                  kmsMasterKeyID: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("")
+                      : (schema.spec.encryption.kmsKeyArn != ""
+                          ? schema.spec.encryption.kmsKeyArn
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("")
+                              : "alias/aws/s3"))}
+                bucketKeyEnabled: ${schema.spec.encryption.bucketKeyEnabled}
+          publicAccessBlock:
+            blockPublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            blockPublicPolicy: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            ignorePublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            restrictPublicBuckets: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+          versioning:
+            status: >-
+              ${schema.spec.?objectLockEnabled.orValue(false)
+                ? "Enabled"
+                : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
+                    : (schema.spec.versioning != ""
+                        ? schema.spec.versioning
+                        : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : ""))}
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          tagging:
+            tagSet: >-
+              ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.spec.tags)
+                .merge(schema.spec.syncedLabels)
+                .merge(schema.spec.syncedAnnotations)
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v})
+                .sortBy(x, x.key)}
+          objectOwnership: >-
+            ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          ownershipControls:
+            rules:
+              - objectOwnership: >-
+                  ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+
+    # Bucket variant: user-supplied policy doc, no logging, HTTPS disabled, object lock inactive.
+    # includeWhen: NOT httpsEnabled AND NOT loggingEnabled AND policyRef!="" AND objectLockMode=="".
+    - id: bucketWithUserPolicy
+      includeWhen:
+        - >-
+          ${!((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
+              ? true
+              : (schema.spec.?enforceHttpsOnly.orValue(false)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enforceHttpsOnly.orValue(false))))
+            &&
+            !((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingEnabled.orValue(false))
+              ? true
+              : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            &&
+            schema.spec.?bucketPolicyRef.orValue("") != ""
+            && naming.data.effectiveObjectLockMode == ""}
+      template:
+        apiVersion: s3.services.k8s.aws/v1alpha1
+        kind: Bucket
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          createBucketConfiguration:
+            locationConstraint: >-
+              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
+                ? schema.spec.region
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
+                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+                    : "")}
+          encryption:
+            rules:
+              - applyServerSideEncryptionByDefault:
+                  sseAlgorithm: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("")
+                      : (schema.spec.encryption.algorithm != ""
+                          ? schema.spec.encryption.algorithm
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("")
+                              : "aws:kms"))}
+                  kmsMasterKeyID: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("")
+                      : (schema.spec.encryption.kmsKeyArn != ""
+                          ? schema.spec.encryption.kmsKeyArn
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("")
+                              : "alias/aws/s3"))}
+                bucketKeyEnabled: ${schema.spec.encryption.bucketKeyEnabled}
+          publicAccessBlock:
+            blockPublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            blockPublicPolicy: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            ignorePublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            restrictPublicBuckets: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+          versioning:
+            status: >-
+              ${schema.spec.?objectLockEnabled.orValue(false)
+                ? "Enabled"
+                : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
+                    : (schema.spec.versioning != ""
+                        ? schema.spec.versioning
+                        : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : ""))}
+          policy: >-
+            ${policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
+              ? policyDoc[0].status.resolvedDocumentJSON
+              : ""}
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          tagging:
+            tagSet: >-
+              ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.spec.tags)
+                .merge(schema.spec.syncedLabels)
+                .merge(schema.spec.syncedAnnotations)
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v})
+                .sortBy(x, x.key)}
+          objectOwnership: >-
+            ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          ownershipControls:
+            rules:
+              - objectOwnership: >-
+                  ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+
+    # Object lock active variants (objectLockMode resolves). These 6 mirror the 6 base variants
+    # and add objectLockEnabledForBucket + objectLockConfiguration. Versioning is always "Enabled"
+    # (AWS requirement for object lock). KRO-920: objectLockConfiguration is only emitted when
+    # mode resolves — these variants fire only when naming.data.effectiveObjectLockMode != "".
+
+    # Object lock + HTTPS + logging.
+    - id: bucketHttpsLoggingWithObjectLock
+      includeWhen:
+        - >-
+          ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
+              ? true
+              : (schema.spec.?enforceHttpsOnly.orValue(false)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enforceHttpsOnly.orValue(false))))
+            &&
+            ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingEnabled.orValue(false))
+              ? true
+              : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            && naming.data.effectiveObjectLockMode != ""}
+      template:
+        apiVersion: s3.services.k8s.aws/v1alpha1
+        kind: Bucket
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          createBucketConfiguration:
+            locationConstraint: >-
+              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
+                ? schema.spec.region
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
+                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+                    : "")}
+          encryption:
+            rules:
+              - applyServerSideEncryptionByDefault:
+                  sseAlgorithm: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("")
+                      : (schema.spec.encryption.algorithm != ""
+                          ? schema.spec.encryption.algorithm
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("")
+                              : "aws:kms"))}
+                  kmsMasterKeyID: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("")
+                      : (schema.spec.encryption.kmsKeyArn != ""
+                          ? schema.spec.encryption.kmsKeyArn
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("")
+                              : "alias/aws/s3"))}
+                bucketKeyEnabled: ${schema.spec.encryption.bucketKeyEnabled}
+          publicAccessBlock:
+            blockPublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            blockPublicPolicy: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            ignorePublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            restrictPublicBuckets: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+          versioning:
+            status: "Enabled"
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          objectLockConfiguration:
+            rule:
+              defaultRetention:
+                mode: ${naming.data.effectiveObjectLockMode}
+                days: ${int(naming.data.effectiveObjectLockRetentionDays)}
+          policy: >-
+            ${(policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
+              ? (policyDoc[0].status.resolvedDocumentJSON
+                  .replace("\"Statement\":[{", "\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}},{")
+                  .replace("\"Statement\":[]", "\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]")
+                  .replace("__BNAME__", naming.data.effectiveName))
+              : "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
+                  .replace("__BNAME__", naming.data.effectiveName))}
+          tagging:
+            tagSet: >-
+              ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.spec.tags)
+                .merge(schema.spec.syncedLabels)
+                .merge(schema.spec.syncedAnnotations)
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v})
+                .sortBy(x, x.key)}
+          objectOwnership: >-
+            ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          ownershipControls:
+            rules:
+              - objectOwnership: >-
+                  ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          logging:
+            loggingEnabled:
+              targetBucket: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?logDeliveryBucket.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.?logDeliveryBucket.orValue("")
+                  : (has(schema.spec.logging) && schema.spec.logging.targetBucket != ""
+                      ? schema.spec.logging.targetBucket
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?logDeliveryBucket.orValue("") != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.?logDeliveryBucket.orValue("")
+                          : ""))}
+              targetPrefix: ${naming.data.effectiveLoggingPrefix}
+
+    # Object lock + HTTPS only (no logging).
+    - id: bucketHttpsOnlyWithObjectLock
+      includeWhen:
+        - >-
+          ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
+              ? true
+              : (schema.spec.?enforceHttpsOnly.orValue(false)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enforceHttpsOnly.orValue(false))))
+            &&
+            !((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingEnabled.orValue(false))
+              ? true
+              : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            && naming.data.effectiveObjectLockMode != ""}
+      template:
+        apiVersion: s3.services.k8s.aws/v1alpha1
+        kind: Bucket
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          createBucketConfiguration:
+            locationConstraint: >-
+              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
+                ? schema.spec.region
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
+                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+                    : "")}
+          encryption:
+            rules:
+              - applyServerSideEncryptionByDefault:
+                  sseAlgorithm: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("")
+                      : (schema.spec.encryption.algorithm != ""
+                          ? schema.spec.encryption.algorithm
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("")
+                              : "aws:kms"))}
+                  kmsMasterKeyID: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("")
+                      : (schema.spec.encryption.kmsKeyArn != ""
+                          ? schema.spec.encryption.kmsKeyArn
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("")
+                              : "alias/aws/s3"))}
+                bucketKeyEnabled: ${schema.spec.encryption.bucketKeyEnabled}
+          publicAccessBlock:
+            blockPublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            blockPublicPolicy: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            ignorePublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            restrictPublicBuckets: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+          versioning:
+            status: "Enabled"
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          objectLockConfiguration:
+            rule:
+              defaultRetention:
+                mode: ${naming.data.effectiveObjectLockMode}
+                days: ${int(naming.data.effectiveObjectLockRetentionDays)}
+          policy: >-
+            ${(policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
+              ? (policyDoc[0].status.resolvedDocumentJSON
+                  .replace("\"Statement\":[{", "\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}},{")
+                  .replace("\"Statement\":[]", "\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]")
+                  .replace("__BNAME__", naming.data.effectiveName))
+              : "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyNonTLSAccess\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::__BNAME__\",\"arn:aws:s3:::__BNAME__/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
+                  .replace("__BNAME__", naming.data.effectiveName))}
+          tagging:
+            tagSet: >-
+              ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.spec.tags)
+                .merge(schema.spec.syncedLabels)
+                .merge(schema.spec.syncedAnnotations)
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v})
+                .sortBy(x, x.key)}
+          objectOwnership: >-
+            ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          ownershipControls:
+            rules:
+              - objectOwnership: >-
+                  ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+
+    # Object lock + logging only (no HTTPS, no policyRef).
+    - id: bucketLoggingOnlyWithObjectLock
+      includeWhen:
+        - >-
+          ${!((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
+              ? true
+              : (schema.spec.?enforceHttpsOnly.orValue(false)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enforceHttpsOnly.orValue(false))))
+            &&
+            ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingEnabled.orValue(false))
+              ? true
+              : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            &&
+            schema.spec.?bucketPolicyRef.orValue("") == ""
+            && naming.data.effectiveObjectLockMode != ""}
+      template:
+        apiVersion: s3.services.k8s.aws/v1alpha1
+        kind: Bucket
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          createBucketConfiguration:
+            locationConstraint: >-
+              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
+                ? schema.spec.region
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
+                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+                    : "")}
+          encryption:
+            rules:
+              - applyServerSideEncryptionByDefault:
+                  sseAlgorithm: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("")
+                      : (schema.spec.encryption.algorithm != ""
+                          ? schema.spec.encryption.algorithm
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("")
+                              : "aws:kms"))}
+                  kmsMasterKeyID: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("")
+                      : (schema.spec.encryption.kmsKeyArn != ""
+                          ? schema.spec.encryption.kmsKeyArn
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("")
+                              : "alias/aws/s3"))}
+                bucketKeyEnabled: ${schema.spec.encryption.bucketKeyEnabled}
+          publicAccessBlock:
+            blockPublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            blockPublicPolicy: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            ignorePublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            restrictPublicBuckets: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+          versioning:
+            status: "Enabled"
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          objectLockConfiguration:
+            rule:
+              defaultRetention:
+                mode: ${naming.data.effectiveObjectLockMode}
+                days: ${int(naming.data.effectiveObjectLockRetentionDays)}
+          tagging:
+            tagSet: >-
+              ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.spec.tags)
+                .merge(schema.spec.syncedLabels)
+                .merge(schema.spec.syncedAnnotations)
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v})
+                .sortBy(x, x.key)}
+          objectOwnership: >-
+            ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          ownershipControls:
+            rules:
+              - objectOwnership: >-
+                  ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
+          logging:
+            loggingEnabled:
+              targetBucket: >-
+                ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?logDeliveryBucket.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.?logDeliveryBucket.orValue("")
+                  : (has(schema.spec.logging) && schema.spec.logging.targetBucket != ""
+                      ? schema.spec.logging.targetBucket
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?logDeliveryBucket.orValue("") != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.?logDeliveryBucket.orValue("")
+                          : ""))}
+              targetPrefix: ${naming.data.effectiveLoggingPrefix}
+
+    # Object lock + user policy + logging (no HTTPS).
+    - id: bucketWithUserPolicyAndLoggingWithObjectLock
+      includeWhen:
+        - >-
+          ${!((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
+              ? true
+              : (schema.spec.?enforceHttpsOnly.orValue(false)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?enforceHttpsOnly.orValue(false))))
+            &&
+            ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?loggingEnabled.orValue(false))
+              ? true
+              : ((has(schema.spec.logging) && has(schema.spec.logging.enabled) && schema.spec.logging.enabled)
+                  ? true
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
+            &&
+            schema.spec.?bucketPolicyRef.orValue("") != ""
+            && naming.data.effectiveObjectLockMode != ""}
+      template:
+        apiVersion: s3.services.k8s.aws/v1alpha1
+        kind: Bucket
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          createBucketConfiguration:
+            locationConstraint: >-
+              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
+                ? schema.spec.region
+                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
+                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+                    : "")}
+          encryption:
+            rules:
+              - applyServerSideEncryptionByDefault:
+                  sseAlgorithm: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAlgorithm.orValue("")
+                      : (schema.spec.encryption.algorithm != ""
+                          ? schema.spec.encryption.algorithm
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAlgorithm.orValue("")
+                              : "aws:kms"))}
+                  kmsMasterKeyID: >-
+                    ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyArn.orValue("")
+                      : (schema.spec.encryption.kmsKeyArn != ""
+                          ? schema.spec.encryption.kmsKeyArn
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("") != ""
+                              ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyArn.orValue("")
+                              : "alias/aws/s3"))}
+                bucketKeyEnabled: ${schema.spec.encryption.bucketKeyEnabled}
+          publicAccessBlock:
+            blockPublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            blockPublicPolicy: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            ignorePublicACLs: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+            restrictPublicBuckets: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?blockPublicAccess.orValue(false))
+                ? true
+                : (schema.spec.?blockPublicAccess.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
+          versioning:
+            status: "Enabled"
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          objectLockConfiguration:
+            rule:
+              defaultRetention:
+                mode: ${naming.data.effectiveObjectLockMode}
+                days: ${int(naming.data.effectiveObjectLockRetentionDays)}
           policy: >-
             ${policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
               ? policyDoc[0].status.resolvedDocumentJSON
@@ -724,8 +1563,8 @@ spec:
                           : ""))}
               targetPrefix: ${naming.data.effectiveLoggingPrefix}
 
-    # Bucket variant: no HTTPS policy, no logging, no policyRef (baseline). includeWhen: NOT httpsEnabled AND NOT loggingEnabled AND policyRef=="".
-    - id: bucket
+    # Object lock + no HTTPS + no logging + no policyRef (baseline with object lock).
+    - id: bucketWithObjectLock
       includeWhen:
         - >-
           ${!((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
@@ -740,7 +1579,8 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             &&
-            schema.spec.?bucketPolicyRef.orValue("") == ""}
+            schema.spec.?bucketPolicyRef.orValue("") == ""
+            && naming.data.effectiveObjectLockMode != ""}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -819,12 +1659,13 @@ spec:
                     ? true
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
           versioning:
-            status: >-
-              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
-                ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
-                : (schema.spec.versioning != ""
-                    ? schema.spec.versioning
-                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : "")}
+            status: "Enabled"
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          objectLockConfiguration:
+            rule:
+              defaultRetention:
+                mode: ${naming.data.effectiveObjectLockMode}
+                days: ${int(naming.data.effectiveObjectLockRetentionDays)}
           tagging:
             tagSet: >-
               ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
@@ -845,8 +1686,8 @@ spec:
               - objectOwnership: >-
                   ${schema.spec.objectOwnership != "" ? schema.spec.objectOwnership : "BucketOwnerEnforced"}
 
-    # Bucket variant: user-supplied policy doc, no logging (HTTPS disabled). includeWhen: NOT httpsEnabled AND NOT loggingEnabled AND policyRef!="".
-    - id: bucketWithUserPolicy
+    # Object lock + user policy, no logging, no HTTPS.
+    - id: bucketWithUserPolicyWithObjectLock
       includeWhen:
         - >-
           ${!((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHttpsOnly.orValue(false))
@@ -861,7 +1702,8 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             &&
-            schema.spec.?bucketPolicyRef.orValue("") != ""}
+            schema.spec.?bucketPolicyRef.orValue("") != ""
+            && naming.data.effectiveObjectLockMode != ""}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -940,12 +1782,13 @@ spec:
                     ? true
                     : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?blockPublicAccess.orValue(false)))}
           versioning:
-            status: >-
-              ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("") != ""
-                ? rsrcCfg[0].status.effectiveConfig.mandatory.?versioning.orValue("")
-                : (schema.spec.versioning != ""
-                    ? schema.spec.versioning
-                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?versioning.orValue("") : "")}
+            status: "Enabled"
+          objectLockEnabledForBucket: ${schema.spec.?objectLockEnabled.orValue(false)}
+          objectLockConfiguration:
+            rule:
+              defaultRetention:
+                mode: ${naming.data.effectiveObjectLockMode}
+                days: ${int(naming.data.effectiveObjectLockRetentionDays)}
           policy: >-
             ${policyDoc.size() > 0 && policyDoc[0].?status.?resolvedDocumentJSON.orValue("") != ""
               ? policyDoc[0].status.resolvedDocumentJSON
