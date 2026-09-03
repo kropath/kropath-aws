@@ -1,0 +1,391 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: keyspacestable.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: KeyspacesTable
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      # Required: keyspace and schema definition
+      keyspaceName: string | required=true
+      columns: "[]Column | required=true"
+      partitionKeys: "[]PartitionKey | required=true"
+      clusteringKeys: "[]ClusteringKey | default=[]"
+      staticColumns: "[]StaticColumn | default=[]"
+      # Capacity
+      throughputMode: string | default=""
+      readCapacityUnits: integer | default=0
+      writeCapacityUnits: integer | default=0
+      # Encryption — kmsKeyArn and kmsKeyRef are mutually exclusive
+      encryptionType: string | default=""
+      kmsKeyArn: string | default=""
+      kmsKeyRef: string | default=""
+      # Data protection — declared as bare boolean (no default) so has() detects absence
+      pointInTimeRecovery: boolean
+      ttlEnabled: boolean
+      defaultTimeToLive: integer | default=0
+      clientSideTimestamps: boolean
+      # Metadata
+      comment: string | default=""
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      Column:
+        name: string | required=true
+        type: string | required=true
+      PartitionKey:
+        name: string | required=true
+      ClusteringKey:
+        name: string | required=true
+        orderBy: string | default=ASC
+      StaticColumn:
+        name: string | required=true
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.resourceName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0
+          && has(rsrcCfg[0].status.effectiveConfig.aws)
+          && has(rsrcCfg[0].status.effectiveConfig.aws.accountId)
+          && has(rsrcCfg[0].status.effectiveConfig.aws.region)
+          && naming.data.keyspaceName != ""
+          && naming.data.resourceName != ""
+          && !naming.data.resourceName.contains("{")
+            ? "arn:aws:cassandra:"
+                + rsrcCfg[0].status.effectiveConfig.aws.region
+                + ":"
+                + rsrcCfg[0].status.effectiveConfig.aws.accountId
+                + ":/keyspace/"
+                + naming.data.keyspaceName
+                + "/table/"
+                + naming.data.resourceName
+            : ""}
+      arn: >-
+        ${ackTableRef.size() > 0
+            ? ackTableRef[0].status.?ackResourceMetadata.?arn.orValue("")
+            : ""}
+      conditions: >-
+        ${ackTableRef.size() > 0
+            ? ackTableRef[0].status.?conditions.orValue([])
+            : []}
+      validationError: >-
+        ${has(kmsKeyMutualExclusionError.data) && has(kmsKeyMutualExclusionError.data.error)
+            ? kmsKeyMutualExclusionError.data.error
+            : (has(kmsKeyMissingError.data) && has(kmsKeyMissingError.data.error)
+                ? kmsKeyMissingError.data.error
+                : (has(provisionedMissingRcuError.data) && has(provisionedMissingRcuError.data.error)
+                    ? provisionedMissingRcuError.data.error
+                    : (has(provisionedMissingWcuError.data) && has(provisionedMissingWcuError.data.error)
+                        ? provisionedMissingWcuError.data.error
+                        : "")))}
+  resources:
+    # KropathConfig lookup — always bound via label selector
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KeyspacesConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — materialises resourceName (for table name) and stores
+    # keyspaceName so the status block can build predictedArn without schema.*.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          keyspaceName: ${schema.spec.keyspaceName}
+          resourceName: >-
+            ${((schema.spec.nameOverride != ""
+                ? schema.spec.nameOverride
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                    : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                        : "{namespace}_{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : ""))}
+
+    # Always-bound self-lookup — resolves to [] before ACK Table CR exists, then [ackTable].
+    - id: ackTableRef
+      externalRef:
+        apiVersion: keyspaces.services.k8s.aws/v1alpha1
+        kind: Table
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # Conditional KMS key lookup — sentinel ensures variable is always bound as [] when
+    # kmsKeyRef is unset, preventing graph freeze from an unresolvable externalRef.
+    - id: kmsKeyRef
+      externalRef:
+        apiVersion: kms.services.k8s.aws/v1alpha1
+        kind: Key
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.kmsKeyRef != "" ? schema.spec.kmsKeyRef : "kro-empty-fallback-sentinel"}'
+
+    # Advisory ConfigMap — kmsKeyArn and kmsKeyRef are mutually exclusive (AC-11)
+    - id: kmsKeyMutualExclusionError
+      includeWhen:
+        - '${schema.spec.kmsKeyArn != "" && schema.spec.kmsKeyRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-kms-mutual-exclusion
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "kmsKeyArn and kmsKeyRef are mutually exclusive — set exactly one"
+
+    # Advisory ConfigMap — CUSTOMER_MANAGED_KMS_KEY without a key source (AC-12)
+    - id: kmsKeyMissingError
+      includeWhen:
+        - '${schema.spec.encryptionType == "CUSTOMER_MANAGED_KMS_KEY" && schema.spec.kmsKeyArn == "" && schema.spec.kmsKeyRef == ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-kms-missing-key
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "encryptionType is CUSTOMER_MANAGED_KMS_KEY but neither kmsKeyArn nor kmsKeyRef is set"
+
+    # Advisory ConfigMap — PROVISIONED throughput without readCapacityUnits (AC-17)
+    - id: provisionedMissingRcuError
+      includeWhen:
+        - '${schema.spec.throughputMode == "PROVISIONED" && schema.spec.readCapacityUnits == 0}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-provisioned-missing-rcu
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "throughputMode is PROVISIONED but readCapacityUnits is not set (must be > 0)"
+
+    # Advisory ConfigMap — PROVISIONED throughput without writeCapacityUnits (AC-18)
+    - id: provisionedMissingWcuError
+      includeWhen:
+        - '${schema.spec.throughputMode == "PROVISIONED" && schema.spec.writeCapacityUnits == 0}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-provisioned-missing-wcu
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "throughputMode is PROVISIONED but writeCapacityUnits is not set (must be > 0)"
+
+    # ACK Table CR — wraps keyspaces.services.k8s.aws/Table
+    - id: ackTable
+      template:
+        apiVersion: keyspaces.services.k8s.aws/v1alpha1
+        kind: Table
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels))
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v})
+                : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels))
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v})
+                : {})}
+          annotations:
+            services.k8s.aws/deletion-policy: ${schema.spec.deletionPolicy}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          keyspaceName: ${naming.data.keyspaceName}
+          tableName: ${naming.data.resourceName}
+          schemaDefinition:
+            allColumns: >-
+              ${schema.spec.columns.transformList(i, col, {"name": col.name, "type_": col.type})}
+            partitionKeys: >-
+              ${schema.spec.partitionKeys.transformList(i, pk, {"name": pk.name})}
+            clusteringKeys: >-
+              ${schema.spec.clusteringKeys.transformList(i, ck, {"name": ck.name, "orderBy": ck.orderBy})}
+            staticColumns: >-
+              ${schema.spec.staticColumns.transformList(i, sc, {"name": sc.name})}
+          capacitySpecification:
+            throughputMode: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?throughputMode.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.throughputMode
+                  : (schema.spec.throughputMode != ""
+                      ? schema.spec.throughputMode
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?throughputMode.orValue("") != "")
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.throughputMode
+                          : "PAY_PER_REQUEST"))}
+            readCapacityUnits: ${schema.spec.readCapacityUnits}
+            writeCapacityUnits: ${schema.spec.writeCapacityUnits}
+          encryptionSpecification:
+            type_: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType
+                  : (schema.spec.encryptionType != ""
+                      ? schema.spec.encryptionType
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue("") != "")
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionType
+                          : "AWS_OWNED_KMS_KEY"))}
+            kmsKeyIdentifier: >-
+              ${schema.spec.kmsKeyArn != ""
+                  ? schema.spec.kmsKeyArn
+                  : (kmsKeyRef.size() > 0 && has(kmsKeyRef[0].status.ackResourceMetadata) && has(kmsKeyRef[0].status.ackResourceMetadata.arn)
+                      ? kmsKeyRef[0].status.ackResourceMetadata.arn
+                      : "")}
+          pointInTimeRecovery:
+            status: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?pointInTimeRecovery.orValue(false))
+                  ? "ENABLED"
+                  : (has(schema.spec.pointInTimeRecovery) && schema.spec.pointInTimeRecovery
+                      ? "ENABLED"
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?pointInTimeRecovery.orValue(false)
+                          ? "ENABLED"
+                          : "DISABLED"))}
+          ttl:
+            status: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?ttlEnabled.orValue(false))
+                  ? "enabled"
+                  : (has(schema.spec.ttlEnabled) && schema.spec.ttlEnabled
+                      ? "enabled"
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?ttlEnabled.orValue(false)
+                          ? "enabled"
+                          : "disabled"))}
+          defaultTimeToLive: ${schema.spec.defaultTimeToLive}
+          clientSideTimestamps:
+            status: >-
+              ${has(schema.spec.clientSideTimestamps) && schema.spec.clientSideTimestamps ? "enabled" : ""}
+          comment:
+            message: "${schema.spec.comment}"
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.tags
+                : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}

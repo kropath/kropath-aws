@@ -1,0 +1,270 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: keyspaceskeyspace.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: KeyspacesKeyspace
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      replicationStrategy: string | default=""
+      regionList: "[]string | default=[]"
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.resourceName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0
+          && has(rsrcCfg[0].status.effectiveConfig.aws)
+          && has(rsrcCfg[0].status.effectiveConfig.aws.accountId)
+          && has(rsrcCfg[0].status.effectiveConfig.aws.region)
+          && naming.data.resourceName != ""
+          && !naming.data.resourceName.contains("{")
+            ? "arn:aws:cassandra:"
+                + rsrcCfg[0].status.effectiveConfig.aws.region
+                + ":"
+                + rsrcCfg[0].status.effectiveConfig.aws.accountId
+                + ":/keyspace/"
+                + naming.data.resourceName
+                + "/"
+            : ""}
+      arn: >-
+        ${ackKeyspaceRef.size() > 0
+            ? ackKeyspaceRef[0].status.?ackResourceMetadata.?arn.orValue("")
+            : ""}
+      conditions: >-
+        ${ackKeyspaceRef.size() > 0
+            ? ackKeyspaceRef[0].status.?conditions.orValue([])
+            : []}
+      validationError: >-
+        ${validationErrorRef.size() > 0 && has(validationErrorRef[0].data) && has(validationErrorRef[0].data.error)
+            ? validationErrorRef[0].data.error
+            : ""}
+  resources:
+    # KropathConfig lookup — always bound via label selector
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: KeyspacesConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — materialises resourceName with {tag.X} substitution.
+    # Default template is {namespace}_{name} (underscores per Keyspaces naming requirements).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          resourceName: >-
+            ${((schema.spec.nameOverride != ""
+                ? schema.spec.nameOverride
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                    : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                        : "{namespace}_{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : ""))}
+
+    # Always-bound self-lookup — resolves to [] before ACK Keyspace CR exists, then [ackKeyspace].
+    # Used to read back ACK status (arn, conditions) without blocking on includeWhen.
+    - id: ackKeyspaceRef
+      externalRef:
+        apiVersion: keyspaces.services.k8s.aws/v1alpha1
+        kind: Keyspace
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # Advisory ConfigMap — MULTI_REGION with empty regionList (AC-16)
+    - id: multiRegionMissingRegionListError
+      includeWhen:
+        - '${schema.spec.replicationStrategy == "MULTI_REGION" && size(schema.spec.regionList) == 0}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-multiregion-missing-regionlist
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name, "aws.kropath.run/error-type": "replication-validation"}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "replicationStrategy is MULTI_REGION but regionList is empty — provide at least one AWS region"
+
+    # Advisory ConfigMap — MULTI_REGION with more than 6 regions (AC-17)
+    - id: multiRegionTooManyRegionsError
+      includeWhen:
+        - '${schema.spec.replicationStrategy == "MULTI_REGION" && size(schema.spec.regionList) > 6}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-multiregion-too-many-regions
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name, "aws.kropath.run/error-type": "replication-validation"}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "replicationStrategy is MULTI_REGION but regionList exceeds the maximum of 6 regions"
+
+    # Always-bound self-lookup for validation error ConfigMaps (AC-16, AC-17).
+    # Both error ConfigMaps carry "aws.kropath.run/error-type: replication-validation"; this
+    # externalRef is never gated by includeWhen, so it is always in the memory context and
+    # avoids the Unbound Variable Freeze when either error ConfigMap is excluded.
+    - id: validationErrorRef
+      externalRef:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+              aws.kropath.run/error-type: replication-validation
+
+    # ACK Keyspace CR — wraps keyspaces.services.k8s.aws/Keyspace
+    - id: ackKeyspace
+      template:
+        apiVersion: keyspaces.services.k8s.aws/v1alpha1
+        kind: Keyspace
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels))
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v})
+                : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels))
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v})
+                : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations))
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v})
+                : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations))
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v})
+                : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          keyspaceName: ${naming.data.resourceName}
+          replicationSpecification:
+            replicationStrategy: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?replicationStrategy.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.replicationStrategy
+                  : (schema.spec.replicationStrategy != ""
+                      ? schema.spec.replicationStrategy
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?replicationStrategy.orValue("") != "")
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.replicationStrategy
+                          : "SINGLE_REGION"))}
+            regionList: >-
+              ${schema.spec.replicationStrategy == "MULTI_REGION" ? schema.spec.regionList : schema.spec.regionList.filter(x, false)}
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.tags
+                : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
