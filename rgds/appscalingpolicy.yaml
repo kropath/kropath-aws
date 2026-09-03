@@ -53,8 +53,10 @@ spec:
         # Governed by AppScalingConfig cascade (mandatory > 0 overrides instance; else instance; else defaults)
         scaleInCooldown: integer | default=300
         scaleOutCooldown: integer | default=60
-        # Governed: OR-logic — disabled if ANY tier requests disabling
-        disableScaleIn: boolean | default=false
+        # Governed: cascade (mandatory > instance > defaults).
+        # Bare boolean (no default=false): kro must not materialise false on every instance
+        # or has() is always true and cascade cannot detect "instance did not set this field".
+        disableScaleIn: boolean
         predefinedMetricSpecification:
           predefinedMetricType: string | default=""
           resourceLabel: string | default=""
@@ -123,6 +125,95 @@ spec:
             matchLabels:
               aws.kropath.run/resource-name: '${schema.spec.resourceRef != "" ? schema.spec.resourceRef : "kro-empty-fallback-sentinel"}'
 
+    # Advisory ConfigMap: resourceID and resourceRef are mutually exclusive (AC-11 negative).
+    - id: resourceConflictError
+      includeWhen:
+        - '${schema.spec.resourceID != "" && schema.spec.resourceRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-resource-conflict-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "resourceID and resourceRef are mutually exclusive — set exactly one"
+
+    # Advisory ConfigMap: predefinedMetricSpecification and customizedMetricSpecification are
+    # mutually exclusive (AC-12 negative).
+    - id: metricConflictError
+      includeWhen:
+        - '${schema.spec.targetTracking.predefinedMetricSpecification.predefinedMetricType != "" && schema.spec.targetTracking.customizedMetricSpecification.metricName != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-metric-conflict-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "predefinedMetricSpecification and customizedMetricSpecification are mutually exclusive — set exactly one"
+
+    # Advisory ConfigMap: TargetTrackingScaling requires at least one metric specification (AC-13 negative).
+    - id: noMetricSpecError
+      includeWhen:
+        - '${schema.spec.policyType == "TargetTrackingScaling" && schema.spec.targetTracking.predefinedMetricSpecification.predefinedMetricType == "" && schema.spec.targetTracking.customizedMetricSpecification.metricName == ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-no-metric-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "TargetTrackingScaling requires either predefinedMetricSpecification or customizedMetricSpecification"
+
+    # Advisory ConfigMap: serviceNamespace is required when resourceRef is not set (AC-14 negative).
+    - id: missingServiceNamespaceError
+      includeWhen:
+        - '${schema.spec.resourceRef == "" && schema.spec.serviceNamespace == ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-missing-namespace-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "serviceNamespace is required when resourceRef is not set"
+
     # ACK ScalingPolicy CR — creates the scaling policy via Application Auto Scaling.
     # Both targetTrackingScalingPolicyConfiguration and stepScalingPolicyConfiguration are
     # always serialized; AWS uses the one matching policyType and ignores the other.
@@ -183,8 +274,10 @@ spec:
                 : schema.spec.targetTracking.scaleOutCooldown}
             disableScaleIn: >-
               ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?disableScaleIn.orValue(false))
-                || schema.spec.targetTracking.disableScaleIn
-                || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?disableScaleIn.orValue(false))}
+                ? true
+                : (has(schema.spec.targetTracking.disableScaleIn)
+                    ? schema.spec.targetTracking.disableScaleIn
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?disableScaleIn.orValue(false)))}
             predefinedMetricSpecification:
               predefinedMetricType: ${schema.spec.targetTracking.predefinedMetricSpecification.predefinedMetricType}
               resourceLabel: ${schema.spec.targetTracking.predefinedMetricSpecification.resourceLabel}

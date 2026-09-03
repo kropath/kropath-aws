@@ -97,6 +97,30 @@ spec:
             matchLabels:
               aws.kropath.run/resource-name: '${schema.spec.roleRef != "" ? schema.spec.roleRef : "kro-empty-fallback-sentinel"}'
 
+    # Advisory ConfigMap created when roleARN and roleRef are both set (mutually exclusive).
+    # kro v0.9.2 discards x-kubernetes-validations; this ConfigMap surfaces the violation
+    # as a discoverable K8s resource. The ScalableTarget is still created but roleARN wins.
+    - id: mutualExclusionRoleError
+      includeWhen:
+        - '${schema.spec.roleARN != "" && schema.spec.roleRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-role-conflict-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: AppScalingTarget
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "roleARN and roleRef are mutually exclusive — set exactly one"
+
     # ACK ScalableTarget CR — registers the resource with Application Auto Scaling.
     - id: scalableTarget
       template:
@@ -139,14 +163,17 @@ spec:
               ? rsrcCfg[0].status.effectiveConfig.mandatory.maxCapacity
               : schema.spec.maxCapacity}
 
-          # IAM role ARN: prefer direct roleARN; fall back to resolved roleRef → IAMRole status ARN.
-          # When both are empty, omits the field (service-linked role used automatically by AWS).
+          # IAM role ARN: prefer direct roleARN; fall back to resolved roleRef → IAMRole predictedArn.
+          # When both are empty, passes schema.spec.roleARN ("") — kro omits empty-string fields
+          # from ACK child resources (omitempty), so AWS uses a service-linked role automatically.
+          # Guard predictedArn != "": when roleRef is set but IAMRole is still reconciling, kro
+          # falls back to schema.spec.roleARN ("") rather than writing a placeholder empty ARN.
           roleARN: >-
             ${schema.spec.roleARN != ""
               ? schema.spec.roleARN
-              : (schema.spec.roleRef != "" && iamRoleCr.size() > 0
+              : (schema.spec.roleRef != "" && iamRoleCr.size() > 0 && iamRoleCr[0].status.?predictedArn.orValue("") != ""
                   ? iamRoleCr[0].status.predictedArn
-                  : "")}
+                  : schema.spec.roleARN)}
 
           # Suspended state — controls which scaling activity types are paused
           suspendedState:
