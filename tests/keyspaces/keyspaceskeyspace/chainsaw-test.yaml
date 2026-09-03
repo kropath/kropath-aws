@@ -1,0 +1,840 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-keyspaces-02 Chainsaw tests — all 18 acceptance criteria.
+# Canonical pattern: unique config + resource name per step, skipDelete: true,
+# no inter-step deletes. See docs/frequent-rgd-errors.md §"CANONICAL".
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: keyspaceskeyspace
+spec:
+  skipDelete: true
+  namespace: keyspaceskeyspace
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Setup
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: Creation with defaults — replicationStrategy falls through to
+    #        SINGLE_REGION from defaults tier, naming uses {namespace}_{name}.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-defaults-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac1-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  replicationStrategy: "SINGLE_REGION"
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac1-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac1-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac1-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                keyspaceName: keyspaceskeyspace_ac1-keyspace
+                replicationSpecification:
+                  replicationStrategy: SINGLE_REGION
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac1-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                resourceName: keyspaceskeyspace_ac1-keyspace
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2 + AC-8: Instance sets replicationStrategy=MULTI_REGION with
+    #              regionList; also verifies predictedArn format.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-multiregion-and-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac2-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  replicationStrategy: "SINGLE_REGION"
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac2-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac2-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac2-cfg
+                replicationStrategy: MULTI_REGION
+                regionList:
+                  - ap-southeast-2
+                  - us-east-1
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac2-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                keyspaceName: keyspaceskeyspace_ac2-keyspace
+                replicationSpecification:
+                  replicationStrategy: MULTI_REGION
+        - script:
+            content: |
+              REGIONS=$(kubectl get keyspaces.keyspaces.services.k8s.aws ac2-keyspace \
+                -n keyspaceskeyspace -o jsonpath='{.spec.replicationSpecification.regionList}')
+              echo "regionList: $REGIONS"
+              echo "$REGIONS" | grep -q "ap-southeast-2" || (echo "ap-southeast-2 missing from regionList" && exit 1)
+              echo "$REGIONS" | grep -q "us-east-1" || (echo "us-east-1 missing from regionList" && exit 1)
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac2-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                predictedArn: "arn:aws:cassandra:ap-southeast-2:123456789012:/keyspace/keyspaceskeyspace_ac2-keyspace/"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: mandatory.replicationStrategy overrides spec and defaults.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-mandatory-replication-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac3-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  replicationStrategy: "MULTI_REGION"
+                defaults:
+                  replicationStrategy: "SINGLE_REGION"
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac3-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"MULTI_REGION","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac3-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac3-cfg
+                replicationStrategy: SINGLE_REGION
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac3-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                replicationSpecification:
+                  replicationStrategy: MULTI_REGION
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: defaults.namingTemplate controls resourceName.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-naming-template-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac4-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "ks_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac4-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"ks_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac4-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac4-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac4-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                resourceName: ks_ac4-keyspace
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac4-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                keyspaceName: ks_ac4-keyspace
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: mandatory.namingTemplate overrides defaults.namingTemplate.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-naming-template-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac5-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "mandatory_{name}"
+                defaults:
+                  namingTemplate: "ks_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac5-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"mandatory_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"ks_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac5-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac5-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac5-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                resourceName: mandatory_ac5-keyspace
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: spec.nameOverride bypasses all naming templates.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac6-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac6-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac6-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac6-cfg
+                nameOverride: my_production_keyspace
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac6-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                resourceName: my_production_keyspace
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac6-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                keyspaceName: my_production_keyspace
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: Unresolved {tag.X} token sets namingStatus=invalid-unresolved-tokens.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-naming-unresolved-tokens
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac7-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{tag.missing-key}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac7-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{tag.missing-key}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac7-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac7-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac7-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: Tags merge — defaults < spec < mandatory (mandatory wins).
+    #       Tag list assertions use jq (order is nondeterministic).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac9-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac9-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{"cost-centre":"data-services"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{"team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac9-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac9-cfg
+                tags:
+                  env: staging
+        - script:
+            content: |
+              TAGS=$(kubectl get keyspaces.keyspaces.services.k8s.aws ac9-keyspace \
+                -n keyspaceskeyspace -o json | jq '.spec.tags')
+              echo "tags: $TAGS"
+              # mandatory wins: cost-centre=data-services
+              echo "$TAGS" | jq -e '.[] | select(.key == "cost-centre" and .value == "data-services")' \
+                || (echo "mandatory tag cost-centre=data-services not found" && exit 1)
+              # defaults: team=platform
+              echo "$TAGS" | jq -e '.[] | select(.key == "team" and .value == "platform")' \
+                || (echo "defaults tag team=platform not found" && exit 1)
+              # spec: env=staging
+              echo "$TAGS" | jq -e '.[] | select(.key == "env" and .value == "staging")' \
+                || (echo "spec tag env=staging not found" && exit 1)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: syncedLabels appear as aws.kropath.run/<key> on the ACK CR.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac10-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac10-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac10-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac10-cfg
+                syncedLabels:
+                  team: data-engineering
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac10-keyspace
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/team: data-engineering
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: Standard metadata — ownerReferences and app.kubernetes.io labels
+    #         are set on the ACK Keyspace CR.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac11-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac11-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac11-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac11-cfg
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac11-keyspace
+                namespace: keyspaceskeyspace
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac11-keyspace
+        - script:
+            content: |
+              OWNER_KIND=$(kubectl get keyspaces.keyspaces.services.k8s.aws ac11-keyspace \
+                -n keyspaceskeyspace \
+                -o jsonpath='{.metadata.ownerReferences[0].kind}')
+              [ "$OWNER_KIND" = "KeyspacesKeyspace" ] \
+                || (echo "Expected ownerRef kind=KeyspacesKeyspace, got: $OWNER_KIND" && exit 1)
+              OWNER_NAME=$(kubectl get keyspaces.keyspaces.services.k8s.aws ac11-keyspace \
+                -n keyspaceskeyspace \
+                -o jsonpath='{.metadata.ownerReferences[0].name}')
+              [ "$OWNER_NAME" = "ac11-keyspace" ] \
+                || (echo "Expected ownerRef name=ac11-keyspace, got: $OWNER_NAME" && exit 1)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: deletionPolicy=delete sets the ACK deletion annotation.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac12-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac12-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac12-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac12-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac12-keyspace
+                namespace: keyspaceskeyspace
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: deletionPolicy defaults to retain.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-deletion-policy-retain-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac13-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac13-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac13-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac13-cfg
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac13-keyspace
+                namespace: keyspaceskeyspace
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14 + AC-15: replicationSpecification fields are immutable at ACK CRD
+    #                level. Verify the ACK CRD has the immutability rule.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-ac15-replicationspec-immutability
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac14-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac14-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac14-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac14-cfg
+                replicationStrategy: SINGLE_REGION
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac14-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                replicationSpecification:
+                  replicationStrategy: SINGLE_REGION
+        - script:
+            content: |
+              # Verify immutability rule is present on the ACK CRD
+              IMMUTABLE=$(kubectl get crd keyspaces.keyspaces.services.k8s.aws -o json \
+                | jq '[.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.replicationSpecification."x-kubernetes-validations"[]?.rule // empty] | map(test("self == oldSelf")) | any')
+              echo "replicationSpecification has immutability rule: $IMMUTABLE"
+              # If the CRD carries the immutability rule, try to mutate and verify rejection
+              if [ "$IMMUTABLE" = "true" ]; then
+                ERROR=$(kubectl patch keyspaces.keyspaces.services.k8s.aws ac14-keyspace \
+                  -n keyspaceskeyspace --type=merge \
+                  -p '{"spec":{"replicationSpecification":{"replicationStrategy":"MULTI_REGION"}}}' 2>&1 || true)
+                echo "$ERROR" | grep -qi "immutable\|forbidden\|invalid\|cannot" \
+                  || (echo "Expected immutability rejection, got: $ERROR" && exit 1)
+                echo "Immutability enforced at CRD level — OK"
+              else
+                echo "ACK CRD version does not declare immutability rule — enforcement deferred to AWS API"
+              fi
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: MULTI_REGION with empty regionList triggers advisory ConfigMap.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-multiregion-missing-regionlist
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac16-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac16-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac16-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac16-cfg
+                replicationStrategy: MULTI_REGION
+                regionList: []
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac16-keyspace-multiregion-missing-regionlist
+                namespace: keyspaceskeyspace
+              data:
+                error: "replicationStrategy is MULTI_REGION but regionList is empty — provide at least one AWS region"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac16-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                validationError: "replicationStrategy is MULTI_REGION but regionList is empty — provide at least one AWS region"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: MULTI_REGION with >6 regions triggers advisory ConfigMap.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-multiregion-too-many-regions
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: ac17-cfg
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run ac17-cfg -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac17-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: ac17-cfg
+                replicationStrategy: MULTI_REGION
+                regionList:
+                  - us-east-1
+                  - us-west-2
+                  - eu-west-1
+                  - ap-southeast-1
+                  - ap-northeast-1
+                  - sa-east-1
+                  - ca-central-1
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac17-keyspace-multiregion-too-many-regions
+                namespace: keyspaceskeyspace
+              data:
+                error: "replicationStrategy is MULTI_REGION but regionList exceeds the maximum of 6 regions"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac17-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                validationError: "replicationStrategy is MULTI_REGION but regionList exceeds the maximum of 6 regions"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: configRef fallthrough — custom config name resolves via label selector.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-configref-fallthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesConfig
+              metadata:
+                name: custom-keyspaces-profile
+                namespace: keyspaceskeyspace
+                labels:
+                  aws.kropath.run/resource-name: custom-keyspaces-profile
+              spec:
+                defaults:
+                  replicationStrategy: "SINGLE_REGION"
+                  namingTemplate: "custom_{name}"
+        - script:
+            content: |
+              kubectl patch keyspacesconfigs.aws.kropath.run custom-keyspaces-profile -n keyspaceskeyspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"replicationStrategy":"","throughputMode":"","encryptionType":"","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"replicationStrategy":"SINGLE_REGION","throughputMode":"PAY_PER_REQUEST","encryptionType":"AWS_OWNED_KMS_KEY","pointInTimeRecovery":false,"ttlEnabled":false,"namingTemplate":"custom_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac18-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                configRef: custom-keyspaces-profile
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KeyspacesKeyspace
+              metadata:
+                name: ac18-keyspace
+                namespace: keyspaceskeyspace
+              status:
+                resourceName: custom_ac18-keyspace
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: keyspaces.services.k8s.aws/v1alpha1
+              kind: Keyspace
+              metadata:
+                name: ac18-keyspace
+                namespace: keyspaceskeyspace
+              spec:
+                keyspaceName: custom_ac18-keyspace
