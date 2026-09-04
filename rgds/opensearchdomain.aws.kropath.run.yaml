@@ -1,0 +1,464 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-os-02 — OpenSearchDomain kro RGD (KRO-807).
+# Atomic RGD: wraps one ACK opensearchservice.services.k8s.aws/Domain.
+# Governance: 7 fields enforced via OpenSearchConfig effectiveConfig cascade (ADR-010).
+# Validation: advisory ConfigMaps for FGAC master-user check and policy mutual exclusion
+#   (x-kubernetes-validations not preserved by kro v0.9.2 — see frequent-rgd-errors.md).
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: opensearchdomain.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: OpenSearchDomain
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Engine
+      engineVersion: string | default=""
+
+      # Cluster topology
+      instanceType: string | default=""
+      instanceCount: integer | default=0
+      # Tri-state booleans (no default= so has() presence detection works — see CLAUDE.md)
+      dedicatedMasterEnabled: boolean
+      dedicatedMasterType: string | default=""
+      dedicatedMasterCount: integer | default=0
+      zoneAwarenessEnabled: boolean
+      availabilityZoneCount: integer | default=0
+      multiAZWithStandbyEnabled: boolean
+
+      # Storage
+      ebsEnabled: boolean
+      ebsVolumeType: string | default="gp3"
+      ebsVolumeSize: integer | default=0
+      ebsIops: integer | default=0
+      ebsThroughput: integer | default=0
+
+      # UltraWarm / cold (passthrough, not governance-enforced)
+      warmEnabled: boolean
+      warmType: string | default=""
+      warmCount: integer | default=0
+      coldStorageEnabled: boolean
+
+      # Security — governance-enforced via OpenSearchConfig
+      # Boolean sentinels: false = zero-value / not enforced (see spec §"Boolean cascade semantics")
+      encryptionAtRestEnabled: boolean
+      encryptionAtRestKmsKeyID: string | default=""
+      nodeToNodeEncryptionEnabled: boolean
+      enforceHTTPS: boolean
+      tlsSecurityPolicy: string | default=""
+      advancedSecurityEnabled: boolean
+      internalUserDatabaseEnabled: boolean
+      masterUserARN: string | default=""
+      masterUserName: string | default=""
+      masterUserPassword:
+        key: string | default=""
+        name: string | default=""
+        namespace: string | default=""
+
+      # Access
+      accessPolicies: string | default=""
+      domainPolicyRef: string | default=""
+      ipAddressType: string | default="ipv4"
+
+      # VPC (empty → public endpoint; AC-19)
+      vpcSubnetIDs: "[]string | default=[]"
+      vpcSecurityGroupIDs: "[]string | default=[]"
+
+      # Cognito authentication
+      cognitoEnabled: boolean
+      cognitoUserPoolID: string | default=""
+      cognitoIdentityPoolID: string | default=""
+      cognitoRoleARN: string | default=""
+
+      # Logging (passthrough)
+      logPublishingOptions: map[string]string | default={}
+
+      # Auto-Tune — governance-enforced via OpenSearchConfig
+      autoTuneDesiredState: string | default=""
+      autoTuneUseOffPeakWindow: boolean
+
+      # Off-peak maintenance window
+      offPeakWindowEnabled: boolean
+      offPeakWindowStartHours: integer | default=0
+      offPeakWindowStartMinutes: integer | default=0
+
+      # Software updates
+      autoSoftwareUpdateEnabled: boolean
+
+      # Advanced options (passthrough — all string values per ACK CRD)
+      advancedOptions: map[string]string | default={}
+
+      # AI/ML options (passthrough)
+      naturalLanguageQueryEnabled: string | default=""
+
+    status:
+      # resourceName and namingStatus sourced from the naming ConfigMap's data field.
+      # status: block cannot reference schema.* (frequent-rgd-errors.md §3).
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && !naming.data.effectiveName.contains("{") && naming.data.effectiveName != ""
+          ? "arn:aws:es:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":domain/" + naming.data.effectiveName
+          : ""}
+      conditions: >-
+        ${ackDomain.?status.?conditions.orValue([])}
+
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # kro returns externalRef as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: OpenSearchConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Domain name must be lowercase a-z, 0-9, hyphens (3-28 chars, must start with a-z).
+    # .lowerAscii() applied as the final step.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({})
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)
+              .lowerAscii())}
+
+    # Advisory ConfigMap — FGAC master-user requirement validation.
+    # advancedSecurityEnabled: true requires masterUserARN, or masterUserName + masterUserPassword.
+    # x-kubernetes-validations cannot be preserved by kro v0.9.2 — advisory ConfigMap pattern used.
+    # Checks governance-resolved advancedSecurity (mandatory → instance) against instance master user fields.
+    - id: fgacNoMasterUserError
+      includeWhen:
+        - >-
+          ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?advancedSecurityEnabled.orValue(false)
+              ? true
+              : (has(schema.spec.advancedSecurityEnabled) && schema.spec.advancedSecurityEnabled
+                  ? true
+                  : false))
+            && schema.spec.masterUserARN == ""
+            && schema.spec.masterUserName == ""
+            && (schema.spec.masterUserPassword.name == "" || schema.spec.masterUserPassword.key == "")}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-fgac-no-master-user-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "advancedSecurityEnabled requires masterUserARN, or masterUserName + masterUserPassword"
+
+    # Advisory ConfigMap — accessPolicies and domainPolicyRef mutual exclusion.
+    # x-kubernetes-validations cannot be preserved by kro v0.9.2 — advisory ConfigMap pattern used.
+    - id: policyMutualExclusionError
+      includeWhen:
+        - '${schema.spec.accessPolicies != "" && schema.spec.domainPolicyRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-policy-mutual-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "accessPolicies and domainPolicyRef are mutually exclusive"
+
+    # ACK Domain CR — primary cloud resource.
+    # Only created when naming is valid (effectiveName has no unresolved {tag.X} tokens).
+    - id: ackDomain
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+        kind: Domain
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource name — effectiveName from naming ConfigMap (lowercase per AWS constraint).
+          name: ${naming.data.effectiveName}
+
+          # Engine version — governed: mandatory (non-"") → instance (non-"") → defaults (non-"")
+          engineVersion: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?engineVersion.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.engineVersion
+              : (schema.spec.engineVersion != ""
+                  ? schema.spec.engineVersion
+                  : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?engineVersion.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.engineVersion
+                      : schema.spec.engineVersion))}
+
+          # Cluster topology — direct passthrough (not governance-enforced)
+          clusterConfig:
+            instanceType: ${schema.spec.instanceType}
+            instanceCount: ${schema.spec.instanceCount}
+            dedicatedMasterEnabled: >-
+              ${has(schema.spec.dedicatedMasterEnabled) ? schema.spec.dedicatedMasterEnabled : false}
+            dedicatedMasterType: ${schema.spec.dedicatedMasterType}
+            dedicatedMasterCount: ${schema.spec.dedicatedMasterCount}
+            zoneAwarenessEnabled: >-
+              ${has(schema.spec.zoneAwarenessEnabled) ? schema.spec.zoneAwarenessEnabled : false}
+            zoneAwarenessConfig:
+              availabilityZoneCount: ${schema.spec.availabilityZoneCount}
+            multiAZWithStandbyEnabled: >-
+              ${has(schema.spec.multiAZWithStandbyEnabled) ? schema.spec.multiAZWithStandbyEnabled : false}
+            warmEnabled: >-
+              ${has(schema.spec.warmEnabled) ? schema.spec.warmEnabled : false}
+            warmType: ${schema.spec.warmType}
+            warmCount: ${schema.spec.warmCount}
+            coldStorageOptions:
+              enabled: >-
+                ${has(schema.spec.coldStorageEnabled) ? schema.spec.coldStorageEnabled : false}
+
+          # EBS storage — direct passthrough
+          ebsOptions:
+            ebsEnabled: >-
+              ${has(schema.spec.ebsEnabled) ? schema.spec.ebsEnabled : true}
+            volumeType: ${schema.spec.ebsVolumeType}
+            volumeSize: ${schema.spec.ebsVolumeSize}
+            iops: ${schema.spec.ebsIops}
+            throughput: ${schema.spec.ebsThroughput}
+
+          # Encryption at rest — governed: mandatory true wins; boolean false = zero-value sentinel.
+          encryptionAtRestOptions:
+            enabled: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionAtRestEnabled.orValue(false)
+                ? true
+                : (has(schema.spec.encryptionAtRestEnabled)
+                    ? schema.spec.encryptionAtRestEnabled
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionAtRestEnabled.orValue(false) : false))}
+            kmsKeyID: ${schema.spec.encryptionAtRestKmsKeyID}
+
+          # Node-to-node encryption — governed: mandatory true wins.
+          nodeToNodeEncryptionOptions:
+            enabled: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?nodeToNodeEncryptionEnabled.orValue(false)
+                ? true
+                : (has(schema.spec.nodeToNodeEncryptionEnabled)
+                    ? schema.spec.nodeToNodeEncryptionEnabled
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?nodeToNodeEncryptionEnabled.orValue(false) : false))}
+
+          # HTTPS and TLS — governed: mandatory wins for enforceHTTPS (boolean) and tlsSecurityPolicy (string).
+          domainEndpointOptions:
+            enforceHTTPS: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?enforceHTTPS.orValue(false)
+                ? true
+                : (has(schema.spec.enforceHTTPS)
+                    ? schema.spec.enforceHTTPS
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?enforceHTTPS.orValue(false) : false))}
+            tlsSecurityPolicy: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?tlsSecurityPolicy.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.tlsSecurityPolicy
+                : (schema.spec.tlsSecurityPolicy != ""
+                    ? schema.spec.tlsSecurityPolicy
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tlsSecurityPolicy.orValue("") : ""))}
+
+          # Fine-grained access control — governed: mandatory true wins.
+          advancedSecurityOptions:
+            enabled: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?advancedSecurityEnabled.orValue(false)
+                ? true
+                : (has(schema.spec.advancedSecurityEnabled)
+                    ? schema.spec.advancedSecurityEnabled
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?advancedSecurityEnabled.orValue(false) : false))}
+            internalUserDatabaseEnabled: >-
+              ${has(schema.spec.internalUserDatabaseEnabled) ? schema.spec.internalUserDatabaseEnabled : false}
+            masterUserOptions:
+              masterUserARN: ${schema.spec.masterUserARN}
+              masterUserName: ${schema.spec.masterUserName}
+              masterUserPassword:
+                key: ${schema.spec.masterUserPassword.key}
+                name: ${schema.spec.masterUserPassword.name}
+                namespace: ${schema.spec.masterUserPassword.namespace}
+
+          # Access policy — direct passthrough (mutually exclusive with domainPolicyRef per AC-23)
+          accessPolicies: ${schema.spec.accessPolicies}
+
+          # IP address type — passthrough; immutable after creation per ACK CRD validation
+          ipAddressType: ${schema.spec.ipAddressType}
+
+          # VPC access — only included when vpcSubnetIDs is non-empty (AC-19: empty → public endpoint).
+          # kro requires both branches of a ternary to have the same type; since we cannot omit
+          # vpcOptions entirely via ternary, we always include it but use empty lists for public endpoint.
+          # The ACK controller omits vpcOptions when subnetIDs is empty (omitempty).
+          vpcOptions:
+            subnetIDs: ${schema.spec.vpcSubnetIDs}
+            securityGroupIDs: ${schema.spec.vpcSecurityGroupIDs}
+
+          # Cognito authentication — passthrough
+          cognitoOptions:
+            enabled: >-
+              ${has(schema.spec.cognitoEnabled) ? schema.spec.cognitoEnabled : false}
+            userPoolID: ${schema.spec.cognitoUserPoolID}
+            identityPoolID: ${schema.spec.cognitoIdentityPoolID}
+            roleARN: ${schema.spec.cognitoRoleARN}
+
+          # Auto-Tune — governed: mandatory (non-"") → instance (non-"") → defaults (non-"")
+          autoTuneOptions:
+            desiredState: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?autoTuneDesiredState.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.autoTuneDesiredState
+                : (schema.spec.autoTuneDesiredState != ""
+                    ? schema.spec.autoTuneDesiredState
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?autoTuneDesiredState.orValue("") : ""))}
+            useOffPeakWindow: >-
+              ${has(schema.spec.autoTuneUseOffPeakWindow) ? schema.spec.autoTuneUseOffPeakWindow : false}
+
+          # Off-peak window — passthrough
+          offPeakWindowOptions:
+            enabled: >-
+              ${has(schema.spec.offPeakWindowEnabled) ? schema.spec.offPeakWindowEnabled : false}
+            offPeakWindow:
+              windowStartTime:
+                hours: ${schema.spec.offPeakWindowStartHours}
+                minutes: ${schema.spec.offPeakWindowStartMinutes}
+
+          # Software update options — passthrough
+          softwareUpdateOptions:
+            autoSoftwareUpdateEnabled: >-
+              ${has(schema.spec.autoSoftwareUpdateEnabled) ? schema.spec.autoSoftwareUpdateEnabled : false}
+
+          # Advanced options — passthrough (all string values per ACK CRD)
+          advancedOptions: ${schema.spec.advancedOptions}
+
+          # AI/ML options — passthrough
+          aimlOptions:
+            naturalLanguageQueryGenerationOptions:
+              desiredState: ${schema.spec.naturalLanguageQueryEnabled}
+
+          # Cloud resource tags — ACK Domain spec.tags is array<{key, value}> (not map).
+          # Merge order: defaults → instance spec → mandatory (mandatory wins on key collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          # transformList produces a list of {key, value} pairs; sortBy for deterministic ordering.
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
