@@ -1,0 +1,235 @@
+---
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Spec: kropath-core/docs/specs/aws/aws-bedrock-04-bedrockharness.md
+# CRD cache: kropath-core/docs/crd-cache/aws/bedrockagentcorecontrol-v1.14.0.md
+#
+# Governance cascade (BedrockConfig mandatory > spec > defaults):
+#   maxIterations, maxTokens, timeoutSeconds
+#
+# Mutual exclusivity: executionRoleArn XOR executionRoleRef (ConfigMap advisory).
+# ACK field name: executionRoleARN (uppercase ARN).
+# ACK field name: harnessName (immutable — must be set at creation, enforced by ACK).
+# Integer sentinel: 0 = "not set", falls through to next tier.
+#
+# harnessId is exposed in status for cross-family reference by BedrockHarnessEndpoint.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: bedrockharness.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: BedrockHarness
+    scope: Namespaced
+    spec:
+      configRef: string | default=""
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      maxIterations: integer | default=0
+      maxTokens: integer | default=0
+      timeoutSeconds: integer | default=0
+      executionRoleArn: string | default=""
+      executionRoleRef: string | default=""
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${ackHarnessRef.size() > 0 ? ackHarnessRef[0].?status.?ackResourceMetadata.?arn.orValue("") : ""}
+      harnessId: >-
+        ${ackHarnessRef.size() > 0 ? ackHarnessRef[0].?status.?harnessID.orValue("") : ""}
+      conditions: >-
+        ${ackHarnessRef.size() > 0 ? ackHarnessRef[0].?status.?conditions.orValue([]) : []}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: HarnessId
+        type: string
+        jsonPath: .status.harnessId
+
+  resources:
+    # Config lookup.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: BedrockConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.spec.?configRef.orValue("general")}
+
+    # Naming ConfigMap.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockHarness
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # IAMRole lookup for executionRoleRef cross-family resolution.
+    # Uses kro-empty-fallback-sentinel when executionRoleRef is "" to ensure empty list.
+    - id: executionRoleRef
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMRole
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.executionRoleRef != "" ? schema.spec.executionRoleRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap advisory: fires when both executionRoleArn AND executionRoleRef are set.
+    - id: mutualExclusionRoleError
+      includeWhen:
+        - '${schema.spec.executionRoleArn != "" && schema.spec.executionRoleRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-role-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockHarness
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "executionRoleArn and executionRoleRef are mutually exclusive — set exactly one"
+
+    # ACK Harness resource. Governance fields cascade: mandatory > spec > defaults.
+    - id: ackHarness
+      template:
+        apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+        kind: Harness
+        metadata:
+          name: ${naming.data.effectiveName}
+          namespace: ${schema.metadata.namespace}
+          annotations:
+            services.k8s.aws/deletion-policy: ${schema.spec.deletionPolicy}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockHarness
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          harnessName: ${naming.data.effectiveName}
+          maxIterations: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxIterations.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxIterations
+              : (schema.spec.maxIterations != 0
+                  ? schema.spec.maxIterations
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?maxIterations.orValue(0) : 0))}
+          maxTokens: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxTokens.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxTokens
+              : (schema.spec.maxTokens != 0
+                  ? schema.spec.maxTokens
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?maxTokens.orValue(0) : 0))}
+          timeoutSeconds: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?timeoutSeconds.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.timeoutSeconds
+              : (schema.spec.timeoutSeconds != 0
+                  ? schema.spec.timeoutSeconds
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?timeoutSeconds.orValue(0) : 0))}
+          executionRoleARN: >-
+            ${schema.spec.executionRoleArn != ""
+              ? schema.spec.executionRoleArn
+              : (executionRoleRef.size() > 0 ? executionRoleRef[0].?status.?predictedArn.orValue("") : "")}
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(schema.spec.?tags.orValue({}))
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})}
+
+    # Always-bound self-lookup for the Harness's own ACK child.
+    - id: ackHarnessRef
+      externalRef:
+        apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+        kind: Harness
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
