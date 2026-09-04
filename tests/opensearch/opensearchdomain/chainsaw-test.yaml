@@ -1,0 +1,1118 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-os-02 Chainsaw tests — all 34 acceptance criteria for OpenSearchDomain RGD (KRO-807).
+# Canonical pattern: spec.skipDelete: true, unique resource names per step, no inter-step ACK deletes.
+# AC-to-scenario map: posted on Multica issue 935cc54d-9596-4805-98e5-3dec45509e5f (Theme 19-2).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: opensearchdomain
+spec:
+  skipDelete: true
+  namespace: opensearchdomain
+  steps:
+    # ── Setup: namespace + shared configs ───────────────────────────────────────
+
+    - name: setup-namespace-and-configs
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 01-general-policy.yaml
+        - apply:
+            file: 02-mandatory-encryption-config.yaml
+        - apply:
+            file: 03-mandatory-n2n-config.yaml
+        - apply:
+            file: 04-mandatory-https-tls-config.yaml
+        - apply:
+            file: 05-mandatory-fgac-config.yaml
+        - apply:
+            file: 06-mandatory-engine-config.yaml
+        - apply:
+            file: 07-mandatory-autotune-config.yaml
+        - apply:
+            file: 08-mandatory-naming-config.yaml
+        - apply:
+            file: 09-mandatory-tags-config.yaml
+        - apply:
+            file: 10-unresolved-naming-config.yaml
+        - apply:
+            file: 11-synced-labels-config.yaml
+        # Verify Theme 28 label present on one config as sanity check
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchConfig
+              metadata:
+                name: general-policy
+                namespace: opensearchdomain
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+
+    # ── AC-1: encryptionAtRest from defaults ────────────────────────────────────
+    # Given: general-policy (defaults.encryptionAtRestEnabled: true, mandatory sentinel false)
+    # When: OpenSearchDomain with no explicit encryptionAtRestEnabled
+    # Then: ACK Domain spec.encryptionAtRestOptions.enabled: true
+
+    - name: ac1-encryption-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac1
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: acosd-ac1-naming
+                namespace: opensearchdomain
+              data:
+                effectiveName: opensearchdomain-acosd-ac1
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac1
+                namespace: opensearchdomain
+              spec:
+                encryptionAtRestOptions:
+                  enabled: true
+
+    # ── AC-2: mandatory encryptionAtRest overrides instance false ───────────────
+    # Given: mandatory-encryption (mandatory.encryptionAtRestEnabled: true)
+    # When: OpenSearchDomain with no explicit encryptionAtRestEnabled
+    # Then: ACK Domain enabled: true (mandatory wins)
+
+    - name: ac2-encryption-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac2
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-encryption
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac2
+                namespace: opensearchdomain
+              spec:
+                encryptionAtRestOptions:
+                  enabled: true
+
+    # ── AC-3: KMS key ID passthrough ────────────────────────────────────────────
+    # Given: general-policy, encryptionAtRestKmsKeyID set in instance spec
+    # When: OpenSearchDomain applied
+    # Then: ACK Domain spec.encryptionAtRestOptions.kmsKeyID reflects the provided key ID
+
+    - name: ac3-encryption-cmk
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac3
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                encryptionAtRestKmsKeyID: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac3
+                namespace: opensearchdomain
+              spec:
+                encryptionAtRestOptions:
+                  kmsKeyID: "arn:aws:kms:us-east-1:123456789012:key/test-key-id"
+
+    # ── AC-4: nodeToNode from mandatory ─────────────────────────────────────────
+    # Given: mandatory-n2n (mandatory.nodeToNodeEncryptionEnabled: true)
+    # When: OpenSearchDomain applied
+    # Then: ACK Domain spec.nodeToNodeEncryptionOptions.enabled: true
+
+    - name: ac4-n2n-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac4
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-n2n
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac4
+                namespace: opensearchdomain
+              spec:
+                nodeToNodeEncryptionOptions:
+                  enabled: true
+
+    # ── AC-5: enforceHTTPS + tlsSecurityPolicy from mandatory ──────────────────
+    # Given: mandatory-https-tls (mandatory.enforceHTTPS: true, mandatory.tlsSecurityPolicy: PFS)
+    # When: OpenSearchDomain applied
+    # Then: ACK Domain enforceHTTPS: true, tlsSecurityPolicy: PFS policy
+
+    - name: ac5-https-tls-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac5
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-https-tls
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac5
+                namespace: opensearchdomain
+              spec:
+                domainEndpointOptions:
+                  enforceHTTPS: true
+                  tlsSecurityPolicy: "Policy-Min-TLS-1-2-PFS-2023-10"
+
+    # ── AC-6: enforceHTTPS + tlsSecurityPolicy from defaults ──────────────────
+    # Given: general-policy (defaults.enforceHTTPS: true, defaults.tlsSecurityPolicy: 2019-07)
+    # When: OpenSearchDomain applied
+    # Then: ACK Domain enforceHTTPS: true, tlsSecurityPolicy: 2019-07
+
+    - name: ac6-https-tls-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac6
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac6
+                namespace: opensearchdomain
+              spec:
+                domainEndpointOptions:
+                  enforceHTTPS: true
+                  tlsSecurityPolicy: "Policy-Min-TLS-1-2-2019-07"
+
+    # ── AC-7: instance tlsSecurityPolicy overrides defaults ────────────────────
+    # Given: general-policy (defaults.tlsSecurityPolicy: 2019-07, mandatory: "")
+    # When: OpenSearchDomain with spec.tlsSecurityPolicy: "Policy-Min-TLS-1-0-2021-02"
+    # Then: ACK Domain tlsSecurityPolicy: "Policy-Min-TLS-1-0-2021-02" (instance wins over defaults)
+
+    - name: ac7-tls-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac7
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                tlsSecurityPolicy: "Policy-Min-TLS-1-0-2021-02"
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac7
+                namespace: opensearchdomain
+              spec:
+                domainEndpointOptions:
+                  tlsSecurityPolicy: "Policy-Min-TLS-1-0-2021-02"
+
+    # ── AC-8: FGAC from mandatory with masterUserARN ────────────────────────────
+    # Given: mandatory-fgac (mandatory.advancedSecurityEnabled: true)
+    # When: OpenSearchDomain with masterUserARN set
+    # Then: ACK Domain advancedSecurityOptions.enabled: true, masterUserARN present
+
+    - name: ac8-fgac-mandatory-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac8
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-fgac
+                masterUserARN: "arn:aws:iam::123456789012:user/os-master"
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac8
+                namespace: opensearchdomain
+              spec:
+                advancedSecurityOptions:
+                  enabled: true
+                  masterUserOptions:
+                    masterUserARN: "arn:aws:iam::123456789012:user/os-master"
+
+    # ── AC-9: FGAC enabled but no master user — advisory ConfigMap created ──────
+    # Given: mandatory-fgac (mandatory.advancedSecurityEnabled: true)
+    # When: OpenSearchDomain with no masterUserARN / masterUserName / masterUserPassword
+    # Then: fgacNoMasterUserError advisory ConfigMap is created
+
+    - name: ac9-fgac-no-master-user
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac9
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-fgac
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: acosd-ac9-fgac-no-master-user-error
+                namespace: opensearchdomain
+              data:
+                error: "advancedSecurityEnabled requires masterUserARN, or masterUserName + masterUserPassword"
+
+    # ── AC-10: instance FGAC + internalUserDatabaseEnabled ────────────────────
+    # Given: general-policy (defaults.advancedSecurityEnabled: false, mandatory sentinel false)
+    # When: OpenSearchDomain with advancedSecurityEnabled: true, internalUserDatabaseEnabled: true,
+    #       masterUserName + masterUserPassword set
+    # Then: ACK Domain advancedSecurityOptions.enabled: true, internalUserDatabaseEnabled: true
+
+    - name: ac10-fgac-instance-userdb
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac10
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                advancedSecurityEnabled: true
+                internalUserDatabaseEnabled: true
+                masterUserName: "admin"
+                masterUserPassword:
+                  name: os-master-secret
+                  key: password
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac10
+                namespace: opensearchdomain
+              spec:
+                advancedSecurityOptions:
+                  enabled: true
+                  internalUserDatabaseEnabled: true
+                  masterUserOptions:
+                    masterUserName: "admin"
+
+    # ── AC-11: engineVersion from mandatory ─────────────────────────────────────
+    # Given: mandatory-engine (mandatory.engineVersion: "OpenSearch_2.11",
+    #         defaults.engineVersion: "OpenSearch_2.9")
+    # When: OpenSearchDomain applied (instance engineVersion "")
+    # Then: ACK Domain spec.engineVersion: "OpenSearch_2.11"
+
+    - name: ac11-engine-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac11
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-engine
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac11
+                namespace: opensearchdomain
+              spec:
+                engineVersion: "OpenSearch_2.11"
+
+    # ── AC-12: engineVersion from defaults ──────────────────────────────────────
+    # Given: general-policy (defaults.engineVersion: "OpenSearch_2.9", mandatory: "")
+    # When: OpenSearchDomain applied (instance engineVersion "")
+    # Then: ACK Domain spec.engineVersion: "OpenSearch_2.9"
+
+    - name: ac12-engine-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac12
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac12
+                namespace: opensearchdomain
+              spec:
+                engineVersion: "OpenSearch_2.9"
+
+    # ── AC-13: autoTuneDesiredState from mandatory ──────────────────────────────
+    # Given: mandatory-autotune (mandatory.autoTuneDesiredState: "DISABLED",
+    #         defaults.autoTuneDesiredState: "ENABLED")
+    # When: OpenSearchDomain applied
+    # Then: ACK Domain autoTuneOptions.desiredState: "DISABLED"
+
+    - name: ac13-autotune-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac13
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-autotune
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac13
+                namespace: opensearchdomain
+              spec:
+                autoTuneOptions:
+                  desiredState: "DISABLED"
+
+    # ── AC-14: autoTuneDesiredState from defaults ───────────────────────────────
+    # Given: general-policy (defaults.autoTuneDesiredState: "ENABLED", mandatory: "")
+    # When: OpenSearchDomain applied (instance autoTuneDesiredState "")
+    # Then: ACK Domain autoTuneOptions.desiredState: "ENABLED"
+
+    - name: ac14-autotune-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac14
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac14
+                namespace: opensearchdomain
+              spec:
+                autoTuneOptions:
+                  desiredState: "ENABLED"
+
+    # ── AC-15: cluster topology passthrough ─────────────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with instanceType, instanceCount, dedicatedMaster, zoneAwareness
+    # Then: ACK Domain clusterConfig reflects the instance spec values
+
+    - name: ac15-cluster-topology
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac15
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                instanceType: "r6g.large.search"
+                instanceCount: 3
+                dedicatedMasterEnabled: true
+                dedicatedMasterType: "r6g.large.search"
+                dedicatedMasterCount: 3
+                zoneAwarenessEnabled: true
+                availabilityZoneCount: 3
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac15
+                namespace: opensearchdomain
+              spec:
+                clusterConfig:
+                  instanceType: "r6g.large.search"
+                  instanceCount: 3
+                  dedicatedMasterEnabled: true
+                  dedicatedMasterType: "r6g.large.search"
+                  dedicatedMasterCount: 3
+                  zoneAwarenessEnabled: true
+                  zoneAwarenessConfig:
+                    availabilityZoneCount: 3
+
+    # ── AC-16: multiAZWithStandby passthrough ───────────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with multiAZWithStandbyEnabled: true
+    # Then: ACK Domain clusterConfig.multiAZWithStandbyEnabled: true
+
+    - name: ac16-multi-az-standby
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac16
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                multiAZWithStandbyEnabled: true
+                instanceType: "r6g.2xlarge.search"
+                instanceCount: 3
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac16
+                namespace: opensearchdomain
+              spec:
+                clusterConfig:
+                  multiAZWithStandbyEnabled: true
+
+    # ── AC-17: EBS gp3 options passthrough ─────────────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with EBS gp3 options
+    # Then: ACK Domain ebsOptions reflects the spec values
+
+    - name: ac17-ebs-gp3
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac17
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                ebsEnabled: true
+                ebsVolumeType: gp3
+                ebsVolumeSize: 100
+                ebsIops: 3000
+                ebsThroughput: 125
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac17
+                namespace: opensearchdomain
+              spec:
+                ebsOptions:
+                  ebsEnabled: true
+                  volumeType: gp3
+                  volumeSize: 100
+                  iops: 3000
+                  throughput: 125
+
+    # ── AC-18: VPC access — subnetIDs non-empty ─────────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with vpcSubnetIDs and vpcSecurityGroupIDs
+    # Then: ACK Domain vpcOptions.subnetIDs and securityGroupIDs reflect spec values
+
+    - name: ac18-vpc-access
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac18
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                vpcSubnetIDs:
+                  - subnet-11111111
+                  - subnet-22222222
+                vpcSecurityGroupIDs:
+                  - sg-33333333
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac18
+                namespace: opensearchdomain
+              spec:
+                vpcOptions:
+                  subnetIDs:
+                    - subnet-11111111
+                    - subnet-22222222
+                  securityGroupIDs:
+                    - sg-33333333
+
+    # ── AC-19: public endpoint — vpcSubnetIDs empty ─────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with no vpcSubnetIDs (default: [])
+    # Then: ACK Domain vpcOptions.subnetIDs is empty (ACK controller treats as public endpoint)
+
+    - name: ac19-public-endpoint
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac19
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac19
+                namespace: opensearchdomain
+              spec:
+                vpcOptions:
+                  (length(subnetIDs)): 0
+
+    # ── AC-20: Cognito authentication passthrough ───────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with cognitoEnabled + pool IDs + role ARN
+    # Then: ACK Domain cognitoOptions reflects spec values
+
+    - name: ac20-cognito-auth
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac20
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                cognitoEnabled: true
+                cognitoUserPoolID: "us-east-1_TestPool123"
+                cognitoIdentityPoolID: "us-east-1:test-identity-pool-id"
+                cognitoRoleARN: "arn:aws:iam::123456789012:role/CognitoAccessForAmazonOpenSearch"
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac20
+                namespace: opensearchdomain
+              spec:
+                cognitoOptions:
+                  enabled: true
+                  userPoolID: "us-east-1_TestPool123"
+                  identityPoolID: "us-east-1:test-identity-pool-id"
+                  roleARN: "arn:aws:iam::123456789012:role/CognitoAccessForAmazonOpenSearch"
+
+    # ── AC-21: log publishing options passthrough ───────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with advancedOptions set (log publishing via advancedOptions)
+    # Then: ACK Domain advancedOptions reflects the provided map
+
+    - name: ac21-log-publishing
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac21
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                advancedOptions:
+                  "rest.action.multi.allow_explicit_index": "true"
+                  "indices.query.bool.max_clause_count": "1024"
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac21
+                namespace: opensearchdomain
+              spec:
+                advancedOptions:
+                  "rest.action.multi.allow_explicit_index": "true"
+                  "indices.query.bool.max_clause_count": "1024"
+
+    # ── AC-22: accessPolicies passthrough ───────────────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with accessPolicies JSON (no domainPolicyRef)
+    # Then: ACK Domain spec.accessPolicies reflects the provided policy
+
+    - name: ac22-access-policies
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac22
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                accessPolicies: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"es:*"}]}'
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac22
+                namespace: opensearchdomain
+              spec:
+                accessPolicies: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"es:*"}]}'
+
+    # ── AC-23: accessPolicies + domainPolicyRef mutual exclusion (negative) ─────
+    # Given: general-policy
+    # When: OpenSearchDomain with BOTH accessPolicies and domainPolicyRef set
+    # Then: policyMutualExclusionError advisory ConfigMap created with error message
+
+    - name: ac23-policy-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac23
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                accessPolicies: '{"Version":"2012-10-17","Statement":[]}'
+                domainPolicyRef: "my-policy-ref"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: acosd-ac23-policy-mutual-exclusion-error
+                namespace: opensearchdomain
+              data:
+                error: "accessPolicies and domainPolicyRef are mutually exclusive"
+
+    # ── AC-24: naming from defaults template {namespace}-{name} ────────────────
+    # Given: general-policy (defaults.namingTemplate: "{namespace}-{name}", mandatory: "")
+    # When: OpenSearchDomain applied with no nameOverride
+    # Then: naming ConfigMap effectiveName: "opensearchdomain-acosd-ac24"
+
+    - name: ac24-naming-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac24
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: acosd-ac24-naming
+                namespace: opensearchdomain
+              data:
+                effectiveName: opensearchdomain-acosd-ac24
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac24
+                namespace: opensearchdomain
+              status:
+                resourceName: opensearchdomain-acosd-ac24
+                namingStatus: valid
+
+    # ── AC-25: naming from mandatory namingTemplate ─────────────────────────────
+    # Given: mandatory-naming (mandatory.namingTemplate: "kr-{name}")
+    # When: OpenSearchDomain applied
+    # Then: effectiveName: "kr-acosd-ac25"
+
+    - name: ac25-naming-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac25
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-naming
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: acosd-ac25-naming
+                namespace: opensearchdomain
+              data:
+                effectiveName: kr-acosd-ac25
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac25
+                namespace: opensearchdomain
+              status:
+                resourceName: kr-acosd-ac25
+                namingStatus: valid
+
+    # ── AC-26: nameOverride takes precedence ────────────────────────────────────
+    # Given: general-policy, spec.nameOverride: "my-custom-domain"
+    # When: OpenSearchDomain applied
+    # Then: effectiveName: "my-custom-domain" (nameOverride wins over template)
+
+    - name: ac26-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac26
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                nameOverride: "my-custom-domain"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: acosd-ac26-naming
+                namespace: opensearchdomain
+              data:
+                effectiveName: my-custom-domain
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac26
+                namespace: opensearchdomain
+              spec:
+                name: my-custom-domain
+
+    # ── AC-27: unresolved {tag.X} token — ACK Domain not created ───────────────
+    # Given: unresolved-naming (defaults.namingTemplate: "{namespace}-{tag.nonexistent}-{name}")
+    # When: OpenSearchDomain applied (no matching tags in spec or config)
+    # Then: namingStatus: invalid-unresolved-tokens; ACK Domain is NOT created
+
+    - name: ac27-naming-unresolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac27
+                namespace: opensearchdomain
+              spec:
+                configRef: unresolved-naming
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac27
+                namespace: opensearchdomain
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - error:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac27
+                namespace: opensearchdomain
+
+    # ── AC-28: tags merge — mandatory wins on key collision ─────────────────────
+    # Given: mandatory-tags (mandatory.tags: {env: prod}, defaults.tags: {env: staging})
+    # When: OpenSearchDomain with spec.tags: {team: search}
+    # Then: ACK Domain spec.tags contains key=env value=prod (mandatory wins) and key=team value=search
+    # Note: tags are array[{key,value}] — assert via script+jq (frequent-rgd-errors.md)
+
+    - name: ac28-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac28
+                namespace: opensearchdomain
+              spec:
+                configRef: mandatory-tags
+                tags:
+                  team: search
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac28
+                namespace: opensearchdomain
+        - script:
+            content: |
+              TAGS=$(kubectl get domain acosd-ac28 -n opensearchdomain -o json | jq -r '.spec.tags // []')
+              ENV_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "env") | .value')
+              TEAM_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "team") | .value')
+              if [ "$ENV_VAL" != "prod" ]; then
+                echo "FAIL: expected env=prod but got env=$ENV_VAL (mandatory should win over defaults)"
+                exit 1
+              fi
+              if [ "$TEAM_VAL" != "search" ]; then
+                echo "FAIL: expected team=search but got team=$TEAM_VAL (instance tag not merged)"
+                exit 1
+              fi
+              echo "PASS: tags merged correctly"
+
+    # ── AC-29: syncedLabels written to cloud tags ───────────────────────────────
+    # Given: synced-labels config (defaults.syncedLabels: {team: platform})
+    # When: OpenSearchDomain applied
+    # Then: ACK Domain spec.tags contains key=team value=platform
+
+    - name: ac29-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac29
+                namespace: opensearchdomain
+              spec:
+                configRef: synced-labels
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac29
+                namespace: opensearchdomain
+        - script:
+            content: |
+              TAGS=$(kubectl get domain acosd-ac29 -n opensearchdomain -o json | jq -r '.spec.tags // []')
+              TEAM_VAL=$(echo "$TAGS" | jq -r '.[] | select(.key == "team") | .value')
+              if [ "$TEAM_VAL" != "platform" ]; then
+                echo "FAIL: expected team=platform in tags (syncedLabels dual-write) but got: $TEAM_VAL"
+                exit 1
+              fi
+              echo "PASS: syncedLabels written to cloud tags"
+
+    # ── AC-30: standard metadata — labels and annotations applied ──────────────
+    # Given: general-policy
+    # When: OpenSearchDomain applied
+    # Then: ACK Domain metadata.labels contains app.kubernetes.io/managed-by: kro;
+    #       metadata.annotations contains services.k8s.aws/deletion-policy: retain (default)
+
+    - name: ac30-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac30
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac30
+                namespace: opensearchdomain
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: acosd-ac30
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ── AC-31: deletionPolicy: delete — annotation set to delete ───────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with deletionPolicy: delete
+    # Then: ACK Domain annotation services.k8s.aws/deletion-policy: delete
+
+    - name: ac31-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac31
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac31
+                namespace: opensearchdomain
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ── AC-32: deletionPolicy: retain (default) ────────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with no deletionPolicy specified (default: retain)
+    # Then: ACK Domain annotation services.k8s.aws/deletion-policy: retain
+
+    - name: ac32-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac32
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac32
+                namespace: opensearchdomain
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ── AC-33: offPeakWindow + softwareUpdateOptions passthrough ────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with offPeakWindow and autoSoftwareUpdateEnabled
+    # Then: ACK Domain offPeakWindowOptions and softwareUpdateOptions reflect spec values
+
+    - name: ac33-offpeak-software-update
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac33
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                offPeakWindowEnabled: true
+                offPeakWindowStartHours: 2
+                offPeakWindowStartMinutes: 0
+                autoSoftwareUpdateEnabled: true
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac33
+                namespace: opensearchdomain
+              spec:
+                offPeakWindowOptions:
+                  enabled: true
+                  offPeakWindow:
+                    windowStartTime:
+                      hours: 2
+                      minutes: 0
+                softwareUpdateOptions:
+                  autoSoftwareUpdateEnabled: true
+
+    # ── AC-34: ipAddressType dualstack ──────────────────────────────────────────
+    # Given: general-policy
+    # When: OpenSearchDomain with ipAddressType: dualstack
+    # Then: ACK Domain spec.ipAddressType: dualstack
+
+    - name: ac34-ip-dualstack
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: acosd-ac34
+                namespace: opensearchdomain
+              spec:
+                configRef: general-policy
+                ipAddressType: dualstack
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: acosd-ac34
+                namespace: opensearchdomain
+              spec:
+                ipAddressType: dualstack
