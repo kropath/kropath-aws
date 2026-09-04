@@ -1,0 +1,306 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# BedrockAgent Chainsaw tests.
+# Canonical pattern: skipDelete + unique resource name per step; no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bedrockagent
+spec:
+  skipDelete: true
+  namespace: bedrockagent
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: BedrockAgent with foundationModel in spec creates ACK Agent with that model.
+    - name: ac1-basic-create-with-foundationmodel
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac1-cfg
+                namespace: bedrockagent
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac1-cfg -n bedrockagent \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgent
+              metadata:
+                name: ac1-agent
+                namespace: bedrockagent
+              spec:
+                configRef: ac1-cfg
+                foundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+                agentResourceRoleArn: "arn:aws:iam::123456789012:role/agent-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgent
+              metadata:
+                name: ac1-agent
+                namespace: bedrockagent
+              status:
+                resourceName: bedrockagent-ac1-agent
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagent.services.k8s.aws/v1alpha1
+              kind: Agent
+              metadata:
+                name: bedrockagent-ac1-agent
+                namespace: bedrockagent
+              spec:
+                agentName: bedrockagent-ac1-agent
+                foundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+                agentResourceRoleARN: "arn:aws:iam::123456789012:role/agent-role"
+
+    # AC-2: mandatory.foundationModel overrides spec.foundationModel (governance cascade).
+    - name: ac2-foundationmodel-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac2-cfg
+                namespace: bedrockagent
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  foundationModel: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac2-cfg -n bedrockagent \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"anthropic.claude-3-5-sonnet-20241022-v2:0","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgent
+              metadata:
+                name: ac2-agent
+                namespace: bedrockagent
+              spec:
+                configRef: ac2-cfg
+                foundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+                agentResourceRoleArn: "arn:aws:iam::123456789012:role/agent-role"
+        - assert:
+            resource:
+              apiVersion: bedrockagent.services.k8s.aws/v1alpha1
+              kind: Agent
+              metadata:
+                name: bedrockagent-ac2-agent
+                namespace: bedrockagent
+              spec:
+                foundationModel: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+    # AC-3: defaults.foundationModel used when spec and mandatory are empty.
+    - name: ac3-foundationmodel-defaults-fallback
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac3-cfg
+                namespace: bedrockagent
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  foundationModel: "amazon.titan-text-lite-v1"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac3-cfg -n bedrockagent \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"amazon.titan-text-lite-v1","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgent
+              metadata:
+                name: ac3-agent
+                namespace: bedrockagent
+              spec:
+                configRef: ac3-cfg
+                agentResourceRoleArn: "arn:aws:iam::123456789012:role/agent-role"
+        - assert:
+            resource:
+              apiVersion: bedrockagent.services.k8s.aws/v1alpha1
+              kind: Agent
+              metadata:
+                name: bedrockagent-ac3-agent
+                namespace: bedrockagent
+              spec:
+                foundationModel: "amazon.titan-text-lite-v1"
+
+    # AC-4: mutual exclusion ConfigMap created when both agentResourceRoleArn and agentResourceRoleRef set.
+    - name: ac4-mutual-exclusion-role-error
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac4-cfg
+                namespace: bedrockagent
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac4-cfg -n bedrockagent \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgent
+              metadata:
+                name: ac4-agent
+                namespace: bedrockagent
+              spec:
+                configRef: ac4-cfg
+                foundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+                agentResourceRoleArn: "arn:aws:iam::123456789012:role/agent-role"
+                agentResourceRoleRef: some-iam-role
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac4-agent-role-exclusion-error
+                namespace: bedrockagent
+              data:
+                error: "agentResourceRoleArn and agentResourceRoleRef are mutually exclusive — set exactly one"
+
+    # AC-5: tags merge (mandatory > spec > defaults) verified with jq.
+    - name: ac5-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac5-cfg
+                namespace: bedrockagent
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  tags:
+                    env: production
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    team: platform
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac5-cfg -n bedrockagent \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{"env":"production"},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"team":"platform"},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgent
+              metadata:
+                name: ac5-agent
+                namespace: bedrockagent
+              spec:
+                configRef: ac5-cfg
+                foundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+                agentResourceRoleArn: "arn:aws:iam::123456789012:role/agent-role"
+                tags:
+                  owner: squad-ml
+        - assert:
+            resource:
+              apiVersion: bedrockagent.services.k8s.aws/v1alpha1
+              kind: Agent
+              metadata:
+                name: bedrockagent-ac5-agent
+                namespace: bedrockagent
+        - script:
+            content: |
+              set -euo pipefail
+              TAGS=$(kubectl get agent bedrockagent-ac5-agent -n bedrockagent -o json \
+                | jq -r '.spec.tags | to_entries | map(.key + "=" + .value) | sort | join(",")')
+              echo "tags: $TAGS"
+              echo "$TAGS" | grep -q "env=production"
+              echo "$TAGS" | grep -q "owner=squad-ml"
+              echo "$TAGS" | grep -q "team=platform"
+
+    # AC-6: idleSessionTTLInSeconds governance cascade (mandatory wins).
+    - name: ac6-idlesessionttl-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac6-cfg
+                namespace: bedrockagent
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  idleSessionTTLInSeconds: 3600
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac6-cfg -n bedrockagent \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":3600,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgent
+              metadata:
+                name: ac6-agent
+                namespace: bedrockagent
+              spec:
+                configRef: ac6-cfg
+                foundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+                idleSessionTTLInSeconds: 600
+                agentResourceRoleArn: "arn:aws:iam::123456789012:role/agent-role"
+        - assert:
+            resource:
+              apiVersion: bedrockagent.services.k8s.aws/v1alpha1
+              kind: Agent
+              metadata:
+                name: bedrockagent-ac6-agent
+                namespace: bedrockagent
+              spec:
+                idleSessionTTLInSeconds: 3600
