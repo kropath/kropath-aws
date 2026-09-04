@@ -1592,3 +1592,119 @@ bugs:
   belong in the `<service>config` suite.
 
 ---
+### Minimal Fixture CRDs Are a Fallback — Never Apply Them Over a Live ACK CRD
+
+* **What Fails:** A Chainsaw suite opens by unconditionally applying the stub CRDs under
+  `tests/fixtures/crds/<service>/`, then a *different* suite fails with an error that names a field
+  neither suite mentions:
+    ```log
+    failed to create typed patch object (acmedomainvalidation/ac4-dv; ...Kind=AcmeDomainValidation):
+      .spec.prevalidationOptions.dnsPrevalidation.domainScope.subdomains:
+        expected string, got &value.valueUnstructured{Value:true}
+    ```
+  or an ACK CR that always applied cleanly is suddenly rejected for a missing field:
+    ```log
+    The AcmeEndpoint "ref-ep" is invalid:
+    * spec.certificateAuthority: Required value
+    ```
+* **Why:** Those fixtures are hand-written **minimal** stubs (their headers say so). They exist so
+  a cluster without the real ACK charts can still compile the RGD. `tests/setup.sh` installs the
+  genuine ACK CRDs from ECR, so applying a stub on top **replaces the live schema with a narrower,
+  possibly mistyped one** — cluster-wide, for every suite running in parallel. It also cuts both
+  ways: a stub that is *laxer* than the real CRD (missing a `required:` list, `boolean` where ACK
+  says `string`) makes a broken RGD or an incomplete test fixture look green, and the breakage only
+  surfaces later against real AWS or once the overwrite is removed.
+* **What Works Instead:** Apply the stubs only when a required ACK CRD is genuinely absent — see
+  `tests/acm/ensure-acm-prereqs.sh` for the pattern. Keep each stub faithful to the real CRD
+  (matching types **and** `spec.required`); diff it against `kubectl get crd <name> -o json` after
+  any ACK chart bump.
+* **Root cause (KRO-873):** All five ACM suites overwrote the shared `acm`/`acmpca` CRDs on every
+  run. Two real bugs were hiding behind it: the RGD emitted booleans into
+  `domainScope.subdomains`/`wildcards`, which the real ACK CRD types as `ENABLED`/`DISABLED`
+  strings, and a hand-rolled ACK `AcmeEndpoint` in a test omitted the required
+  `spec.certificateAuthority`.
+
+---
+
+### Never Delete or Recreate a Shared RGD From Inside a Chainsaw Suite
+
+* **What Fails:** A suite times out in its own preamble, on an RGD that `tests/setup.sh` already
+  brought to `Active` minutes earlier:
+    ```log
+    | acmcertificate | preamble-apply-crds-and-rgds | SCRIPT | ERROR |
+    error: timed out waiting for the condition on resourcegraphdefinitions/acmcertificate.aws.kropath.run
+    ```
+  It passes on the next run, which makes it read as an infrastructure flake.
+* **Why:** Suites run concurrently (`chainsaw --parallel 4`) against one kro pod, so
+  `kubectl delete rgd` is cluster-wide surgery, not suite-local setup. Two suites that share an RGD
+  (`acmprivateca` is used by `acmprivateca`, `acmprivatecertificate` **and** `acmcertificate`) will
+  delete it out from under each other. Every delete also makes kro tear down and re-derive the
+  generated CRD; several at once regularly blow a 120s wait.
+* **What Works Instead:** Verify, do not mutate. `setup.sh` has already applied and waited for every
+  RGD, so `kubectl wait rgd <name> --for=condition=Ready --timeout=30s` returns instantly; only
+  apply (never delete) if that fails. If an RGD still will not go Ready, fail with kro's own
+  condition message.
+* **Do not "repair" a stuck RGD by deleting it.** A persistent
+  `cannot update CRD ...: breaking changes detected: Property X was removed` means the cluster holds
+  a CRD derived from an older revision of that RGD. kro only re-derives on a fresh create, but the
+  delete cascades into ACK children whose finalizers are never removed on a cluster running kro with
+  no ACK controllers — so it hangs (see §"CANONICAL: Unique-Name-Per-Step + `skipDelete`"). This
+  only happens on a long-lived local cluster; CI creates a fresh kind cluster every run. Fix it with
+  `make teardown && make setup`.
+
+---
+
+### A Scripted Mass-Edit Across All RGDs Can Leave CEL Unparseable — Run `make lint-rgd-cel`
+
+* **What Fails:** After a bulk edit, one or two RGDs never leave `Inactive`. The suites for those
+  kinds fail ~20 minutes later, and the only clue is in the setup step, not the test output:
+    ```log
+    timed out waiting for the condition on resourcegraphdefinitions/stepfunctionsactivity.aws.kropath.run
+      - stepfunctionsactivity.aws.kropath.run: failed to build dependency graph: ...
+        parse error: ERROR: <input>:38:50: Syntax error: mismatched input ')' expecting <EOF>
+     |   .replace("{configRef}", schema.spec.configRef))).contains("{")
+    ```
+* **Why:** A rewrite that adds an opening and a closing paren in two separate substitutions stays
+  balanced only while *both* patterns match. KRO-977 rewrote `${(schema.spec.nameOverride` →
+  `${((schema.spec.nameOverride` and the matching close `))` → `)))`. In the two RGDs whose
+  expression already opened with `((`, only the closing rewrite fired.
+* **What Works Instead:** Run `make lint-rgd-cel` (`hack/check-rgd-cel-balance.sh`) after any bulk
+  RGD edit — it is quote-aware, sub-second, runs with no cluster, and names the file and line. It
+  also runs as its own PR job in `.github/workflows/crd-classification-check.yml`. To confirm a
+  fix is not merely *balanced* but *correct*, diff the whole expression against a peer RGD the
+  script handled properly; after the KRO-873 fix the `namingStatus` blocks in both `stepfunctions`
+  RGDs are byte-identical to `gluejob`'s.
+
+---
+
+### Waiting on the Injected Status Field Instead of the One the RGD Reads
+
+* **What Fails:** A cross-resource reference resolves to `""` and the ACK child is then frozen that
+  way, so the suite burns its whole 5m assert timeout:
+    ```log
+    * spec.restAPIID: Invalid value: "": Expected value: "abc123def"
+    ...
+    Authorizer "ac6-auth" is invalid: spec.restAPIID: Invalid value: "abc123def":
+      Value is immutable once set
+    ```
+* **Why:** The test patched `status.id` on the **ACK** `RestApi` and immediately applied the
+  dependent CR. But the consuming RGD reads `status.restApiId` on the **kropath**
+  `APIGatewayRestAPI`, which kro surfaces only on a further reconcile hop. The dependent resource
+  was created during that window with an empty ID — and many ACK identity fields are
+  `x-kubernetes-validations: self == oldSelf`, so the correct value is rejected forever afterwards.
+  Whether the hop wins the race varies with cluster load, which is what makes it look flaky.
+* **What Works Instead:** Poll for the exact field the RGD consumes before creating the dependent
+  resource, and assert it — do not just wait for the value you injected:
+    ```bash
+    kubectl patch restapi ac6-api -n apigatewayauthorizer \
+      --subresource=status --type=merge -p '{"status":{"id":"abc123def"}}'
+    for i in $(seq 1 30); do
+      [ "$(kubectl get apigatewayrestapis.aws.kropath.run ac6-api -n apigatewayauthorizer \
+            -o jsonpath='{.status.restApiId}' 2>/dev/null)" = "abc123def" ] && break
+      sleep 2
+    done
+    kubectl get apigatewayrestapis.aws.kropath.run ac6-api -n apigatewayauthorizer \
+      -o jsonpath='{.status.restApiId}' | grep -qx abc123def
+    ```
+
+---

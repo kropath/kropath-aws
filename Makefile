@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: lint-crds
+.PHONY: lint lint-crds lint-rgd-cel
+
+lint: lint-crds lint-rgd-cel
 
 lint-crds:
 	bash hack/check-crd-classification.sh
+
+lint-rgd-cel:
+	bash hack/check-rgd-cel-balance.sh
