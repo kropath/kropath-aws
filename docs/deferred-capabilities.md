@@ -79,3 +79,27 @@ clear error message instructing them to configure all 10 ARN fields or none.
 template write position, remove the 12-variant template structure and replace with a single
 template using conditional field emission. Also remove the `mixedFeedbackARNError` ConfigMap and
 the `hasMixedFeedbackARN` flag from the naming ConfigMap.
+
+---
+
+## AWS OpenSearch — `OpenSearchDomain` (KRO-807)
+
+### AC-21 — `logPublishingOptions` passthrough
+
+**Spec requirement:** When `logPublishingOptions` is set on an `OpenSearchDomain`, the ACK
+`Domain` `spec.logPublishingOptions` field should be populated accordingly.
+
+**Blocking constraint:** The ACK `Domain` CRD `spec.logPublishingOptions` field is typed as a
+map of objects — each value is `{cloudWatchLogsLogGroupARN: string, enabled: bool}`. kro's
+schema type system has no first-class support for `map[string]object` with named nested fields.
+A `map[string]string` schema misrepresents the type and would be rejected at kro validation time.
+Implementing this field would require kro to support heterogeneous map values or a dedicated
+nested schema type, neither of which is available in kro v0.9.2.
+
+**Current behaviour:** AC-21 tests `advancedOptions` passthrough (a `map[string]string` field
+that _is_ correctly typed). The `logPublishingOptions` field is not exposed in the
+`OpenSearchDomain` schema.
+
+**To unblock:** When kro supports `map[string]<namedObjectType>` schema fields, add
+`logPublishingOptions` to the `OpenSearchDomain` schema with appropriate nested-object typing
+and wire it to `ackDomain.spec.logPublishingOptions`.
