@@ -70,6 +70,16 @@ echo "==> Installing ACK CRD definitions..."
 #                     acm acmpca glue athena keyspaces ses
 source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 
+echo "==> Installing fixture CRD stubs (fallback for ECR-unavailable services)..."
+# Applies minimal stub CRDs from tests/fixtures/crds/<service>/ for provider services
+# that cannot be pulled from ECR (e.g. new services not yet in the public ACK registry,
+# or services blocked by GitHub API rate limits in unauthenticated environments).
+# The stubs define only the fields referenced by the corresponding RGDs.
+# Services with real CRDs already installed (via hack/install-provider-crds.sh) are
+# unaffected — server-side apply is a no-op for unchanged resources.
+find "${SCRIPT_DIR}/fixtures/crds" -name "*.yaml" -not -path "*/kind-config*" -not -path "*/rbac*" \
+  | sort | xargs -r kubectl apply --server-side -f 2>&1 | grep -v "^$" || true
+
 echo "==> Installing kropath CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
 kubectl apply -f "${SCRIPT_DIR}/../crds/policy/policydocument.yaml"
