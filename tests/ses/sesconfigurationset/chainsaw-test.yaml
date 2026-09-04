@@ -1,0 +1,716 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ses-02 Chainsaw tests — one scenario per acceptance criterion (13 ACs).
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named SESConfig + SESConfigurationSet and
+# deletes nothing between steps, so no ACK finalizer ever blocks a delete and kro's
+# per-object-key backoff never compounds.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: sesconfigurationset
+spec:
+  skipDelete: true
+  namespace: sesconfigurationset
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-sesconfigurationset-namespace.yaml
+
+    - name: ac1-default-naming
+      # Given: SESConfig with defaults.namingTemplate "{namespace}-{name}" in effectiveConfig;
+      # SESConfigurationSet in namespace sesconfigurationset, name "ac1-default".
+      # Then: child ConfigurationSet spec.name = "sesconfigurationset-ac1-default".
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac1-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac1-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac1-default
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac1-default
+                namespace: sesconfigurationset
+              status:
+                resourceName: sesconfigurationset-ac1-default
+                namingStatus: valid
+                predictedArn: arn:aws:ses:ap-southeast-2:123456789012:configuration-set/sesconfigurationset-ac1-default
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac1-default
+                namespace: sesconfigurationset
+              spec:
+                name: sesconfigurationset-ac1-default
+            timeout: 60s
+
+    - name: ac2-name-override
+      # Given: SESConfigurationSet with spec.nameOverride "custom-config-set".
+      # Then: child ConfigurationSet spec.name = "custom-config-set".
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac2-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac2-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac2-override
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac2-cfg
+                nameOverride: custom-config-set
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac2-override
+                namespace: sesconfigurationset
+              status:
+                resourceName: custom-config-set
+                namingStatus: valid
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac2-override
+                namespace: sesconfigurationset
+              spec:
+                name: custom-config-set
+            timeout: 60s
+
+    - name: ac3-mandatory-naming-override
+      # Given: SESConfig with mandatory.namingTemplate "corp-{namespace}-{name}"; instance in sesconfigurationset/ac3-mandatory.
+      # Then: child ConfigurationSet spec.name = "corp-sesconfigurationset-ac3-mandatory" (mandatory overrides defaults).
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac3-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  namingTemplate: 'corp-{namespace}-{name}'
+                # CRD validation: namingTemplate cannot be set in both tiers; only set mandatory here
+        - script:
+            content: |
+              kubectl patch sesconfig ac3-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac3-mandatory
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac3-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac3-mandatory
+                namespace: sesconfigurationset
+              status:
+                resourceName: corp-sesconfigurationset-ac3-mandatory
+                namingStatus: valid
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac3-mandatory
+                namespace: sesconfigurationset
+              spec:
+                name: corp-sesconfigurationset-ac3-mandatory
+            timeout: 60s
+
+    - name: ac4-tag-token-naming
+      # Given: defaults.namingTemplate "{namespace}-{name}-{tag.env}"; instance with spec.tags {env: prod}.
+      # Then: effectiveName = "sesconfigurationset-ac4-tag-naming-prod".
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac4-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}-{tag.env}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac4-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}-{tag.env}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac4-tag-naming
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac4-cfg
+                tags:
+                  env: prod
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac4-tag-naming
+                namespace: sesconfigurationset
+              status:
+                resourceName: sesconfigurationset-ac4-tag-naming-prod
+                namingStatus: valid
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac4-tag-naming
+                namespace: sesconfigurationset
+              spec:
+                name: sesconfigurationset-ac4-tag-naming-prod
+            timeout: 60s
+
+    - name: ac5-unresolved-tag-token
+      # Given: defaults.namingTemplate "{namespace}-{name}-{tag.env}"; instance with no env tag.
+      # Then: namingStatus = "invalid-unresolved-tokens"; child ConfigurationSet NOT created.
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac5-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}-{tag.env}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac5-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}-{tag.env}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac5-unresolved
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac5-cfg
+                # no env tag — {tag.env} stays unresolved
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac5-unresolved
+                namespace: sesconfigurationset
+              status:
+                namingStatus: invalid-unresolved-tokens
+            timeout: 60s
+        - script:
+            content: |
+              # Verify child ConfigurationSet is NOT created due to _namingValid includeWhen guard
+              sleep 5
+              COUNT=$(kubectl get configurationset.ses.services.k8s.aws ac5-unresolved \
+                -n sesconfigurationset --ignore-not-found --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              [ "$COUNT" = "0" ] || (echo "ERROR: child ConfigurationSet should not exist when naming is invalid"; exit 1)
+              echo "OK: child ConfigurationSet correctly not created"
+
+    - name: ac6-deletion-policy-delete
+      # Given: SESConfigurationSet with spec.deletionPolicy "delete".
+      # Then: child ACK CR has annotation services.k8s.aws/deletion-policy: delete.
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac6-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac6-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac6-del-delete
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac6-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac6-del-delete
+                namespace: sesconfigurationset
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+              spec:
+                name: sesconfigurationset-ac6-del-delete
+            timeout: 60s
+
+    - name: ac7-deletion-policy-retain
+      # Given: SESConfigurationSet with spec.deletionPolicy "retain" (default).
+      # Then: child ACK CR has annotation services.k8s.aws/deletion-policy: retain.
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac7-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac7-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac7-del-retain
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac7-cfg
+                # deletionPolicy defaults to "retain"
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac7-del-retain
+                namespace: sesconfigurationset
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                name: sesconfigurationset-ac7-del-retain
+            timeout: 60s
+
+    - name: ac8-synced-labels
+      # Given: mandatory.syncedLabels {data-class: internal}; instance spec.syncedLabels {team: email}.
+      # Then: child K8s labels include aws.kropath.run/data-class: internal (mandatory),
+      #        aws.kropath.run/team: email (instance), app.kubernetes.io/managed-by: kro,
+      #        app.kubernetes.io/instance: ac8-synced-labels.
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac8-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    data-class: internal
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac8-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{"data-class":"internal"},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac8-synced-labels
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac8-cfg
+                syncedLabels:
+                  team: email
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac8-synced-labels
+                namespace: sesconfigurationset
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac8-synced-labels
+                  aws.kropath.run/data-class: internal
+                  aws.kropath.run/team: email
+              spec:
+                name: sesconfigurationset-ac8-synced-labels
+            timeout: 60s
+
+    - name: ac9-synced-annotations
+      # Given: mandatory.syncedAnnotations {owner: platform}; instance spec.syncedAnnotations {purpose: transactional}.
+      # Then: child K8s annotations include aws.kropath.run/owner: platform (mandatory),
+      #        aws.kropath.run/purpose: transactional (instance), services.k8s.aws/deletion-policy: retain.
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac9-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory:
+                  syncedAnnotations:
+                    owner: platform
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac9-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"platform"}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac9-synced-anns
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac9-cfg
+                syncedAnnotations:
+                  purpose: transactional
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac9-synced-anns
+                namespace: sesconfigurationset
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                  aws.kropath.run/owner: platform
+                  aws.kropath.run/purpose: transactional
+              spec:
+                name: sesconfigurationset-ac9-synced-anns
+            timeout: 60s
+
+    - name: ac10-tag-merge-no-cloud
+      # Given: mandatory.tags {cost-centre: infra}, defaults.tags {env: dev}; instance spec.tags {team: email}.
+      # Then: mergedTags = {cost-centre: infra, team: email, env: dev} (naming token resolution);
+      #        child ACK CR has NO spec.tags (ACK tags.ignore: true).
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac10-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory:
+                  tags:
+                    cost-centre: infra
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+                  tags:
+                    env: dev
+        - script:
+            content: |
+              kubectl patch sesconfig ac10-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"cost-centre":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{"env":"dev"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac10-tag-merge
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac10-cfg
+                tags:
+                  team: email
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac10-tag-merge
+                namespace: sesconfigurationset
+              status:
+                resourceName: sesconfigurationset-ac10-tag-merge
+                namingStatus: valid
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac10-tag-merge
+                namespace: sesconfigurationset
+              spec:
+                name: sesconfigurationset-ac10-tag-merge
+            timeout: 60s
+        - script:
+            content: |
+              # Verify child ConfigurationSet has no spec.tags field (ACK tags.ignore: true)
+              TAGS=$(kubectl get configurationset.ses.services.k8s.aws ac10-tag-merge \
+                -n sesconfigurationset -o jsonpath='{.spec.tags}' 2>/dev/null)
+              [ -z "$TAGS" ] || (echo "ERROR: child ConfigurationSet should not have spec.tags; got: $TAGS"; exit 1)
+              echo "OK: no spec.tags on child ConfigurationSet"
+
+    - name: ac11-custom-config-ref
+      # Given: SESConfigurationSet with spec.configRef "ac11-transactional".
+      # Then: externalRef resolves SESConfig with label aws.kropath.run/resource-name: ac11-transactional.
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac11-transactional
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac11-transactional
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac11-transactional -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac11-custom-ref
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac11-transactional
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac11-custom-ref
+                namespace: sesconfigurationset
+              status:
+                resourceName: sesconfigurationset-ac11-custom-ref
+                namingStatus: valid
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac11-custom-ref
+                namespace: sesconfigurationset
+              spec:
+                name: sesconfigurationset-ac11-custom-ref
+            timeout: 60s
+
+    - name: ac12-default-config-ref
+      # Given: SESConfigurationSet with default configRef (empty → "general-policy").
+      # Then: externalRef resolves SESConfig with label aws.kropath.run/resource-name: general-policy.
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac12-general-policy
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac12-general-policy -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac12-default-ref
+                namespace: sesconfigurationset
+              spec: {}
+              # spec.configRef defaults to "general-policy"; no explicit configRef set
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac12-default-ref
+                namespace: sesconfigurationset
+              status:
+                resourceName: sesconfigurationset-ac12-default-ref
+                namingStatus: valid
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac12-default-ref
+                namespace: sesconfigurationset
+              spec:
+                name: sesconfigurationset-ac12-default-ref
+            timeout: 60s
+
+    - name: ac13-name-too-long
+      # Given: SESConfigurationSet with spec.nameOverride = 65-character string.
+      # Then: namingStatus = "valid" (no unresolved tokens — _namingValid guard does not fire
+      #        for literal strings); child ConfigurationSet CR IS created with the 65-char name;
+      #        ACK rejects it with InvalidConfigurationSet in production (requires live controller).
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: ac13-cfg
+                namespace: sesconfigurationset
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch sesconfig ac13-cfg -n sesconfigurationset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac13-toolong
+                namespace: sesconfigurationset
+              spec:
+                configRef: ac13-cfg
+                # 65-character nameOverride — exceeds SES 64-char limit; ACK rejects in production
+                nameOverride: nameoverride-that-is-exactly-sixty-five-characters-long-123456xyz
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfigurationSet
+              metadata:
+                name: ac13-toolong
+                namespace: sesconfigurationset
+              status:
+                # _namingValid guard fires only for unresolved {tag.X} tokens, not length
+                resourceName: nameoverride-that-is-exactly-sixty-five-characters-long-123456xyz
+                namingStatus: valid
+            timeout: 60s
+        - assert:
+            resource:
+              apiVersion: ses.services.k8s.aws/v1alpha1
+              kind: ConfigurationSet
+              metadata:
+                name: ac13-toolong
+                namespace: sesconfigurationset
+              spec:
+                # kro submits the CR; ACK rejects (InvalidConfigurationSet) in production
+                name: nameoverride-that-is-exactly-sixty-five-characters-long-123456xyz
+            timeout: 60s
