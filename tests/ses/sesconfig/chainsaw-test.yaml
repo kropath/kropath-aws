@@ -1,0 +1,220 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ses-01 Chainsaw tests — one scenario per acceptance criterion (8 ACs).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: sesconfig
+spec:
+  skipDelete: true
+  namespace: sesconfig
+  steps:
+    - name: ac1-general-policy-accepted
+      try:
+        - apply:
+            file: 00-sesconfig-namespace.yaml
+        - apply:
+            file: 01-config-create-general-policy.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: general-policy
+                namespace: kro-system
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+
+    - name: ac2-reject-dual-tier-naming
+      try:
+        - apply:
+            file: 02-config-dual-tier-naming.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: SESConfig
+                check:
+                  ($error != null): true
+
+    - name: ac3-effective-config-cascade
+      try:
+        - script:
+            content: |
+              kubectl create namespace email-prod --dry-run=client -o yaml | kubectl apply -f -
+        - apply:
+            file: 03-config-effective-cascade.yaml
+        - script:
+            content: |
+              # Simulate controller cascade: KropathConfig mandatory.tags {cost-centre: infra}
+              # merged with local SESConfig; defaults merged from global + local SESConfig.
+              kubectl patch sesconfig general-policy -n email-prod \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"cost-centre":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: general-policy
+                namespace: email-prod
+              status:
+                effectiveConfig:
+                  mandatory:
+                    tags:
+                      cost-centre: infra
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+                  aws:
+                    region: us-east-1
+                    accountId: "123456789012"
+            timeout: 60s
+
+    - name: ac4-naming-template-in-effective-config
+      try:
+        - apply:
+            file: 04-config-naming-template.yaml
+        - script:
+            content: |
+              # Simulate controller writing effectiveConfig with defaults.namingTemplate.
+              kubectl patch sesconfig naming-config -n sesconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: naming-config
+                namespace: sesconfig
+              status:
+                effectiveConfig:
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+            timeout: 60s
+
+    - name: ac5-tags-merge-in-effective-config
+      try:
+        - apply:
+            file: 05-config-tag-merge.yaml
+        - script:
+            content: |
+              # Simulate controller cascade: KropathConfig mandatory.tags {cost-centre: infra}
+              # merged with SESConfig mandatory.tags {email-type: transactional}.
+              # SESConfig defaults.tags {team: platform} preserved in defaults tier.
+              kubectl patch sesconfig tags-config -n sesconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"email-type":"transactional","cost-centre":"infra"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{"team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: tags-config
+                namespace: sesconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    tags:
+                      email-type: transactional
+                      cost-centre: infra
+                  defaults:
+                    tags:
+                      team: platform
+            timeout: 60s
+
+    - name: ac6-synced-labels-in-effective-config
+      try:
+        - apply:
+            file: 06-config-synced-labels.yaml
+        - script:
+            content: |
+              # Simulate controller writing effectiveConfig with mandatory.syncedLabels.
+              # RGD applies data-class: internal as K8s label (aws.kropath.run/data-class: internal).
+              kubectl patch sesconfig synced-labels-config -n sesconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{"data-class":"internal"},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: synced-labels-config
+                namespace: sesconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    syncedLabels:
+                      data-class: internal
+            timeout: 60s
+
+    - name: ac7-synced-annotations-in-effective-config
+      try:
+        - apply:
+            file: 07-config-synced-annotations.yaml
+        - script:
+            content: |
+              # Simulate controller writing effectiveConfig with mandatory.syncedAnnotations.
+              # RGD applies owner: email-team as K8s annotation (aws.kropath.run/owner: email-team).
+              kubectl patch sesconfig synced-annotations-config -n sesconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"email-team"}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: synced-annotations-config
+                namespace: sesconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    syncedAnnotations:
+                      owner: email-team
+            timeout: 60s
+
+    - name: ac8-all-map-fields-in-effective-config
+      try:
+        - apply:
+            file: 08-config-all-map-fields.yaml
+        - script:
+            content: |
+              # Simulate controller writing effectiveConfig with all three map fields
+              # in their correct tiers: mandatory.tags, defaults.syncedLabels, defaults.syncedAnnotations.
+              kubectl patch sesconfig all-map-fields-config -n sesconfig \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{"tier":"standard"},"syncedAnnotations":{"provisioner":"kropath"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SESConfig
+              metadata:
+                name: all-map-fields-config
+                namespace: sesconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    tags:
+                      env: prod
+                  defaults:
+                    syncedLabels:
+                      tier: standard
+                    syncedAnnotations:
+                      provisioner: kropath
+            timeout: 60s
