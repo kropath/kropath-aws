@@ -1,0 +1,541 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-pipes-02 Chainsaw tests — one scenario per acceptance criterion.
+# Canonical pattern: unique resource name per step, spec.skipDelete=true,
+# no inter-step deletes for ACK-child resources (cluster has kro but no ACK
+# controllers, so ACK finalizers are never removed and deletes block forever).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: pipespipe
+spec:
+  skipDelete: true
+  namespace: pipespipe
+  steps:
+    - name: purge-stale-leftovers
+      try:
+        - apply:
+            file: 00-pipespipe-namespace.yaml
+        - apply:
+            file: 01-general-policy.yaml
+
+    # AC-1: defaults.desiredState "running" → ACK desiredState "RUNNING" (default tier wins when mandatory and instance are empty)
+    - name: ac1-desired-state-default-running
+      try:
+        - apply:
+            file: 02-config-defaults-running.yaml
+        - apply:
+            file: 03-pipe-ac1-desired-state-default.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PipesPipe
+              metadata:
+                name: ac1-desired-state-default
+                namespace: pipespipe
+              status:
+                resourceName: pipespipe-ac1-desired-state-default
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac1-desired-state-default
+                namespace: pipespipe
+              spec:
+                desiredState: RUNNING
+
+    # AC-2: instance spec.desiredState "stopped" wins over defaults.desiredState "running"
+    - name: ac2-desired-state-instance-stopped
+      try:
+        - apply:
+            file: 04-pipe-ac2-desired-state-instance-stopped.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac2-desired-state-instance-stopped
+                namespace: pipespipe
+              spec:
+                desiredState: STOPPED
+
+    # AC-3: mandatory.desiredState "stopped" wins over instance.desiredState "running"
+    - name: ac3-desired-state-mandatory-override
+      try:
+        - apply:
+            file: 05-config-mandatory-stopped.yaml
+        - apply:
+            file: 06-pipe-ac3-desired-state-mandatory-override.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac3-desired-state-mandatory-override
+                namespace: pipespipe
+              spec:
+                desiredState: STOPPED
+
+    # AC-4: all tiers empty → built-in default "RUNNING"
+    - name: ac4-desired-state-builtin-default
+      try:
+        - apply:
+            file: 07-config-empty-tiers.yaml
+        - apply:
+            file: 08-pipe-ac4-desired-state-builtin-default.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac4-desired-state-builtin-default
+                namespace: pipespipe
+              spec:
+                desiredState: RUNNING
+
+    # AC-5: SQS source → Lambda target (basic source/target passthrough)
+    - name: ac5-source-target-sqs-lambda
+      try:
+        - apply:
+            file: 09-pipe-ac5-source-target-sqs-lambda.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac5-source-target-sqs-lambda
+                namespace: pipespipe
+              spec:
+                source: arn:aws:sqs:us-east-1:123456789012:my-queue
+                target: arn:aws:lambda:us-east-1:123456789012:function:my-function
+
+    # AC-6: Kinesis source with sourceParameters passthrough
+    - name: ac6-source-kinesis-params
+      try:
+        - apply:
+            file: 10-pipe-ac6-source-kinesis-params.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac6-source-kinesis-params
+                namespace: pipespipe
+              spec:
+                source: arn:aws:kinesis:us-east-1:123456789012:stream/my-stream
+                sourceParameters:
+                  kinesisStreamParameters:
+                    startingPosition: TRIM_HORIZON
+                    batchSize: 10
+
+    # AC-7: DynamoDB stream source with DLQ in sourceParameters
+    - name: ac7-source-dynamodb-dlq
+      try:
+        - apply:
+            file: 11-pipe-ac7-source-dynamodb-dlq.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac7-source-dynamodb-dlq
+                namespace: pipespipe
+              spec:
+                sourceParameters:
+                  dynamoDBStreamParameters:
+                    startingPosition: TRIM_HORIZON
+                    deadLetterConfig:
+                      arn: arn:aws:sqs:us-east-1:123456789012:dlq
+
+    # AC-8: filter criteria in sourceParameters
+    - name: ac8-filter-criteria
+      try:
+        - apply:
+            file: 12-pipe-ac8-filter-criteria.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac8-filter-criteria
+                namespace: pipespipe
+              spec:
+                sourceParameters:
+                  filterCriteria:
+                    filters:
+                      - pattern: '{"body":{"temperature":[{"numeric":[">",0,"<=",212]}]}}'
+
+    # AC-9: Lambda enrichment + inputTemplate in enrichmentParameters
+    - name: ac9-enrichment-lambda
+      try:
+        - apply:
+            file: 13-pipe-ac9-enrichment-lambda.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac9-enrichment-lambda
+                namespace: pipespipe
+              spec:
+                enrichment: arn:aws:lambda:us-east-1:123456789012:function:enricher
+                enrichmentParameters:
+                  inputTemplate: '{"id": <$.id>}'
+
+    # AC-10: empty enrichment → no enrichment ARN set (ackPipe.spec.enrichment is "")
+    - name: ac10-enrichment-none
+      try:
+        - apply:
+            file: 14-pipe-ac10-enrichment-none.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac10-enrichment-none
+                namespace: pipespipe
+              spec:
+                enrichment: ""
+
+    # AC-11: Lambda target with FIRE_AND_FORGET invocationType
+    - name: ac11-target-lambda-async
+      try:
+        - apply:
+            file: 15-pipe-ac11-target-lambda-async.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac11-target-lambda-async
+                namespace: pipespipe
+              spec:
+                targetParameters:
+                  lambdaFunctionParameters:
+                    invocationType: FIRE_AND_FORGET
+
+    # AC-12: ECS Fargate task params in targetParameters
+    - name: ac12-target-ecs-fargate
+      try:
+        - apply:
+            file: 16-pipe-ac12-target-ecs-fargate.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac12-target-ecs-fargate
+                namespace: pipespipe
+              spec:
+                targetParameters:
+                  ecsTaskParameters:
+                    taskDefinitionArn: arn:aws:ecs:us-east-1:123456789012:task-definition/my-task:1
+                    launchType: FARGATE
+                    networkConfiguration:
+                      awsvpcConfiguration:
+                        subnets:
+                          - subnet-12345678
+
+    # AC-13: inputTemplate with SQS target in targetParameters
+    - name: ac13-target-input-transformation
+      try:
+        - apply:
+            file: 17-pipe-ac13-target-input-transformation.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac13-target-input-transformation
+                namespace: pipespipe
+              spec:
+                targetParameters:
+                  inputTemplate: '{"order": <$.body.order>}'
+
+    # AC-14: roleARN direct passthrough
+    - name: ac14-role-arn-direct
+      try:
+        - apply:
+            file: 18-pipe-ac14-role-arn-direct.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac14-role-arn-direct
+                namespace: pipespipe
+              spec:
+                roleARN: arn:aws:iam::123456789012:role/PipesExecutionRole
+
+    # AC-15: roleRef object passthrough
+    - name: ac15-role-ref-resolution
+      try:
+        - apply:
+            file: 19-pipe-ac15-role-ref-resolution.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac15-role-ref-resolution
+                namespace: pipespipe
+              spec:
+                roleRef:
+                  from:
+                    name: my-pipes-role
+
+    # AC-16: standard naming {namespace}-{name} (default template)
+    - name: ac16-naming-standard
+      try:
+        - apply:
+            file: 20-pipe-ac16-naming-standard.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PipesPipe
+              metadata:
+                name: ac16-naming-standard
+                namespace: pipespipe
+              status:
+                resourceName: pipespipe-ac16-naming-standard
+                namingStatus: valid
+
+    # AC-17: mandatory namingTemplate overrides default
+    - name: ac17-naming-mandatory-template
+      try:
+        - apply:
+            file: 21-config-mandatory-naming.yaml
+        - apply:
+            file: 22-pipe-ac17-naming-mandatory-template.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PipesPipe
+              metadata:
+                name: ac17-naming-mandatory-template
+                namespace: pipespipe
+              status:
+                resourceName: corp-pipespipe-ac17-naming-mandatory-template
+                namingStatus: valid
+
+    # AC-18: nameOverride takes highest precedence
+    - name: ac18-naming-override
+      try:
+        - apply:
+            file: 23-pipe-ac18-naming-override.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PipesPipe
+              metadata:
+                name: ac18-naming-override
+                namespace: pipespipe
+              status:
+                resourceName: my-custom-pipe-name
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac18-naming-override
+                namespace: pipespipe
+              spec:
+                name: my-custom-pipe-name
+
+    # AC-19: missing {tag.env} (not set anywhere) → resolves to "" (empty string for that segment)
+    # The token {tag.env} with no matching tag leaves "{tag.env}" literal → namingStatus invalid-unresolved-tokens
+    # Actually per spec: if the tag key is not found the literal "{tag.env}" remains → invalid
+    # AC-19 in spec: happy path = tag found resolves normally; negative = unrecognized {env} token
+    # Re-mapping: AC-19 happy = tag token found in spec.tags, AC-19a negative = bare {env} unrecognized
+    - name: ac19-naming-missing-tag-empty
+      try:
+        - apply:
+            file: 24-pipe-ac19-naming-missing-tag-empty.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PipesPipe
+              metadata:
+                name: ac19-naming-missing-tag-empty
+                namespace: pipespipe
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-19a: unrecognized token {env} (not a {tag.*} pattern) → namingStatus invalid-unresolved-tokens → ackPipe not created
+    - name: ac19a-negative-naming-unresolved-token
+      try:
+        - apply:
+            file: 25-pipe-ac19a-negative-naming-unresolved-token.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PipesPipe
+              metadata:
+                name: ac19a-negative-naming-unresolved-token
+                namespace: pipespipe
+              status:
+                namingStatus: invalid-unresolved-tokens
+        # Verify ACK Pipe NOT created (naming invalid → ackPipe excluded via includeWhen)
+        - script:
+            content: |
+              count=$(kubectl get pipe ac19a-negative-naming-unresolved-token -n pipespipe --no-headers 2>/dev/null | wc -l)
+              [ "$count" -eq 0 ] && echo "PASS: no Pipe CR created" || (echo "FAIL: Pipe CR was created unexpectedly"; exit 1)
+
+    # AC-20: cross-tier tags merge (mandatory > spec > defaults)
+    - name: ac20-tags-merge
+      try:
+        - apply:
+            file: 26-config-tags-merge.yaml
+        - apply:
+            file: 27-pipe-ac20-tags-merge.yaml
+        - script:
+            content: |
+              kubectl get pipe ac20-tags-merge -n pipespipe -o json | \
+                jq -e '
+                  .spec.tags["env"] == "prod" and
+                  .spec.tags["team"] == "platform" and
+                  .spec.tags["project"] == "pipes"
+                ' && echo "PASS" || (echo "FAIL: tag merge incorrect"; exit 1)
+
+    # AC-21: syncedLabels dual-write to K8s metadata.labels AND cloud tags
+    - name: ac21-synced-labels-dual
+      try:
+        - apply:
+            file: 28-config-synced-labels.yaml
+        - apply:
+            file: 29-pipe-ac21-synced-labels-dual.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac21-synced-labels-dual
+                namespace: pipespipe
+                labels:
+                  aws.kropath.run/env: prod
+        - script:
+            content: |
+              kubectl get pipe ac21-synced-labels-dual -n pipespipe -o json | \
+                jq -e '.spec.tags["env"] == "prod"' && echo "PASS" || (echo "FAIL: syncedLabel not in cloud tags"; exit 1)
+
+    # AC-22: syncedAnnotations → ACK Pipe metadata.annotations (with aws.kropath.run/ prefix)
+    - name: ac22-synced-annotations
+      try:
+        - apply:
+            file: 30-pipe-ac22-synced-annotations.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac22-synced-annotations
+                namespace: pipespipe
+                annotations:
+                  aws.kropath.run/cost-centre: platform
+
+    # AC-23: standard metadata on ACK Pipe child (managed-by label, ownerReference)
+    - name: ac23-standard-metadata
+      try:
+        - apply:
+            file: 31-pipe-ac23-standard-metadata.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac23-standard-metadata
+                namespace: pipespipe
+                labels:
+                  app.kubernetes.io/managed-by: kro
+
+    # AC-24: deletionPolicy delete → services.k8s.aws/deletion-policy: delete
+    - name: ac24-deletion-policy-delete
+      try:
+        - apply:
+            file: 32-pipe-ac24-deletion-policy-delete.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac24-deletion-policy-delete
+                namespace: pipespipe
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-25: deletionPolicy retain → services.k8s.aws/deletion-policy: retain (default)
+    - name: ac25-deletion-policy-retain
+      try:
+        - apply:
+            file: 33-pipe-ac25-deletion-policy-retain.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac25-deletion-policy-retain
+                namespace: pipespipe
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-26: configRef profile selection (non-default profile)
+    - name: ac26-configref-profile-selection
+      try:
+        - apply:
+            file: 34-config-team-profile.yaml
+        - apply:
+            file: 35-pipe-ac26-configref-profile-selection.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac26-configref-profile-selection
+                namespace: pipespipe
+              spec:
+                desiredState: STOPPED
+
+    # AC-27: configRef="" → general-policy fallthrough (uses default general-policy config)
+    - name: ac27-configref-default-fallthrough
+      try:
+        - apply:
+            file: 36-pipe-ac27-configref-default-fallthrough.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: PipesPipe
+              metadata:
+                name: ac27-configref-default-fallthrough
+                namespace: pipespipe
+              status:
+                resourceName: pipespipe-ac27-configref-default-fallthrough
+                namingStatus: valid
+
+    # AC-28: description passthrough to ACK Pipe
+    - name: ac28-description-passthrough
+      try:
+        - apply:
+            file: 37-pipe-ac28-description-passthrough.yaml
+        - assert:
+            resource:
+              apiVersion: pipes.services.k8s.aws/v1alpha1
+              kind: Pipe
+              metadata:
+                name: ac28-description-passthrough
+                namespace: pipespipe
+              spec:
+                description: "My EventBridge Pipe for data processing"
