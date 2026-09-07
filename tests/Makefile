@@ -20,7 +20,7 @@ CLUSTER_NAME ?= kropath-aws-test
 # silently break CI's changed-file test selection (it would fall back to the full
 # suite, or skip a service, depending on the diff).
 .PHONY: setup teardown test chainsaw-e2e lint-test-scripts \
-	test-acm test-apigateway test-apigatewayv2 test-appscaling test-athena test-autoscaling test-cloudfront \
+	test-acm test-apigateway test-apigatewayv2 test-appscaling test-athena test-autoscaling test-backup test-cloudfront \
 	test-bedrock test-cloudtrail test-cloudwatch test-cloudwatchlogs test-codeartifact test-cognito test-documentdb test-dsql test-dynamodb test-ec2 test-ecr test-ecs test-efs \
 	test-eks test-elasticache test-elb test-eventbridge test-glue test-iam test-keyspaces test-kinesis test-kms \
 	test-lambda test-memorydb test-mq test-msk test-opensearch test-organizations test-pipes test-policy test-rds test-route53 test-s3 test-secretsmanager \
@@ -204,3 +204,6 @@ test-mwaa:
 
 test-organizations:
 	chainsaw test organizations/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-backup:
+	chainsaw test backup/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
