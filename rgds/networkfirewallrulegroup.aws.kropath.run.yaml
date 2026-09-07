@@ -1,0 +1,298 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: networkfirewallrulegroup.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: NetworkFirewallRuleGroup
+    scope: Namespaced
+    spec:
+      # Required fields
+      type: string | required=true
+      capacity: integer | required=true
+      # Standard governance
+      configRef: string | default="general-policy"
+      nameOverride: string | default=""
+      description: string | default=""
+      deletionPolicy: string | default="retain"
+      # Tri-state — no default (frequent-rgd-errors.md §booleans)
+      analyzeRuleGroup: boolean
+      # Mutually exclusive: set ruleGroup OR rules, not both
+      # (x-kubernetes-validations are silently discarded by kro — advisory only)
+      ruleGroup: RuleGroup
+      rules: string | default=""
+      # Encryption governance
+      encryptionType: string | default=""
+      kmsKeyId: string | default=""
+      kmsKeyRef: string | default=""
+      # Tags and metadata
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      RuleGroup:
+        rulesSource: RulesSource
+        ruleVariables: RuleVariables
+        statefulRuleOptions: StatefulRuleOptions
+        referenceSets: ReferenceSets
+      RulesSource:
+        rulesSourceList: RulesSourceList
+        statefulRules: "[]StatefulRule | default=[]"
+        statelessRulesAndCustomActions: StatelessRulesAndCustomActions
+        rulesString: string | default=""
+      RulesSourceList:
+        generatedRulesType: string | required=true
+        targetTypes: "[]string | required=true"
+        targets: "[]string | required=true"
+      StatefulRule:
+        action: string | required=true
+        header: Header
+        ruleOptions: "[]RuleOption | default=[]"
+      Header:
+        destination: string | required=true
+        destinationPort: string | required=true
+        direction: string | required=true
+        protocol: string | required=true
+        source: string | required=true
+        sourcePort: string | required=true
+      RuleOption:
+        keyword: string | required=true
+        settings: "[]string | default=[]"
+      StatelessRulesAndCustomActions:
+        statelessRules: "[]StatelessRule | default=[]"
+        customActions: "[]CustomAction | default=[]"
+      StatelessRule:
+        priority: integer | required=true
+        ruleDefinition: RuleDefinition
+      RuleDefinition:
+        actions: "[]string | required=true"
+        matchAttributes: MatchAttributes
+      MatchAttributes:
+        destinations: "[]Address | default=[]"
+        destinationPorts: "[]PortRange | default=[]"
+        protocols: "[]integer | default=[]"
+        sources: "[]Address | default=[]"
+        sourcePorts: "[]PortRange | default=[]"
+        tcpFlags: "[]TCPFlagField | default=[]"
+      Address:
+        addressDefinition: string | required=true
+      PortRange:
+        fromPort: integer | required=true
+        toPort: integer | required=true
+      TCPFlagField:
+        flags: "[]string | required=true"
+        masks: "[]string | default=[]"
+      CustomAction:
+        actionDefinition: ActionDefinition
+        actionName: string | required=true
+      ActionDefinition:
+        publishMetricAction: PublishMetricAction
+      PublishMetricAction:
+        dimensions: "[]Dimension | required=true"
+      Dimension:
+        value: string | required=true
+      RuleVariables:
+        ipSets: map[string]IPSet | default={}
+        portSets: map[string]PortSet | default={}
+      IPSet:
+        definition: "[]string | required=true"
+      PortSet:
+        definition: "[]string | required=true"
+      StatefulRuleOptions:
+        ruleOrder: string | default=""
+      ReferenceSets:
+        iPSetReferences: map[string]IPSetReference | default={}
+      IPSetReference:
+        referenceArn: string | required=true
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.resourceName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{") ? "arn:aws:network-firewall:" + rsrcCfg[0].status.effectiveConfig.aws.region + ":" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":" + naming.data.ruleGroupType + "/" + naming.data.resourceName : ""}
+      ruleGroupId: >-
+        ${ackRuleGroupRef.size() > 0 ? ackRuleGroupRef[0].?status.?ruleGroupResponse.?ruleGroupID.orValue("") : ""}
+      ruleGroupArn: >-
+        ${ackRuleGroupRef.size() > 0 ? ackRuleGroupRef[0].?status.?ruleGroupResponse.?ruleGroupARN.orValue("") : ""}
+
+  resources:
+    # Config CR lookup — single externalRef per ADR-010 D-4
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: NetworkFirewallConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — computes effectiveName and ruleGroupType for predictedArn
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+        data:
+          resourceName: >-
+            ${
+              schema.?spec.?nameOverride.orValue("") != "" ? schema.spec.nameOverride :
+              rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "" ?
+                rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  .replace("{name}", schema.metadata.name)
+                  .replace("{namespace}", schema.metadata.namespace)
+                  .replace("{account_id}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "")
+                  .replace("{region}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "")
+                  .replace("{configRef}", schema.?spec.?configRef.orValue("general-policy")) :
+              schema.metadata.name
+            }
+          ruleGroupType: >-
+            ${schema.spec.type == "STATEFUL" ? "stateful-rulegroup" : "stateless-rulegroup"}
+
+    # Always-bound self-lookup for status expressions (prevents freeze when variant swaps)
+    - id: ackRuleGroupRef
+      externalRef:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: RuleGroup
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # Variant: RuleGroup without encryption
+    - id: ackRuleGroupNoEnc
+      includeWhen:
+        - "${schema.?spec.?encryptionType.orValue('') == '' && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue('') == '') && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue('') == '')}"
+      template:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: RuleGroup
+        metadata:
+          name: ${naming.data.resourceName}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${
+              {"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+          annotations: >-
+            ${
+              {"services.k8s.aws/deletion-policy": schema.?spec.?deletionPolicy.orValue("retain")}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+        spec:
+          ruleGroupName: ${naming.data.resourceName}
+          type_: ${schema.spec.type}
+          capacity: ${schema.spec.capacity}
+          description: ${schema.?spec.?description.orValue("")}
+          analyzeRuleGroup: >-
+            ${schema.?spec.?analyzeRuleGroup.orValue(false)}
+          ruleGroup: >-
+            ${has(schema.spec.ruleGroup) ? schema.spec.ruleGroup : null}
+          rules: >-
+            ${schema.?spec.?rules.orValue("")}
+          tags: >-
+            ${
+              rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.?spec.?tags.orValue({}))
+                .merge(schema.?spec.?syncedLabels.orValue({}))
+                .merge(schema.?spec.?syncedAnnotations.orValue({}))
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+              : schema.?spec.?tags.orValue({}).transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+            }
+
+    # Variant: RuleGroup with encryption
+    - id: ackRuleGroupWithEnc
+      includeWhen:
+        - "${schema.?spec.?encryptionType.orValue('') != '' || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue('') != '') || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue('') != '')}"
+      template:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: RuleGroup
+        metadata:
+          name: ${naming.data.resourceName}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${
+              {"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+          annotations: >-
+            ${
+              {"services.k8s.aws/deletion-policy": schema.?spec.?deletionPolicy.orValue("retain")}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+        spec:
+          ruleGroupName: ${naming.data.resourceName}
+          type_: ${schema.spec.type}
+          capacity: ${schema.spec.capacity}
+          description: ${schema.?spec.?description.orValue("")}
+          analyzeRuleGroup: >-
+            ${schema.?spec.?analyzeRuleGroup.orValue(false)}
+          ruleGroup: >-
+            ${has(schema.spec.ruleGroup) ? schema.spec.ruleGroup : null}
+          rules: >-
+            ${schema.?spec.?rules.orValue("")}
+          encryptionConfiguration:
+            keyID: >-
+              ${
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != "" ?
+                  schema.?spec.?kmsKeyId.orValue("") :
+                schema.?spec.?encryptionType.orValue("") != "" ?
+                  schema.?spec.?kmsKeyId.orValue("") :
+                ""
+              }
+            type_: >-
+              ${
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != "" ?
+                  rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType :
+                schema.?spec.?encryptionType.orValue("") != "" ?
+                  schema.spec.encryptionType :
+                rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue("AWS_OWNED_KMS_KEY") : "AWS_OWNED_KMS_KEY"
+              }
+          tags: >-
+            ${
+              rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.?spec.?tags.orValue({}))
+                .merge(schema.?spec.?syncedLabels.orValue({}))
+                .merge(schema.?spec.?syncedAnnotations.orValue({}))
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+              : schema.?spec.?tags.orValue({}).transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+            }

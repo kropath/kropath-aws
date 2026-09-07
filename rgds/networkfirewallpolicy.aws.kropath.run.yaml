@@ -1,0 +1,342 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: networkfirewallpolicy.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: NetworkFirewallPolicy
+    scope: Namespaced
+    spec:
+      # Required: stateless actions for ACK FirewallPolicy
+      statelessDefaultActions: "[]string | required=true"
+      statelessFragmentDefaultActions: "[]string | required=true"
+      # Optional rule group references
+      # ruleGroupRef: kropath NetworkFirewallRuleGroup metadata.name — resolves to predictedArn
+      # when no naming template is used (resourceArn preferred for naming-template scenarios)
+      statelessRuleGroupReferences: "[]StatelessRGRef | default=[]"
+      statefulRuleGroupReferences: "[]StatefulRGRef | default=[]"
+      # Optional policy content
+      statelessCustomActions: "[]CustomAction | default=[]"
+      statefulDefaultActions: "[]string | default=[]"
+      policyVariables: PolicyVariables
+      # Stateful engine options (governance tiers override instance)
+      statefulRuleOrder: string | default=""
+      streamExceptionPolicy: string | default=""
+      # Standard governance
+      configRef: string | default="general-policy"
+      nameOverride: string | default=""
+      deletionPolicy: string | default="retain"
+      description: string | default=""
+      # Encryption governance
+      encryptionType: string | default=""
+      kmsKeyId: string | default=""
+      kmsKeyRef: string | default=""
+      # Tags and metadata
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      StatelessRGRef:
+        resourceArn: string | default=""
+        ruleGroupRef: string | default=""
+        priority: integer | required=true
+      StatefulRGRef:
+        resourceArn: string | default=""
+        ruleGroupRef: string | default=""
+        priority: integer | required=true
+        overrideAction: OverrideAction
+      OverrideAction:
+        action: string | required=true
+      CustomAction:
+        actionDefinition: ActionDefinition
+        actionName: string | required=true
+      ActionDefinition:
+        publishMetricAction: PublishMetricAction
+      PublishMetricAction:
+        dimensions: "[]Dimension | required=true"
+      Dimension:
+        value: string | required=true
+      PolicyVariables:
+        ruleVariables: map[string]IPSet | default={}
+      IPSet:
+        definition: "[]string | required=true"
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.resourceName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{") ? "arn:aws:network-firewall:" + rsrcCfg[0].status.effectiveConfig.aws.region + ":" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":firewall-policy/" + naming.data.resourceName : ""}
+      firewallPolicyId: >-
+        ${ackPolicyRef.size() > 0 ? ackPolicyRef[0].?status.?firewallPolicyResponse.?firewallPolicyID.orValue("") : ""}
+      firewallPolicyArn: >-
+        ${ackPolicyRef.size() > 0 ? ackPolicyRef[0].?status.?firewallPolicyResponse.?firewallPolicyARN.orValue("") : ""}
+
+  resources:
+    # Config CR lookup
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: NetworkFirewallConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+        data:
+          resourceName: >-
+            ${
+              schema.?spec.?nameOverride.orValue("") != "" ? schema.spec.nameOverride :
+              rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "" ?
+                rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  .replace("{name}", schema.metadata.name)
+                  .replace("{namespace}", schema.metadata.namespace)
+                  .replace("{account_id}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "")
+                  .replace("{region}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "")
+                  .replace("{configRef}", schema.?spec.?configRef.orValue("general-policy")) :
+              schema.metadata.name
+            }
+
+    # Always-bound self-lookup for status
+    - id: ackPolicyRef
+      externalRef:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: FirewallPolicy
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # Variant: FirewallPolicy without encryption
+    - id: ackPolicyNoEnc
+      includeWhen:
+        - "${schema.?spec.?encryptionType.orValue('') == '' && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue('') == '') && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue('') == '')}"
+      template:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: FirewallPolicy
+        metadata:
+          name: ${naming.data.resourceName}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${
+              {"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+          annotations: >-
+            ${
+              {"services.k8s.aws/deletion-policy": schema.?spec.?deletionPolicy.orValue("retain")}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+        spec:
+          firewallPolicyName: ${naming.data.resourceName}
+          description: ${schema.?spec.?description.orValue("")}
+          firewallPolicy:
+            statelessDefaultActions: ${schema.spec.statelessDefaultActions}
+            statelessFragmentDefaultActions: ${schema.spec.statelessFragmentDefaultActions}
+            statelessRuleGroupReferences: >-
+              ${
+                schema.?spec.?statelessRuleGroupReferences.orValue([]).map(ref,
+                  ref.?ruleGroupRef.orValue("") != "" ?
+                    {"resourceARN": "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":stateless-rulegroup/" + ref.ruleGroupRef, "priority": ref.priority} :
+                    {"resourceARN": ref.resourceArn, "priority": ref.priority}
+                )
+              }
+            statefulRuleGroupReferences: >-
+              ${
+                schema.?spec.?statefulRuleGroupReferences.orValue([]).map(ref,
+                  ref.?ruleGroupRef.orValue("") != "" ?
+                    (has(ref.overrideAction) ?
+                      {"resourceARN": "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":stateful-rulegroup/" + ref.ruleGroupRef, "priority": ref.priority, "override": ref.overrideAction} :
+                      {"resourceARN": "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":stateful-rulegroup/" + ref.ruleGroupRef, "priority": ref.priority}
+                    ) :
+                    (has(ref.overrideAction) ?
+                      {"resourceARN": ref.resourceArn, "priority": ref.priority, "override": ref.overrideAction} :
+                      {"resourceARN": ref.resourceArn, "priority": ref.priority}
+                    )
+                )
+              }
+            statelessCustomActions: ${schema.?spec.?statelessCustomActions.orValue([])}
+            statefulDefaultActions: >-
+              ${
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?statefulDefaultActions.orValue([]).size() > 0 ?
+                  rsrcCfg[0].status.effectiveConfig.mandatory.statefulDefaultActions :
+                schema.?spec.?statefulDefaultActions.orValue([]).size() > 0 ?
+                  schema.spec.statefulDefaultActions :
+                rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?statefulDefaultActions.orValue([]) : []
+              }
+            statefulEngineOptions: >-
+              ${
+                (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?statefulRuleOrder.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.statefulRuleOrder :
+                 schema.?spec.?statefulRuleOrder.orValue("") != "" ? schema.spec.statefulRuleOrder :
+                 rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?statefulRuleOrder.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.defaults.statefulRuleOrder : "") != "" ||
+                (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?streamExceptionPolicy.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.streamExceptionPolicy :
+                 schema.?spec.?streamExceptionPolicy.orValue("") != "" ? schema.spec.streamExceptionPolicy :
+                 rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?streamExceptionPolicy.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.defaults.streamExceptionPolicy : "") != "" ?
+                {
+                  "ruleOrder": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?statefulRuleOrder.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.statefulRuleOrder :
+                                schema.?spec.?statefulRuleOrder.orValue("") != "" ? schema.spec.statefulRuleOrder :
+                                rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?statefulRuleOrder.orValue("") : ""),
+                  "streamExceptionPolicy": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?streamExceptionPolicy.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.streamExceptionPolicy :
+                                            schema.?spec.?streamExceptionPolicy.orValue("") != "" ? schema.spec.streamExceptionPolicy :
+                                            rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?streamExceptionPolicy.orValue("") : "")
+                } : {"ruleOrder": "", "streamExceptionPolicy": ""}
+              }
+            policyVariables: >-
+              ${has(schema.spec.policyVariables) ? schema.spec.policyVariables : null}
+          tags: >-
+            ${
+              rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.?spec.?tags.orValue({}))
+                .merge(schema.?spec.?syncedLabels.orValue({}))
+                .merge(schema.?spec.?syncedAnnotations.orValue({}))
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+              : schema.?spec.?tags.orValue({}).transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+            }
+
+    # Variant: FirewallPolicy with encryption
+    - id: ackPolicyWithEnc
+      includeWhen:
+        - "${schema.?spec.?encryptionType.orValue('') != '' || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue('') != '') || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue('') != '')}"
+      template:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: FirewallPolicy
+        metadata:
+          name: ${naming.data.resourceName}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${
+              {"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+          annotations: >-
+            ${
+              {"services.k8s.aws/deletion-policy": schema.?spec.?deletionPolicy.orValue("retain")}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+        spec:
+          firewallPolicyName: ${naming.data.resourceName}
+          description: ${schema.?spec.?description.orValue("")}
+          firewallPolicy:
+            statelessDefaultActions: ${schema.spec.statelessDefaultActions}
+            statelessFragmentDefaultActions: ${schema.spec.statelessFragmentDefaultActions}
+            statelessRuleGroupReferences: >-
+              ${
+                schema.?spec.?statelessRuleGroupReferences.orValue([]).map(ref,
+                  ref.?ruleGroupRef.orValue("") != "" ?
+                    {"resourceARN": "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":stateless-rulegroup/" + ref.ruleGroupRef, "priority": ref.priority} :
+                    {"resourceARN": ref.resourceArn, "priority": ref.priority}
+                )
+              }
+            statefulRuleGroupReferences: >-
+              ${
+                schema.?spec.?statefulRuleGroupReferences.orValue([]).map(ref,
+                  ref.?ruleGroupRef.orValue("") != "" ?
+                    (has(ref.overrideAction) ?
+                      {"resourceARN": "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":stateful-rulegroup/" + ref.ruleGroupRef, "priority": ref.priority, "override": ref.overrideAction} :
+                      {"resourceARN": "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":stateful-rulegroup/" + ref.ruleGroupRef, "priority": ref.priority}
+                    ) :
+                    (has(ref.overrideAction) ?
+                      {"resourceARN": ref.resourceArn, "priority": ref.priority, "override": ref.overrideAction} :
+                      {"resourceARN": ref.resourceArn, "priority": ref.priority}
+                    )
+                )
+              }
+            statelessCustomActions: ${schema.?spec.?statelessCustomActions.orValue([])}
+            statefulDefaultActions: >-
+              ${
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?statefulDefaultActions.orValue([]).size() > 0 ?
+                  rsrcCfg[0].status.effectiveConfig.mandatory.statefulDefaultActions :
+                schema.?spec.?statefulDefaultActions.orValue([]).size() > 0 ?
+                  schema.spec.statefulDefaultActions :
+                rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?statefulDefaultActions.orValue([]) : []
+              }
+            statefulEngineOptions: >-
+              ${
+                (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?statefulRuleOrder.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.statefulRuleOrder :
+                 schema.?spec.?statefulRuleOrder.orValue("") != "" ? schema.spec.statefulRuleOrder :
+                 rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?statefulRuleOrder.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.defaults.statefulRuleOrder : "") != "" ||
+                (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?streamExceptionPolicy.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.streamExceptionPolicy :
+                 schema.?spec.?streamExceptionPolicy.orValue("") != "" ? schema.spec.streamExceptionPolicy :
+                 rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?streamExceptionPolicy.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.defaults.streamExceptionPolicy : "") != "" ?
+                {
+                  "ruleOrder": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?statefulRuleOrder.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.statefulRuleOrder :
+                                schema.?spec.?statefulRuleOrder.orValue("") != "" ? schema.spec.statefulRuleOrder :
+                                rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?statefulRuleOrder.orValue("") : ""),
+                  "streamExceptionPolicy": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?streamExceptionPolicy.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.streamExceptionPolicy :
+                                            schema.?spec.?streamExceptionPolicy.orValue("") != "" ? schema.spec.streamExceptionPolicy :
+                                            rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?streamExceptionPolicy.orValue("") : "")
+                } : {"ruleOrder": "", "streamExceptionPolicy": ""}
+              }
+            policyVariables: >-
+              ${has(schema.spec.policyVariables) ? schema.spec.policyVariables : null}
+          encryptionConfiguration:
+            keyID: >-
+              ${
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != "" ?
+                  schema.?spec.?kmsKeyId.orValue("") :
+                schema.?spec.?encryptionType.orValue("") != "" ?
+                  schema.?spec.?kmsKeyId.orValue("") :
+                ""
+              }
+            type_: >-
+              ${
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != "" ?
+                  rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType :
+                schema.?spec.?encryptionType.orValue("") != "" ?
+                  schema.spec.encryptionType :
+                rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue("AWS_OWNED_KMS_KEY") : "AWS_OWNED_KMS_KEY"
+              }
+          tags: >-
+            ${
+              rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.?spec.?tags.orValue({}))
+                .merge(schema.?spec.?syncedLabels.orValue({}))
+                .merge(schema.?spec.?syncedAnnotations.orValue({}))
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+              : schema.?spec.?tags.orValue({}).transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+            }
