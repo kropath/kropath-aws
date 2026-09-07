@@ -78,7 +78,9 @@ echo "==> Installing fixture CRD stubs (fallback for ECR-unavailable services)..
 # Services with real CRDs already installed (via hack/install-provider-crds.sh) are
 # unaffected — server-side apply is a no-op for unchanged resources.
 find "${SCRIPT_DIR}/fixtures/crds" -name "*.yaml" -not -path "*/kind-config*" -not -path "*/rbac*" \
-  | sort | xargs -r kubectl apply --server-side -f 2>&1 | grep -v "^$" || true
+  | sort | while IFS= read -r f; do
+    kubectl apply --server-side -f "${f}" 2>&1 | grep -v "^$" || true
+  done
 
 echo "==> Installing kropath CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
