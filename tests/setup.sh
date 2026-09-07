@@ -70,6 +70,41 @@ echo "==> Installing ACK CRD definitions..."
 #                     acm acmpca glue athena keyspaces ses
 source "${SCRIPT_DIR}/../hack/install-provider-crds.sh"
 
+echo "==> Installing fixture CRD stubs (fallback for ECR-unavailable services)..."
+# Applies minimal stub CRDs from tests/fixtures/crds/<service>/ for provider services
+# that cannot be pulled from ECR (e.g. new services not yet in the public ACK registry,
+# or services blocked by GitHub API rate limits in unauthenticated environments).
+# The stubs define only the fields referenced by the corresponding RGDs.
+#
+# A stub is applied ONLY when its CRD is absent from the cluster. This is a strict
+# fallback, never an overwrite. The stubs are hand-trimmed snapshots that lag the real
+# ACK CRDs, and server-side apply does NOT merge them: a CRD's spec.versions is an
+# atomic list, so applying a stub over a CRD that install-provider-crds.sh already
+# pulled from ECR silently REPLACES the live schema with the older, narrower one. Every
+# RGD referencing a field the stub omits then fails to compile.
+#
+# Real regression this guard prevents: the eks stub predates spec.deletionProtection, so
+# blanket-applying it clobbered the real Cluster CRD and ekscluster.aws.kropath.run went
+# Inactive with "schema not found for field deletionProtection". The EKSCluster CRD was
+# therefore never derived, and the whole suite failed on `no matches for kind
+# "EKSCluster"` — in a PR that never touched EKS.
+while IFS= read -r f; do
+  # metadata.name is the first line at indent 2 in every stub; spec.names.* sit at indent 4.
+  crd_name="$(grep -m1 -E '^  name: ' "${f}" | sed 's/^  name: //')"
+  if [[ -z "${crd_name}" ]]; then
+    echo "    WARN: no metadata.name found in ${f} — skipping"
+    continue
+  fi
+  if kubectl get crd "${crd_name}" &>/dev/null; then
+    echo "    skip ${crd_name} (real CRD already installed)"
+    continue
+  fi
+  echo "    stub ${crd_name}"
+  kubectl apply --server-side -f "${f}" >/dev/null
+done < <(
+  find "${SCRIPT_DIR}/fixtures/crds" -name "*.yaml" -not -path "*/kind-config*" -not -path "*/rbac*" | sort
+)
+
 echo "==> Installing kropath CRD definitions..."
 kubectl apply -f "${SCRIPT_DIR}/../crds/*.yaml"
 kubectl apply -f "${SCRIPT_DIR}/../crds/policy/policydocument.yaml"
