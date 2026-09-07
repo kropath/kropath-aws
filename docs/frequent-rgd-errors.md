@@ -1009,6 +1009,86 @@ This document tracks technical friction points, syntax limitations, and runtime 
 * **Why:** This is the value-guarded cousin of "[Boolean Field Presence Check (`has()`) Broken by CRD Defaults](#boolean-field-presence-check-has-broken-by-crd-defaults)". The rules are value-guarded (`&& defaults.X == true`), so a mandatory field colliding with a materialized **zero-value** default (`false`/`""`/`0`) is fine. But when the `spec.defaults` tier carries **non-zero "secure baseline" defaults** (`storageEncrypted: true`, `backupRetentionPeriod: 7`, `storageType: "gp3"`, `namingTemplate: "{namespace}-{name}"`, …), merely creating any `spec.defaults` object makes the apiserver materialize `defaults.storageEncrypted: true` — which then collides with an explicit `mandatory.storageEncrypted: true` and trips the rule. CRD-schema defaults on a tier are **fundamentally incompatible** with a cross-tier mutual-exclusion contract: you could never put a field in `mandatory` because the same field auto-materializes `true` in `defaults`.
 * **What Works Instead:** Remove **all scalar `default:` values** from `spec.mandatory` and `spec.defaults` (keep the `default: {}` on the tier objects and on `tags`/`syncedLabels`/`syncedAnnotations` maps). Then `has()`/materialization reflects true admin intent, the mutual-exclusion rules only fire when the admin **explicitly** sets both tiers, and both the negative tests (explicit dual-tier → rejected) and the positive cascade tests (single-tier → accepted) pass. The `status.effectiveConfig` tiers (consumed by the RGD, and in tests patched manually) must **never** carry defaults either.
 
+### Positive-Path Config Fixtures Must Also Obey the Config CRD's Mutual-Exclusion Rules (KRO-1058)
+
+* **What Fails:** A `<Service>Config` fixture in a **resource** suite (not the config suite) populates the same field in both tiers "for realism" — e.g. `mandatory.desiredState: "stopped"` alongside `defaults.desiredState: "running"`. The apiserver rejects the CREATE, chainsaw retries the `apply` until the 1m `ApplyTimeout`, and the step finally reports a **misleading** last error:
+    ```
+    APPLY | ERROR | aws.kropath.run/v1alpha1/PipesConfig @ pipespipe/config-mandatory-stopped
+    client rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline
+    ```
+    The real error appears **two frames earlier** in the log, on the retried CREATE:
+    ```
+    PipesConfig "config-mandatory-stopped" is invalid: <nil>: Invalid value:
+    desiredState must be set in either mandatory or defaults, not both.
+    ```
+* **Why:** The mutual-exclusion `x-kubernetes-validations` on the config CRD are declared at the **root** `openAPIV3Schema` level, so they gate every write to the object — not just the ones the config suite's negative tests exercise. It is easy to write a resource-suite fixture that sets `mandatory.X` to prove "mandatory wins" while leaving a plausible-looking `defaults.X` in place; that combination is exactly what the CRD forbids. Distinguish this from "[Config-CRD Mutual-Exclusion Broken by Non-Zero `spec.defaults` CRD Defaults](#config-crd-mutual-exclusion-x-kubernetes-validations-broken-by-non-zero-specdefaults-crd-defaults)" — there the collision is *materialized* by CRD defaults; here the fixture sets both tiers **explicitly**.
+* **What Works Instead:** Set only the tier the AC actually exercises and blank the other (`""`). Then mirror that in the step's `kubectl patch --subresource=status` seed: `status.effectiveConfig` must stay reachable from a *valid* spec, or the test asserts a state the real config controller could never produce. Assertions do not change — a non-empty `mandatory` tier already wins the RGD's precedence chain regardless of `defaults`.
+* **Cheap pre-flight** — sweep every config fixture in a suite against both rules before running anything:
+    ```python
+    import glob, yaml
+    for f in glob.glob('tests/<service>/*/*.yaml'):
+        for d in yaml.safe_load_all(open(f)):
+            if not d or d.get('kind') != '<Service>Config': continue
+            m = d['spec'].get('mandatory', {}) or {}; df = d['spec'].get('defaults', {}) or {}
+            for k in ('desiredState', 'namingTemplate'):   # the mutually-exclusive fields
+                if m.get(k) and df.get(k):
+                    print('VIOLATION', f, d['metadata']['name'], k)
+    ```
+    Expect hits **only** in the config suite's own deliberate negative fixtures (the ones guarded by `expect: - check: ($error != null): true`).
+
+### ACK Field-Name Drift Is Silently *Pruned*, Not Rejected — Half-Populated Children Are the Tell (KRO-1058)
+
+* **What Fails:** An assert on a child ACK CR reports some nested fields missing, and the `+++ actual` block shows a partially-filled object:
+    ```
+    * spec.targetParameters.ecsTaskParameters.taskDefinitionArn: Required value: field not found
+    * spec.targetParameters.ecsTaskParameters.networkConfiguration.awsvpcConfiguration: Required value: field not found
+    ...
+         ecsTaskParameters:
+           launchType: FARGATE            # survived
+    -      taskDefinitionArn: arn:aws:ecs:...
+    -      networkConfiguration: {awsvpcConfiguration: {subnets: [...]}}
+    +      networkConfiguration: {}       # emptied
+    ```
+* **Why:** The RGD passes an opaque `object | default={}` (`sourceParameters`/`targetParameters`/…) straight through, so kro type-checks nothing. The ACK CRD, however, types those blocks **fully**, and the apiserver **prunes** unknown keys instead of erroring. ACK capitalises initialisms where the AWS API docs do not: `taskDefinitionArn` → **`taskDefinitionARN`**, `awsvpcConfiguration` → **`awsVPCConfiguration`**. **One sibling surviving while the others vanish is the signature of pruning** — do not go hunting for a broken CEL expression.
+* **What Works Instead:** Validate every pass-through block against the live CRD before trusting a fixture. This is §7 "[ACK Target-Schema Fidelity](#7-ack-target-schema-fidelity--verify-every-field-against-the-live-crd)" applied to **test fixtures**, not just RGD templates — an opaque `object` field moves the whole burden of correctness onto the fixture.
+    ```
+    kubectl get crd pipes.pipes.services.k8s.aws -o json \
+      | jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.targetParameters
+            .properties.ecsTaskParameters.properties | map_values(.type)'
+    ```
+
+### `ownerReferences` Asserts Belong Under `metadata:` — a Root-Level `(ownerReferences[0])` Always "Not Found" (KRO-1058)
+
+* **What Fails:**
+    ```yaml
+              metadata:
+                name: ac23-standard-metadata
+              (ownerReferences[0]):        # sibling of metadata → resource root
+                kind: PipesPipe
+    ```
+    ```
+    * (ownerReferences[0]).kind: Required value: field not found in the input object
+    ```
+    …while the `+++ actual` block printed right underneath **visibly contains** the correct
+    ownerReference under `metadata`.
+* **Why:** `ownerReferences` is a `metadata` field. At the resource root there is nothing to index, so the JMESPath-style projection resolves to nothing. **General rule: when an assert says "field not found" but the actual object shown in the same error clearly has the field, the assert path is wrong — the RGD is fine.**
+* **What Works Instead:** Plain nested YAML under `metadata:`, the form every other suite already uses (reference: `tests/autoscaling/autoscalinggroup/chainsaw-test.yaml` AC-44):
+    ```yaml
+              metadata:
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: PipesPipe
+                    name: ac23-standard-metadata
+                    controller: true
+                    blockOwnerDeletion: true
+    ```
+
+### A Brand-New Suite Is Not Covered by Its Own PR's CI — Run It Locally (KRO-1058)
+
+* **What Fails:** A newly added suite merges green, then **every subsequent `main` push** fails on it — deterministically, and with a failure that has nothing to do with the commit that surfaced it. Chasing the innocent head commit wastes the whole investigation.
+* **Why:** `.github/workflows/rgd-tests.yaml` runs `tests/select-tests.sh`, which narrows CI to the `make test-<service>` targets implied by the changed files. The full `make test` runs on `main` pushes and whenever a shared/cross-cutting path changes — so a new suite's own failures can stay invisible until after merge.
+* **What Works Instead:** Honour the "Local test gate" in `CLAUDE.md` — `cd tests && make test-<service>` must pass locally before the PR exists. When triaging a `main` failure, **read the failing suite name, not the commit title**: `gh run view <id> --log-failed` then filter for `--- FAIL:` and check whether earlier `main` runs failed identically (they usually did).
+
 ### Numeric (`float`) Instance-Spec Values Must Be Unquoted in Test Fixtures
 
 * **What Fails:** After changing an RGD schema field to `float` (OpenAPI `number`), a test fixture that passes a **quoted** value fails at CREATE of the instance/child:
