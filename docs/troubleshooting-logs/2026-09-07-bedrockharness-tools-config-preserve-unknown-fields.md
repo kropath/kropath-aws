@@ -1,3 +1,14 @@
+> **SUPERSEDED 2026-09-07** — the fix recorded below patched the *fixture stub* at
+> `tests/fixtures/crds/bedrock/bedrockagentcorecontrol.services.k8s.aws_harnesses.yaml` to accept a
+> free-form `tools[].config`. That only worked because `tests/setup.sh` was blanket-applying fixture
+> stubs over the real ACK CRDs — the bug fixed in
+> [`2026-09-07-kro815-fixture-crd-stubs-clobber-real-ack-crds.md`](./2026-09-07-kro815-fixture-crd-stubs-clobber-real-ack-crds.md).
+> The real `bedrockagentcorecontrol` chart **does** exist in ECR, and it types `tools[].config` as a
+> discriminated union (`agentCoreBrowser` | `agentCoreCodeInterpreter` | `agentCoreGateway` |
+> `inlineFunction` | `remoteMcp`), not a `map[string]string`. The RGD and the ac19 test were
+> corrected to the real union shape; see that log's "BedrockHarness tools[].config" section.
+> Keep this file for the diagnostic trail only — do not re-apply its remedy.
+
 > **Point-in-time disclaimer:** This log records observations as of 2026-09-07. Claims about kro
 > behaviour, ACK CRD schema, and fixture structure are hypotheses confirmed locally on that date.
 > They may not hold after a kro upgrade, an ACK chart bump, or schema changes. Verify mechanically
