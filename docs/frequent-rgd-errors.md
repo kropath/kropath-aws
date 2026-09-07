@@ -1788,3 +1788,120 @@ bugs:
     ```
 
 ---
+
+## 9. Test-Harness Traps — Fixture CRD Stubs and Provider CRD Installation
+
+These are not RGD or CEL bugs. They are `tests/setup.sh` /
+`hack/install-provider-crds.sh` failures that *present* as RGD compilation errors, which is what
+makes them expensive: the stack trace points at an RGD that is completely correct.
+
+### Never blanket-apply `tests/fixtures/crds/` — a stub must be a fallback, never an overwrite
+
+* **Symptom:** A PR that touches only service A breaks exactly one suite belonging to unrelated
+  service B. The RGD for B reports a missing field that plainly exists in the real ACK CRD, and B's
+  kropath CRD is never derived:
+    ```
+    - ekscluster.aws.kropath.run: failed to build resource "ackClusterWithVersion":
+      failed to extract CEL expressions from schema for resource ackClusterWithVersion:
+      error getting field schema for path spec.deletionProtection:
+      schema not found for field deletionProtection
+    ...
+    no matches for kind "EKSCluster" in version "aws.kropath.run/v1alpha1"
+    ```
+* **Why:** `tests/fixtures/crds/` holds hand-trimmed stub CRDs for services that cannot be pulled
+  from ECR. It **also** holds older stubs for services that *are* pulled from ECR (`eks`, `iam`,
+  `s3`, `acm`, `acmpca`, `cognito`). Applying every file in that tree overwrites the real CRDs that
+  `install-provider-crds.sh` installed one step earlier, replacing each live schema with a narrower,
+  stale one. Any RGD referencing a field the stub omits then fails to compile and goes `Inactive`,
+  so kro never derives its CRD.
+* **`kubectl apply --server-side` on a CRD REPLACES the schema — it does not merge it.**
+  `spec.versions` is an atomic list, so SSA swaps the whole `openAPIV3Schema`. Do not reason about
+  it as a field-wise merge; a comment claiming "SSA is a no-op for unchanged resources" is how this
+  shipped.
+* **What Works Instead:** Gate every stub on the CRD being absent:
+    ```bash
+    while IFS= read -r f; do
+      # metadata.name is the first line at indent 2 in every stub; spec.names.* sit at indent 4.
+      crd_name="$(grep -m1 -E '^  name: ' "${f}" | sed 's/^  name: //')"
+      [[ -z "${crd_name}" ]] && { echo "    WARN: no metadata.name in ${f}"; continue; }
+      if kubectl get crd "${crd_name}" &>/dev/null; then
+        echo "    skip ${crd_name} (real CRD already installed)"; continue
+      fi
+      kubectl apply --server-side -f "${f}" >/dev/null
+    done < <(find "${SCRIPT_DIR}/fixtures/crds" -name "*.yaml" | sort)
+    ```
+
+### An upstream GitHub release does NOT mean the ACK chart is pullable
+
+* **Symptom:** A service is added to `ACK_SERVICES`, `resolve_ack_chart_version` returns a version,
+  and setup prints no obvious error — yet the CRDs are missing and the RGD is `Inactive`.
+* **Why:** `install-provider-crds.sh` resolves the version from the GitHub releases API but pulls
+  the chart from `public.ecr.aws/aws-controllers-k8s/<svc>-chart`. Those are different registries
+  with different contents. A chart-pull failure only emits a `WARNING` and the loop continues.
+* **What Works Instead:** Verify the chart itself before assuming real CRDs will be present:
+    ```bash
+    helm pull "oci://public.ecr.aws/aws-controllers-k8s/<svc>-chart" --version "<ver>" --untar --untardir /tmp/x
+    ```
+    Confirmed 2026-09-07: `bedrock` 1.4.0, `bedrockagent` 1.3.1, and `bedrockagentcorecontrol`
+    1.15.0 all have GitHub releases but **no ECR chart** — they legitimately require fixture stubs.
+
+### `kubectl apply --dry-run=client` still contacts the API server
+
+* **Symptom:** Trying to read `metadata.name` out of a manifest before the cluster exists fails with
+  a connection or patch error, not a parse result.
+* **Why:** `--dry-run=client` still performs discovery and, for `apply`, a merge-patch computation
+  against the live object. It is not an offline parser.
+* **What Works Instead:** Parse the file directly (`grep`/`awk`/`yq`) whenever the name is needed
+  before or independent of a cluster.
+
+### Debugging rule
+
+**When a PR scoped to one service breaks a different service's suite, read `tests/setup.sh` and
+`hack/install-provider-crds.sh` first.** Shared setup is the only thing the two services have in
+common; the innocent RGD is a symptom, not the cause.
+
+### Named-type fields get a synthesized `{}` default iff every leaf has a default
+
+* **Symptom:** An RGD models an ACK **discriminated union** (exactly one member set) with nested
+  named types. The derived CRD gives *every* union member a `{}` default, so each list item ships
+  all branches to AWS instead of the one the user set.
+* **Why:** kro synthesizes an object default for a named-type field when all of its leaves carry
+  defaults. `browserARN: string | default=""` on all five members is enough to make kro default the
+  five parent objects too.
+* **What Works Instead:** Declare union members **and their leaves bare** — no `| default=...`:
+    ```yaml
+    BedrockHarnessToolConfig:
+      agentCoreBrowser: BedrockHarnessToolBrowser      # bare named type
+      remoteMcp: BedrockHarnessToolRemoteMcp
+    BedrockHarnessToolBrowser:
+      browserARN: string                                # NOT `string | default=""`
+    ```
+    Verify mechanically after `kubectl delete crd <plural>.kropath.run` re-derives the schema:
+    ```bash
+    kubectl get crd bedrockharnesses.aws.kropath.run -o json \
+      | jq -c '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties
+               .tools.items.properties.config.properties | map_values(.default // "NO-DEFAULT")'
+    ```
+    Every member must read `NO-DEFAULT`. This is the tri-state-boolean defaulting trap one level up.
+* **Note:** kro **does** support nested named types (a type field referencing another type). The
+  union above compiles to `Active`.
+
+### An ACK `config`/`options` field is often a union, not a `map[string]string`
+
+* **Symptom:** The child ACK resource is silently never created; the suite reports
+  `ASSERT ERROR: actual resource not found`. Applying by hand shows
+  `.spec.tools[0].config.browserID: field not declared in schema`.
+* **Why:** A field named `config` reads like a free-form bag but is frequently a typed union keyed
+  by a sibling discriminator (here `tools[].type`). Modelling it as `map[string]string` type-checks
+  in the RGD but is rejected by the API server at apply time.
+* **What Works Instead:** Dump the real shape before writing the schema, exactly as §7 requires:
+    ```bash
+    kubectl get crd harnesses.bedrockagentcorecontrol.services.k8s.aws -o json \
+      | jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties
+            .tools.items.properties.config.properties | keys'
+    ```
+    **Never "fix" this by loosening a fixture stub with `x-kubernetes-preserve-unknown-fields`** —
+    that only works while the stub is illegitimately overriding the real CRD, and it hides the
+    mismatch until the resource reaches AWS.
+
+---
