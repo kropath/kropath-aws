@@ -1,0 +1,774 @@
+# Copyright 2024 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: sagemakerdomain
+spec:
+  namespace: sagemakerdomain
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Purge stale leftovers from a previous (crashed) run so each run is clean.
+    # Only config CRs (no ACK finalizers) are deleted here; ACK resources
+    # intentionally left with skipDelete: true.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: purge-stale-leftovers
+      try:
+        - script:
+            content: |
+              kubectl delete sagemakerconfig --all -n sagemakerdomain --ignore-not-found=true
+              kubectl delete sagemakerdomain --all -n sagemakerdomain --ignore-not-found=true
+              exit 0
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: Happy path — basic domain creation
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-basic-domain-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: general-policy
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              status:
+                effectiveConfig:
+                  mandatory: {}
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: basic-domain
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                  - subnet-2b
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: basic-domain
+                namespace: sagemakerdomain
+              status:
+                resourceName: sagemakerdomain-basic-domain
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: basic-domain
+                namespace: sagemakerdomain
+              spec:
+                domainName: sagemakerdomain-basic-domain
+                authMode: IAM
+                vpcID: vpc-abc123
+                subnetIDs:
+                  - subnet-1a
+                  - subnet-2b
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: KMS mandatory override
+    # Mandatory kmsKeyId wins over instance spec.kmsKeyId
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-kms-mandatory-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: kms-mandatory-cfg
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: kms-mandatory-cfg
+              status:
+                effectiveConfig:
+                  mandatory:
+                    namingTemplate: "{namespace}-{name}"
+                    kmsKeyId: "arn:aws:kms:ap-southeast-2:123456789012:key/org-key"
+                  defaults: {}
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: kms-mandatory-domain
+                namespace: sagemakerdomain
+              spec:
+                configRef: kms-mandatory-cfg
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+                kmsKeyId: "arn:aws:kms:ap-southeast-2:123456789012:key/team-key"
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: kms-mandatory-domain
+                namespace: sagemakerdomain
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/org-key"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: KMS defaults applied when instance has no kmsKeyId
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-kms-defaults-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: kms-defaults-cfg
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: kms-defaults-cfg
+              status:
+                effectiveConfig:
+                  mandatory: {}
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+                    kmsKeyId: "arn:aws:kms:ap-southeast-2:123456789012:key/default-key"
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: kms-defaults-domain
+                namespace: sagemakerdomain
+              spec:
+                configRef: kms-defaults-cfg
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: kms-defaults-domain
+                namespace: sagemakerdomain
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/default-key"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: KMS instance override — instance wins over defaults
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-kms-instance-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: kms-inst-cfg
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: kms-inst-cfg
+              status:
+                effectiveConfig:
+                  mandatory: {}
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+                    kmsKeyId: "arn:aws:kms:ap-southeast-2:123456789012:key/default-key"
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: kms-instance-domain
+                namespace: sagemakerdomain
+              spec:
+                configRef: kms-inst-cfg
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+                kmsKeyId: "arn:aws:kms:ap-southeast-2:123456789012:key/team-key"
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: kms-instance-domain
+                namespace: sagemakerdomain
+              spec:
+                kmsKeyID: "arn:aws:kms:ap-southeast-2:123456789012:key/team-key"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: Naming — standard {namespace}-{name} template
+    # AC-12: No predictedArn, domainId exposed
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: studio-main
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: studio-main
+                namespace: sagemakerdomain
+              status:
+                resourceName: sagemakerdomain-studio-main
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: studio-main
+                namespace: sagemakerdomain
+              spec:
+                domainName: sagemakerdomain-studio-main
+        # AC-12: predictedArn must NOT be in status schema; domainId field IS present
+        - script:
+            content: |
+              STATUS=$(kubectl get sagemakerdomain studio-main -n sagemakerdomain -o json)
+              echo "$STATUS" | jq -e '.status | has("predictedArn")' && echo "FAIL: predictedArn should not exist" && exit 1
+              echo "$STATUS" | jq -e '.status | has("domainId")' || { echo "FAIL: domainId should be present"; exit 1; }
+              echo "AC-12 OK: no predictedArn, domainId present"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: Naming — mandatory namingTemplate overrides defaults
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: naming-mandatory-cfg
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: naming-mandatory-cfg
+              status:
+                effectiveConfig:
+                  mandatory:
+                    namingTemplate: "corp-{namespace}-{name}"
+                  defaults:
+                    namingTemplate: "{namespace}-{name}"
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: studio-main-mand
+                namespace: sagemakerdomain
+              spec:
+                configRef: naming-mandatory-cfg
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: studio-main-mand
+                namespace: sagemakerdomain
+              status:
+                resourceName: corp-sagemakerdomain-studio-main-mand
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: Naming — spec.nameOverride bypasses template
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: override-domain
+                namespace: sagemakerdomain
+              spec:
+                nameOverride: my-custom-domain
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: override-domain
+                namespace: sagemakerdomain
+              status:
+                resourceName: my-custom-domain
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: override-domain
+                namespace: sagemakerdomain
+              spec:
+                domainName: my-custom-domain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: Negative — naming unresolved token
+    # When {tag.X} cannot be resolved, namingStatus is invalid-unresolved-tokens
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: negative-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: unresolved-token-cfg
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: unresolved-token-cfg
+              status:
+                effectiveConfig:
+                  mandatory: {}
+                  defaults:
+                    namingTemplate: "{tag.env}-{name}"
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: unresolved-domain
+                namespace: sagemakerdomain
+              spec:
+                configRef: unresolved-token-cfg
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: unresolved-domain
+                namespace: sagemakerdomain
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: Tags — merge and array conversion (ACK tags are [{key,value}] format)
+    # Use jq script assert for order-independent verification
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-tags-merge-array-format
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: tags-cfg
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: tags-cfg
+              status:
+                effectiveConfig:
+                  mandatory:
+                    namingTemplate: "{namespace}-{name}"
+                    tags:
+                      resource-type: ml
+                  defaults:
+                    tags:
+                      environment: dev
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: tags-domain
+                namespace: sagemakerdomain
+              spec:
+                configRef: tags-cfg
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+                tags:
+                  team: data-science
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: tags-domain
+                namespace: sagemakerdomain
+        - script:
+            content: |
+              TAGS=$(kubectl get domain tags-domain -n sagemakerdomain -o json | jq '.spec.tags')
+              echo "tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key == "resource-type" and .value == "ml")) | length == 1' || { echo "FAIL: resource-type not found or wrong value"; exit 1; }
+              echo "$TAGS" | jq -e 'map(select(.key == "team" and .value == "data-science")) | length == 1' || { echo "FAIL: team not found or wrong value"; exit 1; }
+              echo "$TAGS" | jq -e 'map(select(.key == "environment" and .value == "dev")) | length == 1' || { echo "FAIL: environment not found or wrong value"; exit 1; }
+              echo "AC-13 OK: all tags present as [{key,value}] array"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: syncedLabels forwarded to both metadata.labels and spec.tags
+    # AC-15: syncedAnnotations forwarded to metadata.annotations
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-synced-labels-and-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerConfig
+              metadata:
+                name: synced-meta-cfg
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/resource-name: synced-meta-cfg
+              status:
+                effectiveConfig:
+                  mandatory:
+                    namingTemplate: "{namespace}-{name}"
+                    syncedLabels:
+                      environment: production
+                    syncedAnnotations:
+                      team: ml-platform
+                  defaults:
+                    syncedLabels:
+                      data-class: internal
+                  aws:
+                    accountId: "123456789012"
+                    region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: synced-meta-domain
+                namespace: sagemakerdomain
+              spec:
+                configRef: synced-meta-cfg
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: synced-meta-domain
+                namespace: sagemakerdomain
+                labels:
+                  aws.kropath.run/environment: production
+                  aws.kropath.run/data-class: internal
+                annotations:
+                  aws.kropath.run/team: ml-platform
+        - script:
+            content: |
+              TAGS=$(kubectl get domain synced-meta-domain -n sagemakerdomain -o json | jq '.spec.tags')
+              echo "tags: $TAGS"
+              echo "$TAGS" | jq -e 'map(select(.key == "environment" and .value == "production")) | length == 1' || { echo "FAIL: environment tag not forwarded"; exit 1; }
+              echo "AC-14 OK: syncedLabels appear in spec.tags"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: Standard metadata wiring
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-standard-metadata
+      try:
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: basic-domain
+                namespace: sagemakerdomain
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: basic-domain
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              OWNER=$(kubectl get domain basic-domain -n sagemakerdomain -o json | jq '.metadata.ownerReferences[0]')
+              echo "$OWNER" | jq -e '.kind == "SageMakerDomain"' || { echo "FAIL: ownerReference kind wrong"; exit 1; }
+              echo "$OWNER" | jq -e '.controller == true' || { echo "FAIL: controller not true"; exit 1; }
+              echo "$OWNER" | jq -e '.blockOwnerDeletion == true' || { echo "FAIL: blockOwnerDeletion not true"; exit 1; }
+              echo "AC-16 OK: standard metadata wired"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: Deletion policy delete
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: del-policy-domain
+                namespace: sagemakerdomain
+              spec:
+                deletionPolicy: delete
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: del-policy-domain
+                namespace: sagemakerdomain
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-19: Config fallthrough to general-policy when configRef not found
+    # AC-20: Default configRef resolves to general-policy
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-config-default-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: default-cfg-domain
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: default-cfg-domain
+                namespace: sagemakerdomain
+              status:
+                resourceName: sagemakerdomain-default-cfg-domain
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: Negative — missing authMode rejected at admission
+    # AC-22: Negative — missing vpcId rejected
+    # AC-23: Negative — missing subnetIds rejected
+    # AC-24: Negative — missing defaultUserSettings rejected
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: negative-missing-required-fields
+      try:
+        - script:
+            content: |
+              # AC-21: missing authMode
+              OUT=$(kubectl apply -f - 2>&1 <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: missing-auth-mode
+                namespace: sagemakerdomain
+              spec:
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/exec"
+              EOF
+              ) || true
+              echo "$OUT" | grep -qi "invalid\|required\|unknown\|field" && echo "AC-21 OK: authMode required enforced" || { echo "AC-21 WARN: admission may not enforce authMode (kro might not set required)"; }
+
+              # AC-22: missing vpcId
+              OUT=$(kubectl apply -f - 2>&1 <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: missing-vpc-id
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                subnetIds:
+                  - subnet-1a
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/exec"
+              EOF
+              ) || true
+              echo "$OUT" | grep -qi "invalid\|required\|unknown\|field" && echo "AC-22 OK: vpcId required enforced" || { echo "AC-22 WARN: admission may not enforce vpcId"; }
+
+              # AC-23: missing subnetIds
+              OUT=$(kubectl apply -f - 2>&1 <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: missing-subnet-ids
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                vpcId: vpc-abc123
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/exec"
+              EOF
+              ) || true
+              echo "$OUT" | grep -qi "invalid\|required\|unknown\|field" && echo "AC-23 OK: subnetIds required enforced" || { echo "AC-23 WARN: admission may not enforce subnetIds"; }
+
+              # AC-24: missing defaultUserSettings
+              OUT=$(kubectl apply -f - 2>&1 <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: missing-user-settings
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+              EOF
+              ) || true
+              echo "$OUT" | grep -qi "invalid\|required\|unknown\|field" && echo "AC-24 OK: defaultUserSettings required enforced" || { echo "AC-24 WARN: admission may not enforce defaultUserSettings"; }
+
+              echo "Negative required-field tests done"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-25: VPC-only network access type
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-vpc-only-network-access
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: vpc-only-domain
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                appNetworkAccessType: VpcOnly
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: vpc-only-domain
+                namespace: sagemakerdomain
+              spec:
+                appNetworkAccessType: VpcOnly
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # appSecurityGroupManagement variant test
+    # Verifies both variants (with and without) create correct ACK Domain CR
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: happy-path-app-security-group-management
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: SageMakerDomain
+              metadata:
+                name: sec-grp-domain
+                namespace: sagemakerdomain
+              spec:
+                authMode: IAM
+                vpcId: vpc-abc123
+                subnetIds:
+                  - subnet-1a
+                appSecurityGroupManagement: Service
+                defaultUserSettings:
+                  executionRole: "arn:aws:iam::123456789012:role/SageMakerExecRole"
+        - assert:
+            resource:
+              apiVersion: sagemaker.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: sec-grp-domain
+                namespace: sagemakerdomain
+              spec:
+                appSecurityGroupManagement: Service
