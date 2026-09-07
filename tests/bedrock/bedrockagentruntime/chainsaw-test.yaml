@@ -1,0 +1,498 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# BedrockAgentRuntime Chainsaw tests.
+# Canonical pattern: skipDelete + unique resource name per step; no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bedrockagentruntime
+spec:
+  skipDelete: true
+  namespace: bedrockagentruntime
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1/AC-5/AC-7: create runtime with container config; standard K8s metadata; deletion-policy retain.
+    - name: ac1-create-runtime-container
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac1-cfg
+                namespace: bedrockagentruntime
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac1-cfg -n bedrockagentruntime \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac1-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/my-agent-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac1-runtime
+                namespace: bedrockagentruntime
+              status:
+                resourceName: bedrockagentruntime-ac1-runtime
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntime
+              metadata:
+                name: bedrockagentruntime-ac1-runtime
+                namespace: bedrockagentruntime
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac1-runtime
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                agentRuntimeName: bedrockagentruntime-ac1-runtime
+                roleARN: "arn:aws:iam::123456789012:role/my-agent-role"
+
+    # AC-2: create runtime with code configuration.
+    - name: ac2-create-runtime-code
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac2-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                agentRuntimeArtifact:
+                  codeConfiguration:
+                    code:
+                      s3:
+                        bucket: my-bucket
+                        prefix: agents/my-agent
+                        versionID: "1"
+                    entryPoint:
+                      - "python"
+                      - "main.py"
+                    runtime: PYTHON_3_12
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/my-agent-role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac2-runtime
+                namespace: bedrockagentruntime
+              status:
+                resourceName: bedrockagentruntime-ac2-runtime
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntime
+              metadata:
+                name: bedrockagentruntime-ac2-runtime
+                namespace: bedrockagentruntime
+              spec:
+                agentRuntimeName: bedrockagentruntime-ac2-runtime
+
+    # AC-3: three-tier tags merge — mandatory wins.
+    - name: ac3-tags-merge-three-tiers
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac3-cfg
+                namespace: bedrockagentruntime
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac3-cfg -n bedrockagentruntime \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{"cost-centre":"ai-platform","env":"prod"}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"managed-by":"kropath","env":"dev"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac3-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac3-cfg
+                tags:
+                  app: my-agent
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - script:
+            content: |
+              set -e
+              TAGS=$(kubectl get agentruntime bedrockagentruntime-ac3-runtime -n bedrockagentruntime -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e '.["cost-centre"] == "ai-platform"'
+              echo "$TAGS" | jq -e '.app == "my-agent"'
+              echo "$TAGS" | jq -e '.["managed-by"] == "kropath"'
+              echo "$TAGS" | jq -e '.env == "prod"'
+
+    # AC-4: defaults tags applied when instance has no tags.
+    - name: ac4-defaults-tags-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac4-cfg
+                namespace: bedrockagentruntime
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac4-cfg -n bedrockagentruntime \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"managed-by":"kropath"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac4-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac4-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - script:
+            content: |
+              set -e
+              kubectl get agentruntime bedrockagentruntime-ac4-runtime -n bedrockagentruntime -o json | jq -e '.spec.tags["managed-by"] == "kropath"'
+
+    # AC-6: deletion-policy delete.
+    - name: ac6-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac6-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: "delete"
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntime
+              metadata:
+                name: bedrockagentruntime-ac6-runtime
+                namespace: bedrockagentruntime
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-8/AC-9/AC-10: naming template — default, mandatory override, nameOverride.
+    - name: ac8-naming-template-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac8-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac8-runtime
+                namespace: bedrockagentruntime
+              status:
+                resourceName: bedrockagentruntime-ac8-runtime
+                namingStatus: valid
+
+    - name: ac9-naming-template-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac9-cfg
+                namespace: bedrockagentruntime
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac9-cfg -n bedrockagentruntime \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"corp-{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac9-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac9-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac9-runtime
+                namespace: bedrockagentruntime
+              status:
+                resourceName: corp-bedrockagentruntime-ac9-runtime
+                namingStatus: valid
+
+    - name: ac10-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac10-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                nameOverride: "custom-runtime-name"
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac10-runtime
+                namespace: bedrockagentruntime
+              status:
+                resourceName: custom-runtime-name
+                namingStatus: valid
+
+    # AC-11: unresolved naming token → namingStatus invalid.
+    - name: ac11-naming-unresolved-tokens
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac11-cfg
+                namespace: bedrockagentruntime
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac11-cfg -n bedrockagentruntime \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{tag.env}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac11-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac11-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac11-runtime
+                namespace: bedrockagentruntime
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-15: optional fields absent when not set.
+    - name: ac15-optional-fields-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac15-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - script:
+            content: |
+              set -e
+              SPEC=$(kubectl get agentruntime bedrockagentruntime-ac15-runtime -n bedrockagentruntime -o json | jq '.spec')
+              if echo "$SPEC" | jq -e '.description != null and .description != ""' > /dev/null 2>&1; then echo "FAIL: description present"; exit 1; fi
+              if echo "$SPEC" | jq -e '.environmentVariables != null' > /dev/null 2>&1; then echo "FAIL: environmentVariables present"; exit 1; fi
+              if echo "$SPEC" | jq -e '.lifecycleConfiguration != null' > /dev/null 2>&1; then echo "FAIL: lifecycleConfiguration present"; exit 1; fi
+              echo "PASS: optional fields absent"
+
+    # AC-16: optional fields present when set.
+    - name: ac16-optional-fields-present
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac16-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                description: "My runtime"
+                environmentVariables:
+                  KEY: value
+                lifecycleConfiguration:
+                  idleRuntimeSessionTimeout: 3600
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - script:
+            content: |
+              set -e
+              SPEC=$(kubectl get agentruntime bedrockagentruntime-ac16-runtime -n bedrockagentruntime -o json | jq '.spec')
+              echo "$SPEC" | jq -e '.description == "My runtime"'
+              echo "$SPEC" | jq -e '.environmentVariables.KEY == "value"'
+              echo "$SPEC" | jq -e '.lifecycleConfiguration.idleRuntimeSessionTimeout == 3600'
+
+    # AC-17: syncedLabels propagated to ACK child labels and spec.tags.
+    - name: ac17-synced-labels-propagated
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac17-cfg
+                namespace: bedrockagentruntime
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    environment: production
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac17-cfg -n bedrockagentruntime \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{"environment":"production"},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac17-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac17-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - script:
+            content: |
+              set -e
+              kubectl get agentruntime bedrockagentruntime-ac17-runtime -n bedrockagentruntime -o json | jq -e '.metadata.labels["aws.kropath.run/environment"] == "production"'
+              kubectl get agentruntime bedrockagentruntime-ac17-runtime -n bedrockagentruntime -o json | jq -e '.spec.tags.environment == "production"'

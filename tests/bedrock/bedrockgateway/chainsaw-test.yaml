@@ -1,0 +1,468 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# BedrockGateway Chainsaw tests.
+# Canonical pattern: skipDelete + unique resource name per step; no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bedrockgateway
+spec:
+  skipDelete: true
+  namespace: bedrockgateway
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1/AC-6/AC-8: create MCP gateway with no auth; standard K8s metadata; deletion-policy retain.
+    - name: ac1-create-gateway-mcp-no-auth
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac1-cfg
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac1-cfg -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac1-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac1-gateway
+                namespace: bedrockgateway
+              status:
+                resourceName: bedrockgateway-ac1-gateway
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Gateway
+              metadata:
+                name: bedrockgateway-ac1-gateway
+                namespace: bedrockgateway
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac1-gateway
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+              spec:
+                authorizerType: NONE
+                protocolType: MCP
+
+    # AC-2: gateway with JWT auth.
+    - name: ac2-create-gateway-jwt-auth
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac2-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: CUSTOM_JWT
+                protocolType: MCP
+                roleArn: "arn:aws:iam::123456789012:role/gateway-role"
+                authorizerConfiguration:
+                  customJWTAuthorizer:
+                    discoveryURL: "https://auth.example.com/.well-known/openid-configuration"
+                    allowedAudience:
+                      - "api://my-app"
+        - script:
+            content: |
+              set -e
+              SPEC=$(kubectl get gateway bedrockgateway-ac2-gateway -n bedrockgateway -o json | jq '.spec')
+              echo "$SPEC" | jq -e '.authorizerType == "CUSTOM_JWT"'
+              echo "$SPEC" | jq -e '.roleARN == "arn:aws:iam::123456789012:role/gateway-role"'
+              echo "$SPEC" | jq -e '.authorizerConfiguration.customJWTAuthorizer.discoveryURL == "https://auth.example.com/.well-known/openid-configuration"'
+
+    # AC-3: gateway with IAM auth.
+    - name: ac3-create-gateway-iam-auth
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac3-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: AWS_IAM
+                protocolType: MCP
+                roleArn: "arn:aws:iam::123456789012:role/gateway-role"
+        - script:
+            content: |
+              set -e
+              SPEC=$(kubectl get gateway bedrockgateway-ac3-gateway -n bedrockgateway -o json | jq '.spec')
+              echo "$SPEC" | jq -e '.authorizerType == "AWS_IAM"'
+              echo "$SPEC" | jq -e '.roleARN == "arn:aws:iam::123456789012:role/gateway-role"'
+
+    # AC-4: three-tier tags merge.
+    - name: ac4-tags-merge-three-tiers
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac4-cfg
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac4-cfg -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{"cost-centre":"ai-platform","env":"prod"}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"managed-by":"kropath","env":"dev"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac4-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac4-cfg
+                authorizerType: NONE
+                protocolType: MCP
+                tags:
+                  app: tool-gateway
+        - script:
+            content: |
+              set -e
+              TAGS=$(kubectl get gateway bedrockgateway-ac4-gateway -n bedrockgateway -o json | jq '.spec.tags')
+              echo "$TAGS" | jq -e '.["cost-centre"] == "ai-platform"'
+              echo "$TAGS" | jq -e '.app == "tool-gateway"'
+              echo "$TAGS" | jq -e '.["managed-by"] == "kropath"'
+              echo "$TAGS" | jq -e '.env == "prod"'
+
+    # AC-7: deletion-policy delete.
+    - name: ac7-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac7-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: "delete"
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Gateway
+              metadata:
+                name: bedrockgateway-ac7-gateway
+                namespace: bedrockgateway
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-9/AC-10/AC-11: naming.
+    - name: ac9-naming-template-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac9-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac9-gateway
+                namespace: bedrockgateway
+              status:
+                resourceName: bedrockgateway-ac9-gateway
+                namingStatus: valid
+
+    - name: ac10-naming-template-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac10-cfg
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac10-cfg -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"corp-{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac10-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac10-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac10-gateway
+                namespace: bedrockgateway
+              status:
+                resourceName: corp-bedrockgateway-ac10-gateway
+                namingStatus: valid
+
+    - name: ac11-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac11-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                nameOverride: "central-gateway"
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac11-gateway
+                namespace: bedrockgateway
+              status:
+                resourceName: central-gateway
+                namingStatus: valid
+
+    # AC-12: unresolved naming token.
+    - name: ac12-naming-unresolved-tokens
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac12-cfg
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac12-cfg -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{tag.env}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac12-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac12-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac12-gateway
+                namespace: bedrockgateway
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-15: kmsKeyArn + kmsKeyRef mutual exclusivity (ConfigMap advisory created).
+    - name: ac15-kms-key-mutual-exclusivity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac15-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+                kmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/abc123"
+                kmsKeyRef: "my-key"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac15-gateway-kms-exclusion-error
+                namespace: bedrockgateway
+
+    # AC-16: roleArn + roleRef mutual exclusivity (ConfigMap advisory).
+    - name: ac16-role-mutual-exclusivity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac16-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+                roleArn: "arn:aws:iam::123456789012:role/my-role"
+                roleRef: "my-role"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac16-gateway-role-exclusion-error
+                namespace: bedrockgateway
+
+    # AC-19: optional fields absent.
+    - name: ac19-optional-fields-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac19-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - script:
+            content: |
+              set -e
+              SPEC=$(kubectl get gateway bedrockgateway-ac19-gateway -n bedrockgateway -o json | jq '.spec')
+              if echo "$SPEC" | jq -e '.description != null and .description != ""' > /dev/null 2>&1; then echo "FAIL: description present"; exit 1; fi
+              if echo "$SPEC" | jq -e '.exceptionLevel != null and .exceptionLevel != ""' > /dev/null 2>&1; then echo "FAIL: exceptionLevel present"; exit 1; fi
+              echo "PASS: optional fields absent"
+
+    # AC-20: optional fields present.
+    - name: ac20-optional-fields-present
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac20-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+                description: "Tool gateway"
+                exceptionLevel: DEBUG
+                protocolConfiguration:
+                  mcp:
+                    instructions: "Use this gateway for tool calls"
+        - script:
+            content: |
+              set -e
+              SPEC=$(kubectl get gateway bedrockgateway-ac20-gateway -n bedrockgateway -o json | jq '.spec')
+              echo "$SPEC" | jq -e '.description == "Tool gateway"'
+              echo "$SPEC" | jq -e '.exceptionLevel == "DEBUG"'
+
+    # AC-21: syncedLabels propagated.
+    - name: ac21-synced-labels-propagated
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac21-cfg
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    environment: production
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac21-cfg -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{"environment":"production"},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac21-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac21-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - script:
+            content: |
+              set -e
+              kubectl get gateway bedrockgateway-ac21-gateway -n bedrockgateway -o json | jq -e '.metadata.labels["aws.kropath.run/environment"] == "production"'
+              kubectl get gateway bedrockgateway-ac21-gateway -n bedrockgateway -o json | jq -e '.spec.tags.environment == "production"'
