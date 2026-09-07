@@ -27,7 +27,7 @@ spec:
         - apply:
             file: 00-namespace.yaml
 
-    # AC-1/AC-6/AC-8: create MCP gateway with no auth; standard K8s metadata; deletion-policy retain.
+    # AC-1: create MCP gateway with no auth.
     - name: ac1-create-gateway-mcp-no-auth
       try:
         - apply:
@@ -508,3 +508,250 @@ spec:
               set -e
               kubectl get gateway bedrockgateway-ac21-gateway -n bedrockgateway -o json | jq -e '.metadata.labels["aws.kropath.run/environment"] == "production"'
               kubectl get gateway bedrockgateway-ac21-gateway -n bedrockgateway -o json | jq -e '.spec.tags.environment == "production"'
+
+    # AC-5: defaults-tags-applied — defaults.tags from effectiveConfig applied when spec has no tags.
+    - name: ac5-defaults-tags-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac5-cfg
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac5-cfg -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"managed-by":"kropath"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac5-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac5-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Gateway
+              metadata:
+                name: bedrockgateway-ac5-gateway
+                namespace: bedrockgateway
+        - script:
+            content: |
+              set -e
+              kubectl get gateway bedrockgateway-ac5-gateway -n bedrockgateway -o json | jq -e '.spec.tags["managed-by"] == "kropath"'
+
+    # AC-6: standard-k8s-metadata — ACK Gateway child has managed-by, instance, deletion-policy, ownerRefs.
+    - name: ac6-standard-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac6-cfg
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac6-cfg -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac6-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac6-cfg
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Gateway
+              metadata:
+                name: bedrockgateway-ac6-gateway
+                namespace: bedrockgateway
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac6-gateway
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              set -eu
+              OWNER=$(kubectl get gateway bedrockgateway-ac6-gateway -n bedrockgateway -o json \
+                | jq -r '.metadata.ownerReferences // [] | map(select(.kind == "BedrockGateway" and .name == "ac6-gateway")) | length')
+              echo "ownerReferences pointing to BedrockGateway/ac6-gateway: $OWNER"
+              [ "$OWNER" -ge 1 ]
+
+    # AC-8: deletion-policy-retain — spec.deletionPolicy: "retain" propagates to ACK annotation.
+    - name: ac8-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac8-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: "retain"
+                authorizerType: NONE
+                protocolType: MCP
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Gateway
+              metadata:
+                name: bedrockgateway-ac8-gateway
+                namespace: bedrockgateway
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-13: missing-authorizer-type — CR without authorizerType rejected (required field).
+    - name: ac13-missing-authorizer-type
+      try:
+        - script:
+            content: |
+              cat > /tmp/ac13-missing-authorizer-type.yaml <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac13-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                protocolType: MCP
+              EOF
+              if kubectl apply --dry-run=server -f /tmp/ac13-missing-authorizer-type.yaml 2>/dev/null; then
+                echo "FAIL: CR missing authorizerType was accepted — field must be required"
+                exit 1
+              else
+                echo "PASS: CR rejected as expected (authorizerType is required)"
+              fi
+
+    # AC-14: missing-protocol-type — CR without protocolType rejected (required field).
+    - name: ac14-missing-protocol-type
+      try:
+        - script:
+            content: |
+              cat > /tmp/ac14-missing-protocol-type.yaml <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac14-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+              EOF
+              if kubectl apply --dry-run=server -f /tmp/ac14-missing-protocol-type.yaml 2>/dev/null; then
+                echo "FAIL: CR missing protocolType was accepted — field must be required"
+                exit 1
+              else
+                echo "PASS: CR rejected as expected (protocolType is required)"
+              fi
+
+    # AC-17: kms-key-ref-resolved — kmsKeyRef resolves to ACK Gateway spec.kmsKeyARN from KMSKey status.predictedArn.
+    - name: ac17-kms-key-ref-resolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: ac17-kms-key
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac17-kms-key
+              spec:
+                configRef: ac1-cfg
+                enableKeyRotation: false
+        - script:
+            content: |
+              kubectl patch kmskey ac17-kms-key -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"predictedArn":"arn:aws:kms:us-east-1:123456789012:key/test-key-id-ac17"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac17-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+                kmsKeyRef: ac17-kms-key
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Gateway
+              metadata:
+                name: bedrockgateway-ac17-gateway
+                namespace: bedrockgateway
+              spec:
+                kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/test-key-id-ac17"
+
+    # AC-18: role-ref-resolved — roleRef resolves to ACK Gateway spec.roleARN from IAMRole status.predictedArn.
+    - name: ac18-role-ref-resolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: IAMRole
+              metadata:
+                name: ac18-gateway-role
+                namespace: bedrockgateway
+                labels:
+                  aws.kropath.run/resource-name: ac18-gateway-role
+              spec:
+                configRef: ac1-cfg
+                type: EC2
+        - script:
+            content: |
+              kubectl patch iamrole ac18-gateway-role -n bedrockgateway \
+                --subresource=status --type=merge \
+                -p '{"status":{"predictedArn":"arn:aws:iam::123456789012:role/gateway-role-ac18"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockGateway
+              metadata:
+                name: ac18-gateway
+                namespace: bedrockgateway
+              spec:
+                configRef: ac1-cfg
+                authorizerType: NONE
+                protocolType: MCP
+                roleRef: ac18-gateway-role
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Gateway
+              metadata:
+                name: bedrockgateway-ac18-gateway
+                namespace: bedrockgateway
+              spec:
+                roleARN: "arn:aws:iam::123456789012:role/gateway-role-ac18"

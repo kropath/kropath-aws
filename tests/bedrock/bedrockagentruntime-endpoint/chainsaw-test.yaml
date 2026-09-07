@@ -27,7 +27,7 @@ spec:
         - apply:
             file: 00-namespace.yaml
 
-    # AC-1/AC-5/AC-7: create endpoint with defaults; standard K8s metadata; deletion-policy retain.
+    # AC-1: create endpoint with defaults.
     - name: ac1-create-endpoint-defaults
       try:
         - apply:
@@ -414,3 +414,140 @@ spec:
               set -e
               kubectl get agentRuntimeEndpoint bedrockagentruntime-endpoint-ac15-endpoint -n bedrockagentruntime-endpoint -o json | jq -e '.metadata.labels["aws.kropath.run/environment"] == "production"'
               kubectl get agentRuntimeEndpoint bedrockagentruntime-endpoint-ac15-endpoint -n bedrockagentruntime-endpoint -o json | jq -e '.spec.tags.environment == "production"'
+
+    # AC-4: defaults-tags-applied — defaults.tags from effectiveConfig applied when spec has no tags.
+    - name: ac4-defaults-tags-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac4-cfg
+                namespace: bedrockagentruntime-endpoint
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac4-cfg -n bedrockagentruntime-endpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"managed-by":"kropath"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntimeEndpoint
+              metadata:
+                name: ac4-endpoint
+                namespace: bedrockagentruntime-endpoint
+              spec:
+                configRef: ac4-cfg
+                agentRuntimeID: "rt-abc123"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntimeEndpoint
+              metadata:
+                name: bedrockagentruntime-endpoint-ac4-endpoint
+                namespace: bedrockagentruntime-endpoint
+        - script:
+            content: |
+              set -e
+              kubectl get agentRuntimeEndpoint bedrockagentruntime-endpoint-ac4-endpoint -n bedrockagentruntime-endpoint -o json | jq -e '.spec.tags["managed-by"] == "kropath"'
+
+    # AC-5: standard-k8s-metadata — ACK AgentRuntimeEndpoint child has managed-by, instance, deletion-policy, ownerRefs.
+    - name: ac5-standard-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac5-cfg
+                namespace: bedrockagentruntime-endpoint
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac5-cfg -n bedrockagentruntime-endpoint \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntimeEndpoint
+              metadata:
+                name: ac5-endpoint
+                namespace: bedrockagentruntime-endpoint
+              spec:
+                configRef: ac5-cfg
+                agentRuntimeID: "rt-abc123"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntimeEndpoint
+              metadata:
+                name: bedrockagentruntime-endpoint-ac5-endpoint
+                namespace: bedrockagentruntime-endpoint
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac5-endpoint
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              set -eu
+              OWNER=$(kubectl get agentRuntimeEndpoint bedrockagentruntime-endpoint-ac5-endpoint -n bedrockagentruntime-endpoint -o json \
+                | jq -r '.metadata.ownerReferences // [] | map(select(.kind == "BedrockAgentRuntimeEndpoint" and .name == "ac5-endpoint")) | length')
+              echo "ownerReferences pointing to BedrockAgentRuntimeEndpoint/ac5-endpoint: $OWNER"
+              [ "$OWNER" -ge 1 ]
+
+    # AC-7: deletion-policy-retain — spec.deletionPolicy: "retain" propagates to ACK annotation.
+    - name: ac7-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntimeEndpoint
+              metadata:
+                name: ac7-endpoint
+                namespace: bedrockagentruntime-endpoint
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: "retain"
+                agentRuntimeID: "rt-abc123"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntimeEndpoint
+              metadata:
+                name: bedrockagentruntime-endpoint-ac7-endpoint
+                namespace: bedrockagentruntime-endpoint
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-12: missing-agent-runtime-id — CR without agentRuntimeID rejected (required field).
+    - name: ac12-missing-agent-runtime-id
+      try:
+        - script:
+            content: |
+              cat > /tmp/ac12-missing-agent-runtime-id.yaml <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntimeEndpoint
+              metadata:
+                name: ac12-endpoint
+                namespace: bedrockagentruntime-endpoint
+              spec:
+                configRef: ac1-cfg
+              EOF
+              if kubectl apply --dry-run=server -f /tmp/ac12-missing-agent-runtime-id.yaml 2>/dev/null; then
+                echo "FAIL: CR missing agentRuntimeID was accepted — field must be required"
+                exit 1
+              else
+                echo "PASS: CR rejected as expected (agentRuntimeID is required)"
+              fi

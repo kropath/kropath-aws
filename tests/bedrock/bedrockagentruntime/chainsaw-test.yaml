@@ -27,7 +27,7 @@ spec:
         - apply:
             file: 00-namespace.yaml
 
-    # AC-1/AC-5/AC-7: create runtime with container config; standard K8s metadata; deletion-policy retain.
+    # AC-1: create runtime with container config.
     - name: ac1-create-runtime-container
       try:
         - apply:
@@ -531,3 +531,162 @@ spec:
               set -e
               kubectl get agentruntime bedrockagentruntime-ac17-runtime -n bedrockagentruntime -o json | jq -e '.metadata.labels["aws.kropath.run/environment"] == "production"'
               kubectl get agentruntime bedrockagentruntime-ac17-runtime -n bedrockagentruntime -o json | jq -e '.spec.tags.environment == "production"'
+
+    # AC-5: standard-k8s-metadata — ACK AgentRuntime child has managed-by, instance, deletion-policy, ownerRefs.
+    - name: ac5-standard-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac5-cfg
+                namespace: bedrockagentruntime
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac5-cfg -n bedrockagentruntime \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"defaults":{"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac5-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac5-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntime
+              metadata:
+                name: bedrockagentruntime-ac5-runtime
+                namespace: bedrockagentruntime
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac5-runtime
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              set -eu
+              OWNER=$(kubectl get agentruntime bedrockagentruntime-ac5-runtime -n bedrockagentruntime -o json \
+                | jq -r '.metadata.ownerReferences // [] | map(select(.kind == "BedrockAgentRuntime" and .name == "ac5-runtime")) | length')
+              echo "ownerReferences pointing to BedrockAgentRuntime/ac5-runtime: $OWNER"
+              [ "$OWNER" -ge 1 ]
+
+    # AC-7: deletion-policy-retain — spec.deletionPolicy: "retain" propagates to ACK annotation.
+    - name: ac7-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac7-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: "retain"
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: AgentRuntime
+              metadata:
+                name: bedrockagentruntime-ac7-runtime
+                namespace: bedrockagentruntime
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-12: missing-artifact — CR without agentRuntimeArtifact rejected (required field).
+    - name: ac12-missing-artifact
+      try:
+        - script:
+            content: |
+              cat > /tmp/ac12-missing-artifact.yaml <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac12-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                networkConfiguration:
+                  networkMode: PUBLIC
+                roleArn: "arn:aws:iam::123456789012:role/role"
+              EOF
+              if kubectl apply --dry-run=server -f /tmp/ac12-missing-artifact.yaml 2>/dev/null; then
+                echo "FAIL: CR missing agentRuntimeArtifact was accepted — field must be required"
+                exit 1
+              else
+                echo "PASS: CR rejected as expected (agentRuntimeArtifact is required)"
+              fi
+
+    # AC-13: missing-network-config — CR without networkConfiguration rejected (required field).
+    - name: ac13-missing-network-config
+      try:
+        - script:
+            content: |
+              cat > /tmp/ac13-missing-network-config.yaml <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac13-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                roleArn: "arn:aws:iam::123456789012:role/role"
+              EOF
+              if kubectl apply --dry-run=server -f /tmp/ac13-missing-network-config.yaml 2>/dev/null; then
+                echo "FAIL: CR missing networkConfiguration was accepted — field must be required"
+                exit 1
+              else
+                echo "PASS: CR rejected as expected (networkConfiguration is required)"
+              fi
+
+    # AC-14: missing-role-arn — CR without roleArn rejected (required field).
+    - name: ac14-missing-role-arn
+      try:
+        - script:
+            content: |
+              cat > /tmp/ac14-missing-role-arn.yaml <<'EOF'
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAgentRuntime
+              metadata:
+                name: ac14-runtime
+                namespace: bedrockagentruntime
+              spec:
+                configRef: ac1-cfg
+                agentRuntimeArtifact:
+                  containerConfiguration:
+                    containerURI: "123456789012.dkr.ecr.us-east-1.amazonaws.com/agent:latest"
+                networkConfiguration:
+                  networkMode: PUBLIC
+              EOF
+              if kubectl apply --dry-run=server -f /tmp/ac14-missing-role-arn.yaml 2>/dev/null; then
+                echo "FAIL: CR missing roleArn was accepted — field must be required"
+                exit 1
+              else
+                echo "PASS: CR rejected as expected (roleArn is required)"
+              fi
