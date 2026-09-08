@@ -19,7 +19,7 @@ CLUSTER_NAME ?= kropath-aws-test
 # `^test-<service>:` lines, so collapsing these into a `test-%:` pattern rule would
 # silently break CI's changed-file test selection (it would fall back to the full
 # suite, or skip a service, depending on the diff).
-.PHONY: setup teardown test chainsaw-e2e lint-test-scripts \
+.PHONY: setup teardown test chainsaw-e2e lint-test-scripts test-select-tests \
 	test-acm test-apigateway test-apigatewayv2 test-appscaling test-athena test-autoscaling test-backup test-cloudfront \
 	test-bedrock test-cloudtrail test-cloudwatch test-cloudwatchlogs test-codeartifact test-cognito test-documentdb test-dsql test-dynamodb test-ec2 test-ecr test-ecs test-efs \
 	test-eks test-elasticache test-elb test-eventbridge test-glue test-iam test-keyspaces test-kinesis test-kms \
@@ -42,6 +42,13 @@ lint-test-scripts:
 	@echo "==> Checking for unqualified ACK resource names in chainsaw test scripts..."
 	@./lint-test-scripts.sh
 	@echo "==> lint-test-scripts: PASS"
+
+# test-select-tests: unit/integration tests for select-tests.sh, the script CI uses to
+# decide which suites a change needs. It runs against throwaway git repos, needs no
+# cluster, and takes ~1s — a wrong answer here silently skips suites, so it is checked
+# on every CI run alongside the linters.
+test-select-tests:
+	@./select-tests-test.sh
 
 teardown:
 	./teardown.sh $(CLUSTER_NAME)
