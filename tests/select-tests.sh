@@ -115,10 +115,19 @@ if [ -z "${CHANGED_FILES}" ]; then
 fi
 
 # Files that affect every resource family: bootstrap/teardown scripts, chainsaw
-# config, shared fixtures, org-wide or cross-cutting CRDs (kropathconfig applies
-# to every RGD's effCfg cascade; policy/ PolicyDocument is referenced by both IAM
-# and DynamoDB RGDs), hack/ scripts, this script itself, or the CI workflow.
-SHARED_PATTERN='^(tests/setup\.sh|tests/teardown\.sh|tests/Makefile|tests/select-tests\.sh|tests/fixtures/|\.chainsaw\.yaml|hack/|crds/kropathconfig\.yaml|crds/policy/|\.github/workflows/)'
+# config, genuinely shared fixtures, org-wide or cross-cutting CRDs (kropathconfig
+# applies to every RGD's effCfg cascade; policy/ PolicyDocument is referenced by both
+# IAM and DynamoDB RGDs), hack/ scripts, this script itself, or the CI workflow.
+#
+# Only the SHARED parts of tests/fixtures/ belong here: rbac/ (the kro ClusterRole —
+# stripping an apiGroup there breaks every suite, see KRO-1064), configs/ (the seeded
+# default KropathConfig feeds every RGD's effCfg cascade), and kind-config.yaml.
+# tests/fixtures/crds/<service>/ is per-service and is mapped below instead; matching
+# all of tests/fixtures/ used to escalate a single-service ACK CRD stub edit to the
+# full suite (KRO-1066). Anything else under tests/fixtures/ still falls through to the
+# tests/<dir>/ branch, where "fixtures" is not a known service — so the default for an
+# unrecognised fixture path remains the full suite.
+SHARED_PATTERN='^(tests/setup\.sh|tests/teardown\.sh|tests/Makefile|tests/select-tests\.sh|tests/fixtures/rbac/|tests/fixtures/configs/|tests/fixtures/kind-config|\.chainsaw\.yaml|hack/|crds/kropathconfig\.yaml|crds/policy/|\.github/workflows/)'
 if echo "${CHANGED_FILES}" | grep -qE "${SHARED_PATTERN}"; then
   full_suite
 fi
@@ -170,6 +179,21 @@ add_service() {
 while IFS= read -r f; do
   [ -z "${f}" ] && continue
   case "${f}" in
+    tests/fixtures/crds/*/*)
+      # Per-service ACK CRD stub. tests/fixtures/crds/<service>/*.yaml can only affect
+      # that one service's suite, so map it instead of escalating. Must precede the
+      # generic tests/*/* branch below, which would otherwise read the service as
+      # "fixtures" and fall back to the full suite.
+      svc="${f#tests/fixtures/crds/}"
+      svc="${svc%%/*}"
+      if is_known_service "${svc}"; then
+        add_service "${svc}"
+      else
+        # A stub directory with no matching test-<service>: target — e.g. acmpca, whose
+        # CRDs are consumed by another service's suite. Don't guess.
+        full_suite
+      fi
+      ;;
     tests/*/*)
       svc="${f#tests/}"
       svc="${svc%%/*}"

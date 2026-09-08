@@ -144,6 +144,68 @@ check "push event uses BASE_SHA (the push delta)" \
   "test-s3" "$(run_select "$d" "" "$before" "$head")"
 rm -rf "$d"
 
+# --- Per-service fixture CRD stubs (KRO-1066) --------------------------------------
+# tests/fixtures/crds/<service>/ only affects that service. It used to match the blanket
+# `tests/fixtures/` shared pattern and escalate the whole suite.
+d=$(new_repo)
+git -C "$d" checkout --quiet -b pr
+commit_files "$d" "pr: s3 crd stub" tests/fixtures/crds/s3/s3.services.k8s.aws_buckets.yaml
+head=$(git -C "$d" rev-parse HEAD)
+check "a per-service fixture CRD stub selects only that service" \
+  "test-s3" "$(run_select "$d" main "" "$head")"
+rm -rf "$d"
+
+d=$(new_repo)
+git -C "$d" checkout --quiet -b pr
+commit_files "$d" "pr: stub + rgd" \
+  tests/fixtures/crds/s3/s3.services.k8s.aws_buckets.yaml rgds/s3bucket.yaml
+head=$(git -C "$d" rev-parse HEAD)
+check "a fixture stub alongside its own RGD stays a single-service selection" \
+  "test-s3" "$(run_select "$d" main "" "$head")"
+rm -rf "$d"
+
+d=$(new_repo)
+git -C "$d" checkout --quiet -b pr
+commit_files "$d" "pr: unmapped stub dir" tests/fixtures/crds/acmpca/x.yaml
+head=$(git -C "$d" rev-parse HEAD)
+check "a fixture stub dir with no Makefile target escalates to the full suite" \
+  "test" "$(run_select "$d" main "" "$head")"
+rm -rf "$d"
+
+# The genuinely shared parts of tests/fixtures/ must still escalate.
+d=$(new_repo)
+git -C "$d" checkout --quiet -b pr
+commit_files "$d" "pr: kro rbac" tests/fixtures/rbac/kro-controller.yaml
+head=$(git -C "$d" rev-parse HEAD)
+check "the shared kro RBAC fixture still escalates to the full suite" \
+  "test" "$(run_select "$d" main "" "$head")"
+rm -rf "$d"
+
+d=$(new_repo)
+git -C "$d" checkout --quiet -b pr
+commit_files "$d" "pr: default config" tests/fixtures/configs/default-kropathconfig.yaml
+head=$(git -C "$d" rev-parse HEAD)
+check "the seeded default config fixture still escalates to the full suite" \
+  "test" "$(run_select "$d" main "" "$head")"
+rm -rf "$d"
+
+d=$(new_repo)
+git -C "$d" checkout --quiet -b pr
+commit_files "$d" "pr: kind config" tests/fixtures/kind-config.yaml
+head=$(git -C "$d" rev-parse HEAD)
+check "the kind cluster config fixture still escalates to the full suite" \
+  "test" "$(run_select "$d" main "" "$head")"
+rm -rf "$d"
+
+# An unrecognised path under tests/fixtures/ must fail safe, not silently select nothing.
+d=$(new_repo)
+git -C "$d" checkout --quiet -b pr
+commit_files "$d" "pr: novel fixture" tests/fixtures/webhooks/some-new-thing.yaml
+head=$(git -C "$d" rev-parse HEAD)
+check "an unrecognised tests/fixtures/ path falls back to the full suite" \
+  "test" "$(run_select "$d" main "" "$head")"
+rm -rf "$d"
+
 # --- Fallbacks preserved ----------------------------------------------------------
 d=$(new_repo)
 git -C "$d" checkout --quiet -b pr
