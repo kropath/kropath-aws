@@ -1,0 +1,349 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# BedrockAPIKeyCredentialProvider Chainsaw tests — spec: aws-bedrock-16.
+# Canonical pattern: skipDelete + unique resource name per step; no inter-step deletes.
+# Tags on ACK APIKeyCredentialProvider are map[string]string; use jq for order-independent assertion.
+# ACK status has no id field — assert apiKeyCredentialProviderArn from ackResourceMetadata.arn (empty without controller).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bedrockapikeycredentialprovider
+spec:
+  skipDelete: true
+  namespace: bedrockapikeycredentialprovider
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: BedrockAPIKeyCredentialProvider with apiKey in same namespace.
+    - name: ac1-create-credential-provider
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac1-cfg
+                namespace: bedrockapikeycredentialprovider
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac1-cfg -n bedrockapikeycredentialprovider \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac1-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                apiKey:
+                  name: my-api-secret
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac1-cred
+                namespace: bedrockapikeycredentialprovider
+              status:
+                resourceName: bedrockapikeycredentialprovider-ac1-cred
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: bedrockapikeycredentialprovider-ac1-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                name: bedrockapikeycredentialprovider-ac1-cred
+                apiKey:
+                  name: my-api-secret
+                  key: api-key
+
+    # AC-2: apiKey.namespace cross-namespace — when namespace is specified, used as-is.
+    - name: ac2-create-credential-cross-ns
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac2-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                apiKey:
+                  name: cross-ns-secret
+                  namespace: other-namespace
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: bedrockapikeycredentialprovider-ac2-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                apiKey:
+                  name: cross-ns-secret
+                  namespace: other-namespace
+                  key: api-key
+
+    # AC-2 (default ns): when apiKey.namespace is omitted, defaults to CR namespace.
+    - name: ac2b-apikey-default-namespace
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac2b-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                apiKey:
+                  name: default-ns-secret
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: bedrockapikeycredentialprovider-ac2b-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                apiKey:
+                  name: default-ns-secret
+                  namespace: bedrockapikeycredentialprovider
+                  key: api-key
+
+    # AC-3+AC-4: Tags from spec and config merged on ACK spec.tags (map[string]string).
+    - name: ac3-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac3-cfg
+                namespace: bedrockapikeycredentialprovider
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    env: test
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac3-cfg -n bedrockapikeycredentialprovider \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"env":"test"},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac3-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac3-cfg
+                apiKey:
+                  name: ac3-secret
+                  key: api-key
+                tags:
+                  team: platform
+        - script:
+            content: |
+              CRED=$(kubectl get apikeycredentialprovider bedrockapikeycredentialprovider-ac3-cred -n bedrockapikeycredentialprovider -o json)
+              echo "$CRED" | jq -e '.spec.tags["env"] == "test"' || exit 1
+              echo "$CRED" | jq -e '.spec.tags["team"] == "platform"' || exit 1
+
+    # AC-5: Standard metadata — ownerReference, deletion-policy annotation, managed-by label.
+    - name: ac4-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac4-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: retain
+                apiKey:
+                  name: ac4-secret
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: bedrockapikeycredentialprovider-ac4-cred
+                namespace: bedrockapikeycredentialprovider
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac4-cred
+
+    # AC-6+AC-7: deletionPolicy retain vs delete.
+    - name: ac5-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac5-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: delete
+                apiKey:
+                  name: ac5-secret
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: bedrockapikeycredentialprovider-ac5-cred
+                namespace: bedrockapikeycredentialprovider
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-8+AC-9+AC-10: Naming — default, nameOverride, unresolved token.
+    - name: ac6-naming-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac6-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                apiKey:
+                  name: ac6-secret
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac6-cred
+                namespace: bedrockapikeycredentialprovider
+              status:
+                resourceName: bedrockapikeycredentialprovider-ac6-cred
+                namingStatus: valid
+
+    - name: ac6-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac6b-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                nameOverride: my-cred-provider-override
+                apiKey:
+                  name: ac6b-secret
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac6b-cred
+                namespace: bedrockapikeycredentialprovider
+              status:
+                resourceName: my-cred-provider-override
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: my-cred-provider-override
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                name: my-cred-provider-override
+
+    # AC-13: Update secret reference — apiKey is mutable (no immutability constraint on apiKey).
+    - name: ac7-update-secret-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac7-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                apiKey:
+                  name: initial-secret
+                  key: api-key
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: bedrockapikeycredentialprovider-ac7-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                apiKey:
+                  name: initial-secret
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockAPIKeyCredentialProvider
+              metadata:
+                name: ac7-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                configRef: ac1-cfg
+                apiKey:
+                  name: updated-secret
+                  key: new-api-key
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: APIKeyCredentialProvider
+              metadata:
+                name: bedrockapikeycredentialprovider-ac7-cred
+                namespace: bedrockapikeycredentialprovider
+              spec:
+                apiKey:
+                  name: updated-secret
+                  key: new-api-key

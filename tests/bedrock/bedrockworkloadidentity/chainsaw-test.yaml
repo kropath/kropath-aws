@@ -1,0 +1,329 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# BedrockWorkloadIdentity Chainsaw tests — spec: aws-bedrock-17.
+# Canonical pattern: skipDelete + unique resource name per step; no inter-step deletes.
+# Tags on ACK WorkloadIdentity are map[string]string; use jq for order-independent assertion.
+# allowedResourceOauth2ReturnURLs is optional []string; omitted when empty (kro default=[]).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bedrockworkloadidentity
+spec:
+  skipDelete: true
+  namespace: bedrockworkloadidentity
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: BedrockWorkloadIdentity minimal — no allowedResourceOauth2ReturnURLs.
+    - name: ac1-create-identity-minimal
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac1-cfg
+                namespace: bedrockworkloadidentity
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac1-cfg -n bedrockworkloadidentity \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac1-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac1-identity
+                namespace: bedrockworkloadidentity
+              status:
+                resourceName: bedrockworkloadidentity-ac1-identity
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: bedrockworkloadidentity-ac1-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                name: bedrockworkloadidentity-ac1-identity
+
+    # AC-2: allowedResourceOauth2ReturnURLs propagated to ACK spec.
+    - name: ac2-create-identity-with-urls
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac2-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+                allowedResourceOauth2ReturnURLs:
+                  - "https://app.example.com/callback"
+                  - "https://app.example.com/auth/return"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: bedrockworkloadidentity-ac2-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                allowedResourceOauth2ReturnURLs:
+                  - "https://app.example.com/callback"
+                  - "https://app.example.com/auth/return"
+
+    # AC-3+AC-4: Tags merged on ACK spec.tags (map[string]string). Use jq for assertion.
+    - name: ac3-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac3-cfg
+                namespace: bedrockworkloadidentity
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    env: test
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac3-cfg -n bedrockworkloadidentity \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"env":"test"},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac3-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac3-cfg
+                tags:
+                  team: platform
+        - script:
+            content: |
+              ID=$(kubectl get workloadidentity bedrockworkloadidentity-ac3-identity -n bedrockworkloadidentity -o json)
+              echo "$ID" | jq -e '.spec.tags["env"] == "test"' || exit 1
+              echo "$ID" | jq -e '.spec.tags["team"] == "platform"' || exit 1
+
+    # AC-5: Standard metadata — ownerReference, deletion-policy annotation, managed-by label.
+    - name: ac4-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac4-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: bedrockworkloadidentity-ac4-identity
+                namespace: bedrockworkloadidentity
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac4-identity
+
+    # AC-6+AC-7: deletionPolicy retain vs delete.
+    - name: ac5-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac5-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: bedrockworkloadidentity-ac5-identity
+                namespace: bedrockworkloadidentity
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-8+AC-9+AC-10: Naming — default template and nameOverride.
+    - name: ac6-naming-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac6-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac6-identity
+                namespace: bedrockworkloadidentity
+              status:
+                resourceName: bedrockworkloadidentity-ac6-identity
+                namingStatus: valid
+
+    - name: ac6-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac6b-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+                nameOverride: my-workload-identity-override
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac6b-identity
+                namespace: bedrockworkloadidentity
+              status:
+                resourceName: my-workload-identity-override
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: my-workload-identity-override
+                namespace: bedrockworkloadidentity
+              spec:
+                name: my-workload-identity-override
+
+    # AC-11: allowedResourceOauth2ReturnURLs is mutable — update URLs on existing identity.
+    - name: ac7-update-return-urls
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac7-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+                allowedResourceOauth2ReturnURLs:
+                  - "https://initial.example.com/callback"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: bedrockworkloadidentity-ac7-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                allowedResourceOauth2ReturnURLs:
+                  - "https://initial.example.com/callback"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac7-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+                allowedResourceOauth2ReturnURLs:
+                  - "https://updated.example.com/callback"
+                  - "https://updated.example.com/auth"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: bedrockworkloadidentity-ac7-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                allowedResourceOauth2ReturnURLs:
+                  - "https://updated.example.com/callback"
+                  - "https://updated.example.com/auth"
+
+    # AC-12: allowedResourceOauth2ReturnURLs is optional — omit when empty.
+    - name: ac8-optional-field-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac8-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockWorkloadIdentity
+              metadata:
+                name: ac8-identity
+                namespace: bedrockworkloadidentity
+              status:
+                resourceName: bedrockworkloadidentity-ac8-identity
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: WorkloadIdentity
+              metadata:
+                name: bedrockworkloadidentity-ac8-identity
+                namespace: bedrockworkloadidentity
+              spec:
+                name: bedrockworkloadidentity-ac8-identity
