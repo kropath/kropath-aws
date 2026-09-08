@@ -38,8 +38,24 @@ spec:
               spec:
                 mandatory:
                   alias: "prod-amp"
-                defaults:
-                  namingTemplate: "{namespace}-{name}"
+        # The fixture sets ONLY spec.mandatory.alias. Every other scalar field must come
+        # back absent -- a scalar `default:` on a mandatory/defaults tier field would
+        # materialise a value here and break the mutual-exclusion rules.
+        - script:
+            content: |
+              set -euo pipefail
+              missing=$(kubectl get managedprometheusconfig general-policy \
+                -n managedprometheusconfig -o json | jq -r '
+                  [ (.spec.mandatory.logGroupARN // empty | "mandatory.logGroupARN"),
+                    (.spec.mandatory.namingTemplate // empty | "mandatory.namingTemplate"),
+                    (.spec.defaults.alias // empty | "defaults.alias"),
+                    (.spec.defaults.logGroupARN // empty | "defaults.logGroupARN"),
+                    (.spec.defaults.namingTemplate // empty | "defaults.namingTemplate")
+                  ] | join(",")')
+              if [ -n "$missing" ]; then
+                echo "unset fields were materialised by schema defaults: $missing" >&2
+                exit 1
+              fi
       cleanup:
         - delete:
             file: 01-general-policy.yaml
@@ -77,6 +93,36 @@ spec:
                 check:
                   ($error != null): true
 
+    # Regression guard for the scalar-default bug: setting ONLY the mandatory tier's
+    # namingTemplate must be accepted. With a schema default on
+    # spec.defaults.namingTemplate this apply is rejected by the ac4 CEL rule.
+    - name: mandatory-only-namingTemplate-accepted
+      try:
+        - apply:
+            file: 08-mandatory-only-namingTemplate.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: mandatory-only-naming
+                namespace: managedprometheusconfig
+              spec:
+                mandatory:
+                  namingTemplate: "{namespace}-mandatory-{name}"
+        - script:
+            content: |
+              set -euo pipefail
+              got=$(kubectl get managedprometheusconfig mandatory-only-naming \
+                -n managedprometheusconfig -o json | jq -r '.spec.defaults.namingTemplate // "<unset>"')
+              if [ "$got" != "<unset>" ]; then
+                echo "spec.defaults.namingTemplate materialised as '$got'; expected unset" >&2
+                exit 1
+              fi
+      cleanup:
+        - delete:
+            file: 08-mandatory-only-namingTemplate.yaml
+
     - name: ac5-tags-both-tiers-accepted
       try:
         - apply:
@@ -113,6 +159,9 @@ spec:
               metadata:
                 name: general
                 namespace: managedprometheusconfig
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
         - assert:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
