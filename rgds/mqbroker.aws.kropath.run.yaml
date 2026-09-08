@@ -1,0 +1,338 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: mqbroker.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: MQBroker
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      engineType: string | default=""
+      engineVersion: string | default=""
+      authenticationStrategy: string | default=""
+      deploymentMode: string | default=""
+      hostInstanceType: string | default=""
+      # No default — nil is the zero-value sentinel meaning "not enforced / fall through".
+      # Use has() for presence detection at each call site.
+      publiclyAccessible: boolean
+      securityGroupIDs: '[]string | default=[]'
+      subnetIDs: '[]string | default=[]'
+      storageType: string | default=""
+      encryptionUseAWSOwnedKey: boolean
+      encryptionKMSKeyID: string | default=""
+      autoMinorVersionUpgrade: boolean
+      maintenanceWindowDay: string | default=""
+      maintenanceWindowTime: string | default=""
+      maintenanceWindowTZ: string | default=""
+      logsGeneral: boolean
+      logsAudit: boolean
+      users: '[]MQBrokerUser | default=[]'
+      configurationID: string | default=""
+      configurationRevision: integer | default=0
+      creatorRequestID: string | default=""
+    types:
+      MQBrokerUser:
+        username: string | default=""
+        # false is safe default: optional in ACK, most users don't need console access.
+        consoleAccess: boolean | default=false
+        groups: '[]string | default=[]'
+        passwordSecretRef: MQBrokerPasswordRef
+      MQBrokerPasswordRef:
+        key: string | default=""
+        name: string | default=""
+        # Empty namespace defaults to the MQBroker CR's namespace in the template.
+        namespace: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      brokerARN: >-
+        ${broker.?status.?ackResourceMetadata.?arn.orValue("")}
+      brokerID: >-
+        ${broker.?status.?brokerID.orValue("")}
+      brokerState: >-
+        ${broker.?status.?brokerState.orValue("")}
+      brokerInstances: >-
+        ${broker.?status.?brokerInstances.orValue([])}
+      conditions: >-
+        ${broker.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: BrokerARN
+        type: string
+        jsonPath: .status.brokerARN
+      - name: BrokerState
+        type: string
+        jsonPath: .status.brokerState
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28 / KRO-221): CEL is NOT evaluated in externalRef.metadata.name.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: MQConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Tag tokens are resolved in cascade order: mandatory → instance → defaults (mandatory wins).
+    # Any {tag.X} token whose key is absent in the merged tags map is kept verbatim so that
+    # namingStatus reports "invalid-unresolved-tokens".
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MQBroker
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # ACK MQ Broker CR — primary cloud resource.
+    # Immutable after creation (enforced by ACK / AWS API): engineType, deploymentMode, publiclyAccessible.
+    # kro does not propagate x-kubernetes-validations with oldSelf to derived CRDs — known gap.
+    - id: broker
+      template:
+        apiVersion: mq.services.k8s.aws/v1alpha1
+        kind: Broker
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MQBroker
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: >-
+            ${naming.data.effectiveName}
+
+          engineType: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?engineType.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.engineType
+              : (schema.spec.engineType != ""
+                  ? schema.spec.engineType
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?engineType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.engineType
+                      : ""))}
+
+          engineVersion: >-
+            ${schema.spec.engineVersion}
+
+          authenticationStrategy: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?authenticationStrategy.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.authenticationStrategy
+              : (schema.spec.authenticationStrategy != ""
+                  ? schema.spec.authenticationStrategy
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?authenticationStrategy.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.authenticationStrategy
+                      : "SIMPLE"))}
+
+          deploymentMode: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?deploymentMode.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.deploymentMode
+              : (schema.spec.deploymentMode != ""
+                  ? schema.spec.deploymentMode
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?deploymentMode.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.deploymentMode
+                      : "SINGLE_INSTANCE"))}
+
+          hostInstanceType: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?hostInstanceType.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.hostInstanceType
+              : (schema.spec.hostInstanceType != ""
+                  ? schema.spec.hostInstanceType
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?hostInstanceType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.hostInstanceType
+                      : "mq.m5.large"))}
+
+          publiclyAccessible: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.publiclyAccessible))
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.publiclyAccessible
+              : (has(schema.spec.publiclyAccessible)
+                  ? schema.spec.publiclyAccessible
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.publiclyAccessible)
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.publiclyAccessible
+                      : false))}
+
+          autoMinorVersionUpgrade: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.autoMinorVersionUpgrade))
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.autoMinorVersionUpgrade
+              : (has(schema.spec.autoMinorVersionUpgrade)
+                  ? schema.spec.autoMinorVersionUpgrade
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.autoMinorVersionUpgrade)
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.autoMinorVersionUpgrade
+                      : true))}
+
+          storageType: >-
+            ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?storageType.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.storageType
+              : (schema.spec.storageType != ""
+                  ? schema.spec.storageType
+                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?storageType.orValue("") != ""
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.storageType
+                      : ""))}
+
+          users: >-
+            ${schema.spec.users.map(u, {
+              "username": u.username,
+              "consoleAccess": u.consoleAccess,
+              "groups": u.groups,
+              "password": {
+                "key": u.passwordSecretRef.key,
+                "name": u.passwordSecretRef.name,
+                "namespace": u.passwordSecretRef.namespace != "" ? u.passwordSecretRef.namespace : schema.metadata.namespace
+              }
+            })}
+
+          securityGroups: >-
+            ${schema.spec.securityGroupIDs}
+
+          subnetIDs: >-
+            ${schema.spec.subnetIDs}
+
+          logs:
+            general: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.logsGeneral))
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.logsGeneral
+                : (has(schema.spec.logsGeneral)
+                    ? schema.spec.logsGeneral
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.logsGeneral)
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.logsGeneral
+                        : false))}
+            audit: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.logsAudit))
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.logsAudit
+                : (has(schema.spec.logsAudit)
+                    ? schema.spec.logsAudit
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.logsAudit)
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.logsAudit
+                        : false))}
+
+          encryptionOptions:
+            useAWSOwnedKey: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.encryptionUseAWSOwnedKey))
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.encryptionUseAWSOwnedKey
+                : (has(schema.spec.encryptionUseAWSOwnedKey)
+                    ? schema.spec.encryptionUseAWSOwnedKey
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.encryptionUseAWSOwnedKey)
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.encryptionUseAWSOwnedKey
+                        : true))}
+            kmsKeyID: >-
+              ${schema.spec.encryptionKMSKeyID}
+
+          maintenanceWindowStartTime:
+            dayOfWeek: >-
+              ${schema.spec.maintenanceWindowDay}
+            timeOfDay: >-
+              ${schema.spec.maintenanceWindowTime}
+            timeZone: >-
+              ${schema.spec.maintenanceWindowTZ}
+
+          configuration:
+            id: >-
+              ${schema.spec.configurationID}
+            revision: >-
+              ${schema.spec.configurationRevision}
+
+          creatorRequestID: >-
+            ${schema.spec.creatorRequestID}
+
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})}
