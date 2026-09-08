@@ -1,0 +1,314 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: networkfirewallfirewall.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: NetworkFirewallFirewall
+    scope: Namespaced
+    spec:
+      # VPC — provide vpcId (direct) or vpcRef (kropath VPC resource name)
+      vpcId: string | default=""
+      vpcRef: string | default=""
+      # Subnet mappings (required)
+      subnetMappings: "[]SubnetMapping | required=true"
+      # Firewall policy — provide firewallPolicyArn (direct) or firewallPolicyRef (kropath policy name)
+      firewallPolicyArn: string | default=""
+      firewallPolicyRef: string | default=""
+      # Protection booleans — no default (tri-state; built-in default applied in cascade)
+      deleteProtection: boolean
+      firewallPolicyChangeProtection: boolean
+      subnetChangeProtection: boolean
+      # Logging destinations (each optional; governance cascade applies)
+      alertLogDestination: LogDestination
+      flowLogDestination: LogDestination
+      tlsLogDestination: LogDestination
+      # Standard governance
+      configRef: string | default="general-policy"
+      nameOverride: string | default=""
+      deletionPolicy: string | default="retain"
+      description: string | default=""
+      # Encryption governance
+      encryptionType: string | default=""
+      kmsKeyId: string | default=""
+      kmsKeyRef: string | default=""
+      # Tags and metadata
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      SubnetMapping:
+        subnetId: string | required=true
+        ipAddressType: string | default=""
+      LogDestination:
+        type: string | required=true
+        destination: map[string]string | required=true
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.resourceName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceName != "" && !naming.data.resourceName.contains("{") ? "arn:aws:network-firewall:" + rsrcCfg[0].status.effectiveConfig.aws.region + ":" + rsrcCfg[0].status.effectiveConfig.aws.accountId + ":firewall/" + naming.data.resourceName : ""}
+      firewallId: >-
+        ${ackFirewallRef.size() > 0 ? ackFirewallRef[0].?status.?firewallID.orValue("") : ""}
+      firewallArn: >-
+        ${ackFirewallRef.size() > 0 ? ackFirewallRef[0].?status.?firewallARN.orValue("") : ""}
+
+  resources:
+    # Config CR lookup
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: NetworkFirewallConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+        data:
+          resourceName: >-
+            ${
+              schema.?spec.?nameOverride.orValue("") != "" ? schema.spec.nameOverride :
+              rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "" ?
+                rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  .replace("{name}", schema.metadata.name)
+                  .replace("{namespace}", schema.metadata.namespace)
+                  .replace("{account_id}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "")
+                  .replace("{region}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "")
+                  .replace("{configRef}", schema.?spec.?configRef.orValue("general-policy")) :
+              rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "" ?
+                rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                  .replace("{name}", schema.metadata.name)
+                  .replace("{namespace}", schema.metadata.namespace)
+                  .replace("{account_id}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "")
+                  .replace("{region}", rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "")
+                  .replace("{configRef}", schema.?spec.?configRef.orValue("general-policy")) :
+              schema.metadata.name
+            }
+
+    # Always-bound self-lookup for status
+    - id: ackFirewallRef
+      externalRef:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: Firewall
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # Variant: Firewall without encryption
+    - id: ackFirewallNoEnc
+      includeWhen:
+        - "${schema.?spec.?encryptionType.orValue('') == '' && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue('') == '') && (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue('') == '')}"
+      template:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: Firewall
+        metadata:
+          name: ${naming.data.resourceName}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${
+              {"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+          annotations: >-
+            ${
+              {"services.k8s.aws/deletion-policy": schema.?spec.?deletionPolicy.orValue("retain")}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+        spec:
+          firewallName: ${naming.data.resourceName}
+          description: ${schema.?spec.?description.orValue("")}
+          vpcID: >-
+            ${schema.?spec.?vpcId.orValue("") != "" ? schema.spec.vpcId : schema.?spec.?vpcRef.orValue("")}
+          subnetMappings: >-
+            ${schema.spec.subnetMappings.map(sm, sm.?ipAddressType.orValue("") != "" ? {"subnetID": sm.subnetId, "ipAddressType": sm.ipAddressType} : {"subnetID": sm.subnetId})}
+          firewallPolicyARN: >-
+            ${
+              schema.?spec.?firewallPolicyRef.orValue("") != "" ?
+                "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":firewall-policy/" + schema.spec.firewallPolicyRef :
+                schema.?spec.?firewallPolicyArn.orValue("")
+            }
+          deleteProtection: >-
+            ${
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.deleteProtection) && rsrcCfg[0].status.effectiveConfig.mandatory.deleteProtection == true ? true :
+              has(schema.spec.deleteProtection) ? schema.spec.deleteProtection :
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.deleteProtection) ? rsrcCfg[0].status.effectiveConfig.defaults.deleteProtection :
+              true
+            }
+          firewallPolicyChangeProtection: >-
+            ${
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.firewallPolicyChangeProtection) && rsrcCfg[0].status.effectiveConfig.mandatory.firewallPolicyChangeProtection == true ? true :
+              has(schema.spec.firewallPolicyChangeProtection) ? schema.spec.firewallPolicyChangeProtection :
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.firewallPolicyChangeProtection) ? rsrcCfg[0].status.effectiveConfig.defaults.firewallPolicyChangeProtection :
+              true
+            }
+          subnetChangeProtection: >-
+            ${
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.subnetChangeProtection) && rsrcCfg[0].status.effectiveConfig.mandatory.subnetChangeProtection == true ? true :
+              has(schema.spec.subnetChangeProtection) ? schema.spec.subnetChangeProtection :
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.subnetChangeProtection) ? rsrcCfg[0].status.effectiveConfig.defaults.subnetChangeProtection :
+              true
+            }
+          loggingConfiguration:
+            logDestinationConfigs: >-
+              ${
+                [
+                  {"logType": "ALERT",
+                   "logDestinationType": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.type : has(schema.spec.alertLogDestination) ? schema.spec.alertLogDestination.type : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.type : ""),
+                   "logDestination": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.destination : has(schema.spec.alertLogDestination) ? schema.spec.alertLogDestination.destination : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.destination : {})},
+                  {"logType": "FLOW",
+                   "logDestinationType": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.type : has(schema.spec.flowLogDestination) ? schema.spec.flowLogDestination.type : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.type : ""),
+                   "logDestination": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.destination : has(schema.spec.flowLogDestination) ? schema.spec.flowLogDestination.destination : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.destination : {})},
+                  {"logType": "TLS",
+                   "logDestinationType": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.type : has(schema.spec.tlsLogDestination) ? schema.spec.tlsLogDestination.type : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.type : ""),
+                   "logDestination": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.destination : has(schema.spec.tlsLogDestination) ? schema.spec.tlsLogDestination.destination : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.destination : {})
+                  }
+                ].filter(x, x.logDestinationType != "")
+              }
+          tags: >-
+            ${
+              rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.?spec.?tags.orValue({}))
+                .merge(schema.?spec.?syncedLabels.orValue({}))
+                .merge(schema.?spec.?syncedAnnotations.orValue({}))
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+              : schema.?spec.?tags.orValue({}).transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+            }
+
+    # Variant: Firewall with encryption
+    - id: ackFirewallWithEnc
+      includeWhen:
+        - "${schema.?spec.?encryptionType.orValue('') != '' || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue('') != '') || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue('') != '')}"
+      template:
+        apiVersion: networkfirewall.services.k8s.aws/v1alpha1
+        kind: Firewall
+        metadata:
+          name: ${naming.data.resourceName}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${
+              {"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+          annotations: >-
+            ${
+              {"services.k8s.aws/deletion-policy": schema.?spec.?deletionPolicy.orValue("retain")}
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.?spec.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+            }
+        spec:
+          firewallName: ${naming.data.resourceName}
+          description: ${schema.?spec.?description.orValue("")}
+          vpcID: >-
+            ${schema.?spec.?vpcId.orValue("") != "" ? schema.spec.vpcId : schema.?spec.?vpcRef.orValue("")}
+          subnetMappings: >-
+            ${schema.spec.subnetMappings.map(sm, sm.?ipAddressType.orValue("") != "" ? {"subnetID": sm.subnetId, "ipAddressType": sm.ipAddressType} : {"subnetID": sm.subnetId})}
+          firewallPolicyARN: >-
+            ${
+              schema.?spec.?firewallPolicyRef.orValue("") != "" ?
+                "arn:aws:network-firewall:" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.region : "") + ":" + (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) ? rsrcCfg[0].status.effectiveConfig.aws.accountId : "") + ":firewall-policy/" + schema.spec.firewallPolicyRef :
+                schema.?spec.?firewallPolicyArn.orValue("")
+            }
+          deleteProtection: >-
+            ${
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.deleteProtection) && rsrcCfg[0].status.effectiveConfig.mandatory.deleteProtection == true ? true :
+              has(schema.spec.deleteProtection) ? schema.spec.deleteProtection :
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.deleteProtection) ? rsrcCfg[0].status.effectiveConfig.defaults.deleteProtection :
+              true
+            }
+          firewallPolicyChangeProtection: >-
+            ${
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.firewallPolicyChangeProtection) && rsrcCfg[0].status.effectiveConfig.mandatory.firewallPolicyChangeProtection == true ? true :
+              has(schema.spec.firewallPolicyChangeProtection) ? schema.spec.firewallPolicyChangeProtection :
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.firewallPolicyChangeProtection) ? rsrcCfg[0].status.effectiveConfig.defaults.firewallPolicyChangeProtection :
+              true
+            }
+          subnetChangeProtection: >-
+            ${
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.subnetChangeProtection) && rsrcCfg[0].status.effectiveConfig.mandatory.subnetChangeProtection == true ? true :
+              has(schema.spec.subnetChangeProtection) ? schema.spec.subnetChangeProtection :
+              rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.subnetChangeProtection) ? rsrcCfg[0].status.effectiveConfig.defaults.subnetChangeProtection :
+              true
+            }
+          encryptionConfiguration:
+            keyID: >-
+              ${schema.?spec.?kmsKeyId.orValue("")}
+            type_: >-
+              ${
+                rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?encryptionType.orValue("") != "" ?
+                  rsrcCfg[0].status.effectiveConfig.mandatory.encryptionType :
+                schema.?spec.?encryptionType.orValue("") != "" ?
+                  schema.spec.encryptionType :
+                rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?encryptionType.orValue("AWS_OWNED_KMS_KEY") : "AWS_OWNED_KMS_KEY"
+              }
+          loggingConfiguration:
+            logDestinationConfigs: >-
+              ${
+                [
+                  {"logType": "ALERT",
+                   "logDestinationType": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.type : has(schema.spec.alertLogDestination) ? schema.spec.alertLogDestination.type : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.type : ""),
+                   "logDestination": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.alertLogDestination.destination : has(schema.spec.alertLogDestination) ? schema.spec.alertLogDestination.destination : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.alertLogDestination.destination : {})},
+                  {"logType": "FLOW",
+                   "logDestinationType": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.type : has(schema.spec.flowLogDestination) ? schema.spec.flowLogDestination.type : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.type : ""),
+                   "logDestination": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.flowLogDestination.destination : has(schema.spec.flowLogDestination) ? schema.spec.flowLogDestination.destination : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.flowLogDestination.destination : {})},
+                  {"logType": "TLS",
+                   "logDestinationType": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.type : has(schema.spec.tlsLogDestination) ? schema.spec.tlsLogDestination.type : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.type : ""),
+                   "logDestination": (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.loggingDestination.tlsLogDestination.destination : has(schema.spec.tlsLogDestination) ? schema.spec.tlsLogDestination.destination : rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination) && has(rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination) && rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.type != "" ? rsrcCfg[0].status.effectiveConfig.defaults.loggingDestination.tlsLogDestination.destination : {})
+                  }
+                ].filter(x, x.logDestinationType != "")
+              }
+          tags: >-
+            ${
+              rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+                .merge(schema.?spec.?tags.orValue({}))
+                .merge(schema.?spec.?syncedLabels.orValue({}))
+                .merge(schema.?spec.?syncedAnnotations.orValue({}))
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+                .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+                .transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+              : schema.?spec.?tags.orValue({}).transformList(k, v, {"key": k, "value": v}).sortBy(x, x.key)
+            }
