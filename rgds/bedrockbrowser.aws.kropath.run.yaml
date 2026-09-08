@@ -1,0 +1,261 @@
+---
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Spec: kropath-core/docs/specs/aws/aws-bedrock-11-bedrockbrowser.md
+# CRD cache: kropath-core/docs/crd-cache/aws/bedrockagentcorecontrol-v1.14.0.md
+#
+# networkConfiguration is required. executionRoleArn and executionRoleRef are mutually
+# exclusive optional fields; a ConfigMap advisory fires when both are set.
+# All other optional fields (browserSigning, certificates, enterprisePolicies, recording)
+# are passed through as-is; kro omits empty-value fields from the ACK child.
+# predictedArn sourced from ACK status ARN (AWS-assigned browser ID, not effectiveName).
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: bedrockbrowser.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: BedrockBrowser
+    scope: Namespaced
+    spec:
+      configRef: string | default="general-policy"
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: "map[string]string | default={}"
+      syncedLabels: "map[string]string | default={}"
+      syncedAnnotations: "map[string]string | default={}"
+      # Required
+      networkConfiguration: BedrockBrowserNetworkConfiguration
+      # Optional — mutually exclusive; set only one
+      executionRoleArn: string | default=""
+      executionRoleRef: string | default=""
+      # Optional complex fields
+      description: string | default=""
+      browserSigning: "BedrockBrowserSigning | default={}"
+      certificates: "[]BedrockCertificate | default=[]"
+      enterprisePolicies: "[]BedrockEnterprisePolicy | default=[]"
+      recording: "BedrockRecording | default={}"
+    types:
+      BedrockBrowserNetworkConfiguration:
+        networkMode: string
+        vpcConfig: "BedrockVpcConfiguration | default={}"
+      BedrockVpcConfiguration:
+        securityGroups: "[]string | default=[]"
+        subnets: "[]string | default=[]"
+      BedrockBrowserSigning:
+        enabled: boolean
+      BedrockCertificate:
+        secretArn: string
+      BedrockEnterprisePolicy:
+        location: BedrockEnterprisePolicyLocation
+        type: string | default=""
+      BedrockEnterprisePolicyLocation:
+        s3: BedrockEnterprisePolicyS3
+      BedrockEnterprisePolicyS3:
+        bucket: string | default=""
+        prefix: string | default=""
+        versionID: string | default=""
+      BedrockRecording:
+        enabled: boolean
+        s3Location: "BedrockBrowserS3Location | default={}"
+      BedrockBrowserS3Location:
+        bucket: string | default=""
+        prefix: string | default=""
+        versionID: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${ackBrowserRef.size() > 0 ? ackBrowserRef[0].?status.?ackResourceMetadata.?arn.orValue("") : ""}
+      browserID: >-
+        ${ackBrowserRef.size() > 0 ? ackBrowserRef[0].?status.?id.orValue("") : ""}
+      browserArn: >-
+        ${ackBrowserRef.size() > 0 ? ackBrowserRef[0].?status.?ackResourceMetadata.?arn.orValue("") : ""}
+      conditions: >-
+        ${ackBrowserRef.size() > 0 ? ackBrowserRef[0].?status.?conditions.orValue([]) : []}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    # Config lookup.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: BedrockConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockBrowser
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # kropath IAMRole externalRef for executionRoleRef resolution. Sentinel prevents empty-string lookup.
+    - id: executionRoleRefCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: IAMRole
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.executionRoleRef != "" ? schema.spec.executionRoleRef : "kro-empty-fallback-sentinel"}'
+
+    # ConfigMap advisory: fires when both executionRoleArn AND executionRoleRef are set.
+    - id: mutualExclusionRoleError
+      includeWhen:
+        - '${schema.spec.executionRoleArn != "" && schema.spec.executionRoleRef != ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-role-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockBrowser
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "spec.executionRoleArn and spec.executionRoleRef are mutually exclusive; set only one."
+
+    # ACK Browser resource.
+    - id: ackBrowser
+      template:
+        apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+        kind: Browser
+        metadata:
+          name: ${naming.data.effectiveName}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockBrowser
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          networkConfiguration: ${schema.spec.networkConfiguration}
+          executionRoleARN: >-
+            ${schema.spec.executionRoleArn != "" ? schema.spec.executionRoleArn
+              : (executionRoleRefCr.size() > 0 ? executionRoleRefCr[0].?status.?predictedArn.orValue("") : "")}
+          description: ${schema.spec.?description.orValue("")}
+          browserSigning: ${schema.spec.browserSigning}
+          certificates: >-
+            ${schema.spec.certificates.transformList(i, c, {"location": {"secretsManager": {"secretARN": c.secretArn}}})}
+          enterprisePolicies: ${schema.spec.enterprisePolicies}
+          recording: ${schema.spec.recording}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+
+    # Always-bound self-lookup for ACK Browser child status.
+    - id: ackBrowserRef
+      externalRef:
+        apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+        kind: Browser
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
