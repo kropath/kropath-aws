@@ -14,8 +14,16 @@
 # limitations under the License.
 #
 # Prints the space-separated `make` targets (see tests/Makefile) needed to
-# cover the files changed between $BASE_SHA and $HEAD_SHA, so CI does not
-# run every resource family's full chainsaw suite on every change.
+# cover the files a change actually touches, so CI does not run every resource
+# family's full chainsaw suite on every change.
+#
+# Inputs (set by .github/workflows/rgd-tests.yaml):
+#   BASE_REF  pull_request only — the PR's target branch (e.g. "main"). The diff base
+#             is the MERGE-BASE of that branch with $HEAD_SHA, so the changed-file set
+#             is exactly what this PR contributes and nothing that landed on main
+#             after the branch forked.
+#   BASE_SHA  push only — the push's `before` commit. Ignored when BASE_REF is set.
+#   HEAD_SHA  the commit under test (defaults to HEAD).
 #
 # The service list is discovered from tests/Makefile's own `test-<service>:`
 # targets, and a changed rgds/*.yaml or crds/*.yaml file is matched to a
@@ -42,8 +50,47 @@ full_suite() {
   exit 0
 }
 
+BASE_REF="${BASE_REF:-}"
 BASE_SHA="${BASE_SHA:-}"
 HEAD_SHA="${HEAD_SHA:-HEAD}"
+
+# Resolve the commit to diff against.
+#
+# pull_request: BASE_REF is the target branch (e.g. "main"). The base must be the
+# MERGE-BASE of that branch with the PR head, not the branch tip and not the previous
+# push — i.e. `git diff base...HEAD` semantics. Two failure modes this avoids:
+#
+#   * Diffing against the branch TIP attributes commits that landed on main after this
+#     branch forked to this PR. An unrelated (or main-breaking) merge would then pull
+#     extra suites into this PR's run and report failures the PR did not cause.
+#   * Diffing against github.event.before covers only the LAST push, so a PR whose
+#     first push touched sagemaker and whose second push touched only iam goes green
+#     having never run the sagemaker suite against the final tree.
+#
+# push (main): BASE_REF is empty and BASE_SHA is the push's `before` commit, which is
+# already the correct delta for that event.
+if [ -n "${BASE_REF}" ]; then
+  base_tip=""
+  for cand in "refs/remotes/origin/${BASE_REF}" "refs/heads/${BASE_REF}"; do
+    if git rev-parse --verify --quiet "${cand}^{commit}" >/dev/null 2>&1; then
+      base_tip="${cand}"
+      break
+    fi
+  done
+  # Checkout didn't bring the target branch down (shallow clone, or a fetch refspec
+  # that only pulled the PR ref) — try once to fetch it before giving up.
+  if [ -z "${base_tip}" ]; then
+    if git fetch --quiet origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" 2>/dev/null &&
+      git rev-parse --verify --quiet "refs/remotes/origin/${BASE_REF}^{commit}" >/dev/null 2>&1; then
+      base_tip="refs/remotes/origin/${BASE_REF}"
+    fi
+  fi
+  if [ -z "${base_tip}" ]; then
+    # Can't locate the target branch — never guess.
+    full_suite
+  fi
+  BASE_SHA=$(git merge-base "${base_tip}" "${HEAD_SHA}" 2>/dev/null || true)
+fi
 
 # No usable base commit (first push to a branch, force-push, shallow history) — safest
 # is to run everything rather than guess.
@@ -51,6 +98,14 @@ if [ -z "${BASE_SHA}" ] || [ "${BASE_SHA}" = "0000000000000000000000000000000000
   full_suite
 fi
 if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+  full_suite
+fi
+# The base must be an ancestor of the head, or the diff is meaningless. After a
+# force-push, github.event.before names a discarded commit, and diffing against it
+# yields a REVERSE diff describing the work that was undone — nothing to do with what
+# the branch actually changes. A merge-base is an ancestor by construction, so this
+# only ever fires on the push path.
+if ! git merge-base --is-ancestor "${BASE_SHA}" "${HEAD_SHA}" 2>/dev/null; then
   full_suite
 fi
 

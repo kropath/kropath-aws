@@ -40,7 +40,9 @@ ACK_BARE_NAMES=(
   dbinstance
   dbsubnetgroup
   distribution
+  domain
   domainname
+  endpoint
   eventsourcemapping
   filesystem
   function
