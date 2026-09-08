@@ -1,0 +1,197 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ram-01 Chainsaw tests — one scenario per acceptance criterion.
+# Canonical pattern: unique resource name per step, skipDelete: true.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ramconfig
+spec:
+  skipDelete: true
+  namespace: ramconfig
+  steps:
+    # AC-1: happy-path: tier-symmetry
+    # Verify a RAMConfig with all 6 fields in both spec.mandatory and spec.defaults is accepted
+    # and stored correctly by the API server — confirming tier-symmetric schema.
+    - name: ac1-tier-symmetry
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 04-general-policy.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: general-policy-test
+                namespace: ramconfig
+              spec:
+                mandatory:
+                  allowedResourceTypes: []
+                  namingTemplate: ""
+                defaults:
+                  allowExternalPrincipals: false
+                  namingTemplate: "{namespace}-{name}"
+
+    # AC-2: negative: dual-tier-allowExternalPrincipals
+    # allowExternalPrincipals set in BOTH mandatory (false) and defaults (true) must be rejected.
+    - name: ac2-dual-tier-allowexternalprincipals-rejected
+      try:
+        - apply:
+            file: 01-invalid-dual-tier-allowexternalprincipals.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: RAMConfig
+                check:
+                  ($error != null): true
+
+    # AC-3: negative: dual-tier-allowedResourceTypes
+    # allowedResourceTypes non-empty in BOTH mandatory and defaults must be rejected.
+    - name: ac3-dual-tier-allowedresourcetypes-rejected
+      try:
+        - apply:
+            file: 02-invalid-dual-tier-allowedresourcetypes.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: RAMConfig
+                check:
+                  ($error != null): true
+
+    # AC-4: negative: dual-tier-namingTemplate
+    # namingTemplate non-empty in BOTH mandatory and defaults must be rejected.
+    - name: ac4-dual-tier-namingtemplate-rejected
+      try:
+        - apply:
+            file: 03-invalid-dual-tier-namingtemplate.yaml
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: RAMConfig
+                check:
+                  ($error != null): true
+
+    # AC-5: happy-path: effective-config-merge
+    # Simulate kropath-controller writing effectiveConfig: mandatory.allowExternalPrincipals=false
+    # (from KropathConfig.mandatory.ram) and defaults.allowExternalPrincipals=true (from this CR's defaults).
+    # Verifies the status schema accepts the controller-written values.
+    - name: ac5-effective-config-merge
+      try:
+        - apply:
+            file: 05-effective-config-merge.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: effective-config-merge-test
+                namespace: ramconfig
+        - script:
+            content: |
+              kubectl patch ramconfig effective-config-merge-test \
+                -n ramconfig \
+                --subresource status \
+                --type merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowExternalPrincipals":false,"allowedResourceTypes":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"allowExternalPrincipals":true,"allowedResourceTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"region":"us-east-1","accountId":"123456789012"}}}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: effective-config-merge-test
+                namespace: ramconfig
+              status:
+                effectiveConfig:
+                  mandatory:
+                    allowExternalPrincipals: false
+                  defaults:
+                    allowExternalPrincipals: true
+            timeout: 30s
+
+    # AC-6: happy-path: effective-config-tag-merge
+    # Simulate controller merging KropathConfig.mandatory.tags={cost-centre:shared-services} with
+    # RAMConfig.mandatory.tags={family:ram} into effectiveConfig.mandatory.tags.
+    - name: ac6-effective-config-tag-merge
+      try:
+        - apply:
+            file: 06-effective-config-tag-merge.yaml
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: effective-config-tag-merge-test
+                namespace: ramconfig
+        - script:
+            content: |
+              kubectl patch ramconfig effective-config-tag-merge-test \
+                -n ramconfig \
+                --subresource status \
+                --type merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedResourceTypes":[],"namingTemplate":"","tags":{"cost-centre":"shared-services","family":"ram"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"allowExternalPrincipals":false,"allowedResourceTypes":[],"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"region":"us-east-1","accountId":"123456789012"}}}}'
+        - script:
+            content: |
+              kubectl get ramconfig effective-config-tag-merge-test -n ramconfig \
+                -o jsonpath='{.status.effectiveConfig.mandatory.tags}' | \
+                grep -q '"cost-centre":"shared-services"' && \
+              kubectl get ramconfig effective-config-tag-merge-test -n ramconfig \
+                -o jsonpath='{.status.effectiveConfig.mandatory.tags}' | \
+                grep -q '"family":"ram"'
+            timeout: 30s
+
+    # AC-7: happy-path: label-selector-lookup
+    # RAMConfig carries metadata.labels.aws.kropath.run/resource-name enabling RGD externalRef
+    # selector.matchLabels lookup (Theme 28).
+    - name: ac7-label-selector-lookup
+      try:
+        - script:
+            content: |
+              set -eu
+              count=$(kubectl get ramconfig -n ramconfig \
+                -l aws.kropath.run/resource-name=general-policy-test \
+                -o json | jq '.items | length')
+              test "$count" -eq 1
+
+    # AC-8: happy-path: defaults-only-profile
+    # RAMConfig with only defaults fields set (mandatory all zero-value) is accepted without errors.
+    - name: ac8-defaults-only-profile
+      try:
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: general-policy-test
+                namespace: ramconfig
+              spec:
+                defaults:
+                  allowExternalPrincipals: false
+                  namingTemplate: "{namespace}-{name}"
+
+    # AC-9: happy-path: standard-labels
+    # Any RAMConfig CR carries the app.kubernetes.io/managed-by label.
+    - name: ac9-standard-labels
+      try:
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: general-policy-test
+                namespace: ramconfig
+                labels:
+                  app.kubernetes.io/managed-by: kropath

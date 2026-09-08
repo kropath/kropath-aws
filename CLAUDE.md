@@ -105,6 +105,27 @@ All gotchas in the list above apply when authoring new resources, not just when 
 - **Fixed namespace in `spec.namespace`** — declare a fixed namespace in the chainsaw test's `spec.namespace` (e.g. `namespace: iamrole`) so resource names are predictable and `{namespace}-{name}` naming templates expand to known values. Never use `default` namespace for tests.
 - **Distinguish `metadata.name` from `spec.name` in asserts** — child K8s resources receive `metadata.name: ${schema.metadata.name}` (the CR's K8s name, unaffected by naming templates) and `spec.name: ${effectiveName}` (the cloud resource name, controlled by naming templates). Asserts on labels, annotations, and ownerReferences use `metadata.name`; asserts on the cloud resource name use `spec.name`.
 
+**Wiring a brand-new service into CI — all four pieces in the SAME PR:**
+
+Omitting the `test-<service>:` target does not run *zero* tests, it runs **every** test:
+`tests/select-tests.sh` maps a changed `tests/<svc>/` path to a service by grepping `tests/Makefile`
+for `^test-<service>:`, and an unmatched `<svc>` takes its deliberate "don't guess" branch to the
+full suite. The tell is a CI run that is `CANCELLED` (not failed) with an **empty**
+`gh run view <id> --log-failed` — nothing failed; the job was still grinding through all 53 suites.
+
+1. `tests/<service>/<kind>/` suite.
+2. `rgds/`/`crds/` file(s) **prefixed with the service name** — longest-prefix match, e.g.
+   `ramconfig` → `ram`, `dynamodbtable` → `dynamodb`.
+3. `test-<service>:` target in `tests/Makefile` **and** its `.PHONY` entry. Never collapse these
+   into a `test-%:` pattern rule — that silently breaks the grep.
+4. `tests/fixtures/crds/<service>/` stubs, if the family needs ACK CRDs.
+
+Verify without a cluster (~1s): `cd tests && ./select-tests-test.sh`. Note the wiring PR itself
+always prints a bare `test` from `./select-tests.sh`, because `tests/Makefile` is in
+`SHARED_PATTERN` — that is correct, not a symptom; the target only pays off on follow-up PRs.
+Full writeup in `docs/frequent-rgd-errors.md` §8 "A New Service Suite With No `test-<service>:`
+Makefile Target Silently Escalates CI to the FULL Suite".
+
 ## Local test gate — mandatory before PR creation
 
 Before creating or updating a PR, the full Chainsaw test suite for the affected service MUST pass locally:

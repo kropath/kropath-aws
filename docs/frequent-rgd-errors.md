@@ -1522,7 +1522,7 @@ Real drift found in the CloudFront family (KRO-443), every instance of which blo
 
 * **To unblock:** When kro adds support for `optional.none()` in write position (or equivalent field-omission semantics), replace the multi-variant template approach with a single template using conditional field emission.
 
-## 8. Diagnosing RGD Failures — Two Traps in the Tooling Itself
+## 8. Diagnosing RGD Failures — Traps in the Tooling Itself
 
 ### `kubectl wait rgd --all --timeout=120s` Shares ONE Budget Across All RGDs
 
@@ -1545,6 +1545,59 @@ Real drift found in the CloudFront family (KRO-443), every instance of which blo
     ```
   In KRO-443 five RGDs were reported; only **two** (`cloudfrontdistribution`,
   `cloudfrontfunction`) were actually broken.
+
+### A New Service Suite With No `test-<service>:` Makefile Target Silently Escalates CI to the FULL Suite (KRO-1006)
+
+* **What You See:** A PR that adds one small suite produces a CI run that is not *failing* but
+  **`CANCELLED`**, typically after an hour or more, with **no `--log-failed` output at all**:
+    ```console
+    $ gh pr view <n> --json statusCheckRollup
+    "name": "Chainsaw E2E Tests", "conclusion": "CANCELLED",
+    "startedAt": "...T08:10:08Z", "completedAt": "...T10:02:51Z"
+    $ gh run view <id> --log-failed
+    (no output)
+    ```
+  The empty `--log-failed` is the tell: **nothing failed**. The job was still running the whole
+  repo's suites when it was killed. Do not go hunting for a broken assert — there isn't one.
+* **Why:** `tests/select-tests.sh` discovers the known services by grepping `tests/Makefile` for
+  `^test-<service>:` lines. A changed `tests/<svc>/...` path whose `<svc>` is not in that list hits
+  the script's deliberate **"don't guess"** branch and calls `full_suite`, because silently
+  *skipping* a suite is the worse failure. So forgetting the one-line Makefile target does not
+  produce "no tests ran" — it produces "**every** test ran". The `.PHONY` comment in
+  `tests/Makefile` says this outright, which is why the per-service targets must never be
+  collapsed into a `test-%:` pattern rule.
+* **Second-Order Cause:** Neither CI job declared `timeout-minutes`, so the job inherited GitHub's
+  **6-hour** default and burned runner time until a human cancelled it — destroying the run's logs
+  in the process. Both workflows now set `timeout-minutes: 60` on every job.
+* **What Works Instead:** When adding a resource family, land **all four** pieces in the same PR:
+    1. `tests/<service>/<kind>/` suite
+    2. `rgds/` and/or `crds/` file(s) **prefixed with the service name** (`find_service_for_basename`
+       does a longest-prefix match, e.g. `ramconfig` → `ram`, `dynamodbtable` → `dynamodb`)
+    3. a `test-<service>:` target in `tests/Makefile` **and** its `.PHONY` entry
+    4. `tests/fixtures/crds/<service>/` stubs, if the family needs ACK CRDs
+  Verify the wiring without a cluster — both take about a second:
+    ```bash
+    cd tests && ./select-tests-test.sh                    # 17 assertions over throwaway git repos
+    BASE_REF=main HEAD_SHA=HEAD ./select-tests.sh         # what CI will actually run
+    ```
+* **The Wiring PR Never Benefits From Its Own Target:** `tests/Makefile` is *itself* in
+  `SHARED_PATTERN`, so the moment you add the `test-<service>:` line, that PR escalates to the full
+  suite regardless. Expect `./select-tests.sh` to print a bare `test` on the wiring PR — that is
+  correct, not a symptom. To confirm the mapping really works, check it the way a **follow-up** PR
+  would see it: replay the change in a throwaway repo touching only `tests/<service>/` and
+  `crds|rgds/<service>*.yaml`, and assert it prints `test-<service>`. Verified for KRO-1006:
+  suite-only → `test-ram`; the same tree plus a `tests/Makefile` edit → `test`.
+* **A Full-Suite Run Is Not Always a Bug:** `SHARED_PATTERN` in `select-tests.sh` escalates *by
+  design* for genuinely cross-cutting paths — `crds/kropathconfig.yaml` (its `mandatory`/`defaults`
+  tiers feed every RGD's `effCfg` cascade), `crds/policy/`, `tests/fixtures/rbac/`,
+  `tests/fixtures/configs/`, `tests/fixtures/kind-config`, `tests/Makefile`, `tests/setup.sh`,
+  `hack/`, `.chainsaw.yaml`, `.github/workflows/`. A PR that adds a `<service>` block to
+  `KropathConfig` **will** run the full suite no matter how good its Makefile wiring is. Confirm
+  which case you are in before "fixing" it — and note this also means such a PR gets no CI-time
+  benefit from the changed-file selection, so budget for the long run.
+* **Related:** §6 "A Brand-New Suite Is Not Covered by Its Own PR's CI — Run It Locally (KRO-1058)",
+  and the `kubectl wait rgd --all` entry above — all three are cases where the CI *output* misleads
+  about which code is at fault.
 
 ### kro Re-Validates the Graph Only on Re-CREATE, Not on Re-Apply
 
