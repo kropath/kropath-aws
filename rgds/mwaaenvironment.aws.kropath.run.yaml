@@ -1,0 +1,714 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: mwaaenvironment.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: MWAAEnvironment
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Immutable after creation; ACK enforces server-side.
+      kmsKeyARN: string | default=""
+      dagS3Path: string
+      sourceBucketARN: string
+      executionRoleARN: string
+      networkConfiguration: "NetworkConfiguration"
+      # Instance-level fields; governed by MWAAConfig cascade.
+      # Immutable after creation: endpointManagement enforced by ACK.
+      endpointManagement: string | default=""
+      airflowVersion: string | default=""
+      environmentClass: string | default=""
+      webserverAccessMode: string | default=""
+      weeklyMaintenanceWindowStart: string | default=""
+      # 0 = fall through to MWAAConfig cascade.
+      maxWorkers: integer | default=0
+      minWorkers: integer | default=0
+      maxWebservers: integer | default=0
+      minWebservers: integer | default=0
+      schedulers: integer | default=0
+      airflowConfigurationOptions: map[string]string | default={}
+      loggingConfiguration: "LoggingConfiguration | default={}"
+      pluginsS3Path: string | default=""
+      pluginsS3ObjectVersion: string | default=""
+      requirementsS3Path: string | default=""
+      requirementsS3ObjectVersion: string | default=""
+      startupScriptS3Path: string | default=""
+      startupScriptS3ObjectVersion: string | default=""
+    types:
+      NetworkConfiguration:
+        subnetIDs: "[]string"
+        securityGroupIDs: "[]string | default=[]"
+      LoggingConfiguration:
+        dagProcessingLogs: "LoggingComponent | default={}"
+        schedulerLogs: "LoggingComponent | default={}"
+        taskLogs: "LoggingComponent | default={}"
+        webserverLogs: "LoggingComponent | default={}"
+        workerLogs: "LoggingComponent | default={}"
+      LoggingComponent:
+        # Tri-state boolean: no default= so has() reliably detects absence.
+        enabled: boolean
+        logLevel: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens"
+          : (!naming.data.effectiveName.matches("^[a-zA-Z][a-zA-Z0-9-]{0,79}$") ? "invalid-format" : "valid")}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws)
+          && !naming.data.effectiveName.contains("{")
+          && naming.data.effectiveName.matches("^[a-zA-Z][a-zA-Z0-9-]{0,79}$")
+          ? "arn:aws:airflow:"
+            + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
+            + ":"
+            + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("")
+            + ":environment/"
+            + naming.data.effectiveName
+          : ""}
+      environmentArn: >-
+        ${ackEnvWithKms.?status.?ackResourceMetadata.?arn.orValue("")}
+      environmentArnNoKms: >-
+        ${ackEnvNoKms.?status.?ackResourceMetadata.?arn.orValue("")}
+      # kro cannot merge list types across mutually-exclusive resources; separate fields required.
+      conditions: >-
+        ${ackEnvWithKms.?status.?conditions.orValue([])}
+      noKmsConditions: >-
+        ${ackEnvNoKms.?status.?conditions.orValue([])}
+      vpcGateReady: >-
+        ${vpcGate.size() > 0 && vpcGate[0].data.?ready.orValue("") == "true"}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PredictedArn
+        type: string
+        jsonPath: .status.predictedArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: MWAAConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # Default template: mwaa-{namespace}-{name} (MWAA name must start with a letter).
+    # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MWAAEnvironment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "mwaa-{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # vpcGate: Always-initialized externalRef to the VPC endpoint gate ConfigMap.
+    # No includeWhen here — an Unbound Variable Freeze occurs when a variable used in another
+    # resource's includeWhen is itself guarded by includeWhen.
+    # For SERVICE mode, vpcGate.size() == 0 (no gate ConfigMap expected); the ACK variant
+    # includeWhen allows creation without gate: endpointMgmt != "CUSTOMER" short-circuits.
+    - id: vpcGate
+      externalRef:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/mwaa-endpoint-gate: ${naming.data.effectiveName}
+
+    # Advisory ConfigMap: fires when pluginsS3Path is set without pluginsS3ObjectVersion (AC-16).
+    # x-kubernetes-validations cannot be preserved by kro; this is the in-graph advisory pattern.
+    - id: pluginsCoRequirementError
+      includeWhen:
+        - ${schema.spec.pluginsS3Path != "" && schema.spec.pluginsS3ObjectVersion == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-plugins-co-requirement-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MWAAEnvironment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "pluginsS3ObjectVersion is required when pluginsS3Path is set"
+
+    # Advisory ConfigMap: fires when requirementsS3Path is set without requirementsS3ObjectVersion (AC-17).
+    - id: requirementsCoRequirementError
+      includeWhen:
+        - ${schema.spec.requirementsS3Path != "" && schema.spec.requirementsS3ObjectVersion == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-requirements-co-requirement-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MWAAEnvironment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "requirementsS3ObjectVersion is required when requirementsS3Path is set"
+
+    # Advisory ConfigMap: fires when startupScriptS3Path is set without startupScriptS3ObjectVersion (AC-22/23).
+    - id: startupScriptCoRequirementError
+      includeWhen:
+        - ${schema.spec.startupScriptS3Path != "" && schema.spec.startupScriptS3ObjectVersion == ""}
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-startup-script-co-requirement-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MWAAEnvironment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "startupScriptS3ObjectVersion is required when startupScriptS3Path is set"
+
+    # ACK MWAA Environment — variant WITHOUT KMS encryption.
+    # Created when: naming valid, no co-requirement errors, effective kmsKeyARN is empty,
+    # and (SERVICE mode OR VPC endpoint gate ready).
+    # includeWhen uses inlined effectiveName CEL (KRO-919): reads only schema.spec and resolved
+    # config tiers — never a sibling node. Tag-token substitution is intentionally omitted; any
+    # unresolved {tag.X} tokens cause the name to fail the .matches() check and block creation.
+    - id: ackEnvNoKms
+      includeWhen:
+        - >-
+          ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "mwaa-{namespace}-{name}"))
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))
+            .matches("^[a-zA-Z][a-zA-Z0-9-]{0,79}$"))
+            && !(schema.spec.pluginsS3Path != "" && schema.spec.pluginsS3ObjectVersion == "")
+            && !(schema.spec.requirementsS3Path != "" && schema.spec.requirementsS3ObjectVersion == "")
+            && !(schema.spec.startupScriptS3Path != "" && schema.spec.startupScriptS3ObjectVersion == "")
+            && (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyARN.orValue("") != ""
+                ? false
+                : (schema.spec.kmsKeyARN != ""
+                    ? false
+                    : (rsrcCfg.size() == 0 || rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyARN.orValue("") == "")))
+            && ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?endpointManagement.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointManagement
+                  : (schema.spec.endpointManagement != ""
+                      ? schema.spec.endpointManagement
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?endpointManagement.orValue("SERVICE") : "SERVICE")))
+                != "CUSTOMER"
+                || (vpcGate.size() > 0 && vpcGate[0].data.?ready.orValue("") == "true"))}
+      template:
+        apiVersion: mwaa.services.k8s.aws/v1alpha1
+        kind: Environment
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MWAAEnvironment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          dagS3Path: ${schema.spec.dagS3Path}
+          sourceBucketARN: ${schema.spec.sourceBucketARN}
+          executionRoleARN: ${schema.spec.executionRoleARN}
+          networkConfiguration:
+            subnetIDs: ${schema.spec.networkConfiguration.subnetIDs}
+            securityGroupIDs: ${schema.spec.networkConfiguration.securityGroupIDs}
+          airflowVersion: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?airflowVersion.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.airflowVersion
+              : (schema.spec.airflowVersion != ""
+                  ? schema.spec.airflowVersion
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?airflowVersion.orValue("") : ""))}
+          environmentClass: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?environmentClass.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.environmentClass
+              : (schema.spec.environmentClass != ""
+                  ? schema.spec.environmentClass
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?environmentClass.orValue("") : ""))}
+          endpointManagement: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?endpointManagement.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointManagement
+              : (schema.spec.endpointManagement != ""
+                  ? schema.spec.endpointManagement
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?endpointManagement.orValue("SERVICE") : "SERVICE"))}
+          loggingConfiguration:
+            dagProcessingLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.dagProcessingLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.dagProcessingLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.dagProcessingLogs.enabled)
+                      ? schema.spec.loggingConfiguration.dagProcessingLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.dagProcessingLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.dagProcessingLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?dagProcessingLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.dagProcessingLogsLevel
+                  : (schema.spec.loggingConfiguration.dagProcessingLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.dagProcessingLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?dagProcessingLogsLevel.orValue("INFO") : "INFO"))}
+            schedulerLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.schedulerLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.schedulerLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.schedulerLogs.enabled)
+                      ? schema.spec.loggingConfiguration.schedulerLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.schedulerLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.schedulerLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?schedulerLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.schedulerLogsLevel
+                  : (schema.spec.loggingConfiguration.schedulerLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.schedulerLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?schedulerLogsLevel.orValue("INFO") : "INFO"))}
+            taskLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.taskLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.taskLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.taskLogs.enabled)
+                      ? schema.spec.loggingConfiguration.taskLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.taskLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.taskLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?taskLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.taskLogsLevel
+                  : (schema.spec.loggingConfiguration.taskLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.taskLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?taskLogsLevel.orValue("INFO") : "INFO"))}
+            webserverLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.webserverLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.webserverLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.webserverLogs.enabled)
+                      ? schema.spec.loggingConfiguration.webserverLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.webserverLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.webserverLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?webserverLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.webserverLogsLevel
+                  : (schema.spec.loggingConfiguration.webserverLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.webserverLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?webserverLogsLevel.orValue("INFO") : "INFO"))}
+            workerLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.workerLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.workerLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.workerLogs.enabled)
+                      ? schema.spec.loggingConfiguration.workerLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.workerLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.workerLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?workerLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.workerLogsLevel
+                  : (schema.spec.loggingConfiguration.workerLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.workerLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?workerLogsLevel.orValue("INFO") : "INFO"))}
+          maxWorkers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxWorkers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxWorkers
+              : (schema.spec.maxWorkers != 0
+                  ? schema.spec.maxWorkers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?maxWorkers.orValue(10) : 10))}
+          minWorkers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?minWorkers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.minWorkers
+              : (schema.spec.minWorkers != 0
+                  ? schema.spec.minWorkers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?minWorkers.orValue(1) : 1))}
+          maxWebservers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxWebservers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxWebservers
+              : (schema.spec.maxWebservers != 0
+                  ? schema.spec.maxWebservers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?maxWebservers.orValue(2) : 2))}
+          minWebservers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?minWebservers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.minWebservers
+              : (schema.spec.minWebservers != 0
+                  ? schema.spec.minWebservers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?minWebservers.orValue(2) : 2))}
+          schedulers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?schedulers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.schedulers
+              : (schema.spec.schedulers != 0
+                  ? schema.spec.schedulers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?schedulers.orValue(2) : 2))}
+          webserverAccessMode: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?webserverAccessMode.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.webserverAccessMode
+              : (schema.spec.webserverAccessMode != ""
+                  ? schema.spec.webserverAccessMode
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?webserverAccessMode.orValue("PRIVATE_ONLY") : "PRIVATE_ONLY"))}
+          weeklyMaintenanceWindowStart: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?weeklyMaintenanceWindowStart.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.weeklyMaintenanceWindowStart
+              : (schema.spec.weeklyMaintenanceWindowStart != ""
+                  ? schema.spec.weeklyMaintenanceWindowStart
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?weeklyMaintenanceWindowStart.orValue("") : ""))}
+          airflowConfigurationOptions: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?airflowConfigurationOptions.orValue({}) : {})
+              .merge(schema.spec.airflowConfigurationOptions)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?airflowConfigurationOptions.orValue({}) : {})}
+          pluginsS3Path: ${schema.spec.pluginsS3Path}
+          pluginsS3ObjectVersion: ${schema.spec.pluginsS3ObjectVersion}
+          requirementsS3Path: ${schema.spec.requirementsS3Path}
+          requirementsS3ObjectVersion: ${schema.spec.requirementsS3ObjectVersion}
+          startupScriptS3Path: ${schema.spec.startupScriptS3Path}
+          startupScriptS3ObjectVersion: ${schema.spec.startupScriptS3ObjectVersion}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+
+    # ACK MWAA Environment — variant WITH KMS encryption.
+    # Created when: naming valid, no co-requirement errors, effective kmsKeyARN is non-empty,
+    # and (SERVICE mode OR VPC endpoint gate ready).
+    # kmsKey is immutable after creation; ACK enforces this server-side.
+    # includeWhen uses inlined effectiveName CEL (KRO-919): reads only schema.spec and resolved
+    # config tiers — never a sibling node. Tag-token substitution is intentionally omitted; any
+    # unresolved {tag.X} tokens cause the name to fail the .matches() check and block creation.
+    - id: ackEnvWithKms
+      includeWhen:
+        - >-
+          ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "mwaa-{namespace}-{name}"))
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))
+            .matches("^[a-zA-Z][a-zA-Z0-9-]{0,79}$"))
+            && !(schema.spec.pluginsS3Path != "" && schema.spec.pluginsS3ObjectVersion == "")
+            && !(schema.spec.requirementsS3Path != "" && schema.spec.requirementsS3ObjectVersion == "")
+            && !(schema.spec.startupScriptS3Path != "" && schema.spec.startupScriptS3ObjectVersion == "")
+            && (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyARN.orValue("") != ""
+                ? true
+                : (schema.spec.kmsKeyARN != ""
+                    ? true
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyARN.orValue("") != "")))
+            && ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?endpointManagement.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointManagement
+                  : (schema.spec.endpointManagement != ""
+                      ? schema.spec.endpointManagement
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?endpointManagement.orValue("SERVICE") : "SERVICE")))
+                != "CUSTOMER"
+                || (vpcGate.size() > 0 && vpcGate[0].data.?ready.orValue("") == "true"))}
+      template:
+        apiVersion: mwaa.services.k8s.aws/v1alpha1
+        kind: Environment
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: MWAAEnvironment
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          dagS3Path: ${schema.spec.dagS3Path}
+          sourceBucketARN: ${schema.spec.sourceBucketARN}
+          executionRoleARN: ${schema.spec.executionRoleARN}
+          networkConfiguration:
+            subnetIDs: ${schema.spec.networkConfiguration.subnetIDs}
+            securityGroupIDs: ${schema.spec.networkConfiguration.securityGroupIDs}
+          # kmsKey is the ACK field name; effectiveConfig stores it as kmsKeyARN.
+          kmsKey: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?kmsKeyARN.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.kmsKeyARN
+              : (schema.spec.kmsKeyARN != ""
+                  ? schema.spec.kmsKeyARN
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?kmsKeyARN.orValue("") : ""))}
+          airflowVersion: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?airflowVersion.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.airflowVersion
+              : (schema.spec.airflowVersion != ""
+                  ? schema.spec.airflowVersion
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?airflowVersion.orValue("") : ""))}
+          environmentClass: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?environmentClass.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.environmentClass
+              : (schema.spec.environmentClass != ""
+                  ? schema.spec.environmentClass
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?environmentClass.orValue("") : ""))}
+          endpointManagement: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?endpointManagement.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.endpointManagement
+              : (schema.spec.endpointManagement != ""
+                  ? schema.spec.endpointManagement
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?endpointManagement.orValue("SERVICE") : "SERVICE"))}
+          loggingConfiguration:
+            dagProcessingLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.dagProcessingLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.dagProcessingLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.dagProcessingLogs.enabled)
+                      ? schema.spec.loggingConfiguration.dagProcessingLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.dagProcessingLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.dagProcessingLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?dagProcessingLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.dagProcessingLogsLevel
+                  : (schema.spec.loggingConfiguration.dagProcessingLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.dagProcessingLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?dagProcessingLogsLevel.orValue("INFO") : "INFO"))}
+            schedulerLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.schedulerLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.schedulerLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.schedulerLogs.enabled)
+                      ? schema.spec.loggingConfiguration.schedulerLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.schedulerLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.schedulerLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?schedulerLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.schedulerLogsLevel
+                  : (schema.spec.loggingConfiguration.schedulerLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.schedulerLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?schedulerLogsLevel.orValue("INFO") : "INFO"))}
+            taskLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.taskLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.taskLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.taskLogs.enabled)
+                      ? schema.spec.loggingConfiguration.taskLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.taskLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.taskLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?taskLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.taskLogsLevel
+                  : (schema.spec.loggingConfiguration.taskLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.taskLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?taskLogsLevel.orValue("INFO") : "INFO"))}
+            webserverLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.webserverLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.webserverLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.webserverLogs.enabled)
+                      ? schema.spec.loggingConfiguration.webserverLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.webserverLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.webserverLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?webserverLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.webserverLogsLevel
+                  : (schema.spec.loggingConfiguration.webserverLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.webserverLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?webserverLogsLevel.orValue("INFO") : "INFO"))}
+            workerLogs:
+              enabled: >-
+                ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.workerLogsEnabled))
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.workerLogsEnabled
+                  : (has(schema.spec.loggingConfiguration.workerLogs.enabled)
+                      ? schema.spec.loggingConfiguration.workerLogs.enabled
+                      : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.workerLogsEnabled))
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.workerLogsEnabled
+                          : true))}
+              logLevel: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?workerLogsLevel.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.workerLogsLevel
+                  : (schema.spec.loggingConfiguration.workerLogs.logLevel != ""
+                      ? schema.spec.loggingConfiguration.workerLogs.logLevel
+                      : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?workerLogsLevel.orValue("INFO") : "INFO"))}
+          maxWorkers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxWorkers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxWorkers
+              : (schema.spec.maxWorkers != 0
+                  ? schema.spec.maxWorkers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?maxWorkers.orValue(10) : 10))}
+          minWorkers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?minWorkers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.minWorkers
+              : (schema.spec.minWorkers != 0
+                  ? schema.spec.minWorkers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?minWorkers.orValue(1) : 1))}
+          maxWebservers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?maxWebservers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.maxWebservers
+              : (schema.spec.maxWebservers != 0
+                  ? schema.spec.maxWebservers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?maxWebservers.orValue(2) : 2))}
+          minWebservers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?minWebservers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.minWebservers
+              : (schema.spec.minWebservers != 0
+                  ? schema.spec.minWebservers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?minWebservers.orValue(2) : 2))}
+          schedulers: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?schedulers.orValue(0) != 0
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.schedulers
+              : (schema.spec.schedulers != 0
+                  ? schema.spec.schedulers
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?schedulers.orValue(2) : 2))}
+          webserverAccessMode: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?webserverAccessMode.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.webserverAccessMode
+              : (schema.spec.webserverAccessMode != ""
+                  ? schema.spec.webserverAccessMode
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?webserverAccessMode.orValue("PRIVATE_ONLY") : "PRIVATE_ONLY"))}
+          weeklyMaintenanceWindowStart: >-
+            ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?weeklyMaintenanceWindowStart.orValue("") != ""
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.weeklyMaintenanceWindowStart
+              : (schema.spec.weeklyMaintenanceWindowStart != ""
+                  ? schema.spec.weeklyMaintenanceWindowStart
+                  : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?weeklyMaintenanceWindowStart.orValue("") : ""))}
+          airflowConfigurationOptions: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?airflowConfigurationOptions.orValue({}) : {})
+              .merge(schema.spec.airflowConfigurationOptions)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?airflowConfigurationOptions.orValue({}) : {})}
+          pluginsS3Path: ${schema.spec.pluginsS3Path}
+          pluginsS3ObjectVersion: ${schema.spec.pluginsS3ObjectVersion}
+          requirementsS3Path: ${schema.spec.requirementsS3Path}
+          requirementsS3ObjectVersion: ${schema.spec.requirementsS3ObjectVersion}
+          startupScriptS3Path: ${schema.spec.startupScriptS3Path}
+          startupScriptS3ObjectVersion: ${schema.spec.startupScriptS3ObjectVersion}
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
