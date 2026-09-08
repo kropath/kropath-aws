@@ -1,0 +1,444 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# BedrockPolicyEngine Chainsaw tests — spec: aws-bedrock-14.
+# Canonical pattern: skipDelete + unique resource name per step; no inter-step deletes.
+# Tags on ACK PolicyEngine are map[string]string; use jq for order-independent assertion.
+# ACK status.id requires live AWS controller — only assert resourceName/namingStatus/policyEngineID.
+# policyEngineID in status reads ackPolicyEngineRef[0].status.id, which is "" without ACK controller.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bedrockpolicyengine
+spec:
+  skipDelete: true
+  namespace: bedrockpolicyengine
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: BedrockPolicyEngine minimal creates ACK PolicyEngine with default naming.
+    - name: ac1-create-engine-minimal
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac1-cfg
+                namespace: bedrockpolicyengine
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac1-cfg -n bedrockpolicyengine \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac1-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac1-engine
+                namespace: bedrockpolicyengine
+              status:
+                resourceName: bedrockpolicyengine-ac1-engine
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac1-engine
+                namespace: bedrockpolicyengine
+              spec:
+                name: bedrockpolicyengine-ac1-engine
+
+    # AC-2: encryptionKeyArn wires directly to ACK PolicyEngine spec.encryptionKeyARN.
+    - name: ac2-create-engine-encrypted
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac2-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                encryptionKeyArn: "arn:aws:kms:ap-southeast-2:123456789012:key/test-key-ac2"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac2-engine
+                namespace: bedrockpolicyengine
+              spec:
+                encryptionKeyARN: "arn:aws:kms:ap-southeast-2:123456789012:key/test-key-ac2"
+
+    # AC-3: encryptionKeyRef resolves via KMSKey CR externalRef.
+    # NOTE: KMSKey.status.predictedArn is computed from ACK status (requires live controller).
+    # In local test cluster, kro overwrites any manually-patched predictedArn with "" on reconcile.
+    # We verify the ACK PolicyEngine CR is created and the externalRef wiring succeeds.
+    - name: ac3-create-engine-keyref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: ac3-kms-key
+                namespace: bedrockpolicyengine
+                labels:
+                  aws.kropath.run/resource-name: ac3-kms-key
+              spec:
+                configRef: ac1-cfg
+                enableKeyRotation: false
+        - script:
+            content: |
+              kubectl patch kmskey ac3-kms-key -n bedrockpolicyengine \
+                --subresource=status --type=merge \
+                -p '{"status":{"predictedArn":"arn:aws:kms:ap-southeast-2:123456789012:key/test-key-id-ac3"}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac3-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                encryptionKeyRef: ac3-kms-key
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac3-engine
+                namespace: bedrockpolicyengine
+              status:
+                resourceName: bedrockpolicyengine-ac3-engine
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac3-engine
+                namespace: bedrockpolicyengine
+
+    # AC-4+AC-5: Tags from spec and config defaults merged on ACK PolicyEngine spec.tags.
+    # Tags are map[string]string — use jq for order-independent key assertion.
+    - name: ac4-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac4-cfg
+                namespace: bedrockpolicyengine
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    env: test
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac4-cfg -n bedrockpolicyengine \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"env":"test"},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac4-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac4-cfg
+                tags:
+                  team: platform
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac4-engine
+                namespace: bedrockpolicyengine
+              status:
+                resourceName: bedrockpolicyengine-ac4-engine
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac4-engine
+                namespace: bedrockpolicyengine
+        - script:
+            content: |
+              ENGINE=$(kubectl get policyengine bedrockpolicyengine-ac4-engine -n bedrockpolicyengine -o json)
+              echo "$ENGINE" | jq -e '.spec.tags["env"] == "test"' || exit 1
+              echo "$ENGINE" | jq -e '.spec.tags["team"] == "platform"' || exit 1
+
+    # AC-6: Standard metadata — ownerReference set, deletion-policy annotation, managed-by label.
+    - name: ac5-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac5-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac5-engine
+                namespace: bedrockpolicyengine
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac5-engine
+
+    # AC-7+AC-8: deletionPolicy retain vs delete propagates to ACK annotation.
+    - name: ac6-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac6-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac6-engine
+                namespace: bedrockpolicyengine
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-9+AC-10+AC-11: Naming — default template, nameOverride, unresolved token.
+    - name: ac7-naming-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac7-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac7-engine
+                namespace: bedrockpolicyengine
+              status:
+                resourceName: bedrockpolicyengine-ac7-engine
+                namingStatus: valid
+
+    - name: ac8-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac7b-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                nameOverride: my-policy-engine-override
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac7b-engine
+                namespace: bedrockpolicyengine
+              status:
+                resourceName: my-policy-engine-override
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: my-policy-engine-override
+                namespace: bedrockpolicyengine
+              spec:
+                name: my-policy-engine-override
+
+    # AC-11: Naming template with unresolved tag token → namingStatus invalid-unresolved-tokens.
+    - name: ac9-naming-unresolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac7c-cfg
+                namespace: bedrockpolicyengine
+                labels:
+                  aws.kropath.run/resource-name: ac7c-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{tag.nonexistent}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac7c-cfg -n bedrockpolicyengine \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{tag.nonexistent}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac7c-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac7c-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac7c-engine
+                namespace: bedrockpolicyengine
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-12+AC-13: Immutability documentation — kro v0.9.2 discards x-kubernetes-validations.
+    # ACK PolicyEngine enforces encryptionKeyARN immutability at the controller level.
+    # We document the constraint by asserting the field is correctly wired (positive doc test).
+    - name: ac8-immutable-encryption-key-doc
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac8-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                encryptionKeyArn: "arn:aws:kms:ap-southeast-2:123456789012:key/immutable-key"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac8-engine
+                namespace: bedrockpolicyengine
+              spec:
+                encryptionKeyARN: "arn:aws:kms:ap-southeast-2:123456789012:key/immutable-key"
+
+    # AC-14: Mutual exclusivity — setting both encryptionKeyArn and encryptionKeyRef creates
+    # a ConfigMap advisory (kro v0.9.2 does not enforce via x-kubernetes-validations).
+    - name: ac9-mutual-exclusivity-key
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac9-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                encryptionKeyArn: "arn:aws:kms:ap-southeast-2:123456789012:key/key-a"
+                encryptionKeyRef: "some-kms-key"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac9-engine-key-exclusion-error
+                namespace: bedrockpolicyengine
+
+    # AC-15: description is mutable — update on existing engine.
+    - name: ac10-update-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac10-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                description: "initial description"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac10-engine
+                namespace: bedrockpolicyengine
+              spec:
+                description: "initial description"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac10-engine
+                namespace: bedrockpolicyengine
+              spec:
+                configRef: ac1-cfg
+                description: "updated description"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: PolicyEngine
+              metadata:
+                name: bedrockpolicyengine-ac10-engine
+                namespace: bedrockpolicyengine
+              spec:
+                description: "updated description"

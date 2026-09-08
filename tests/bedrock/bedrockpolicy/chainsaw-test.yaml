@@ -1,0 +1,463 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# BedrockPolicy Chainsaw tests — spec: aws-bedrock-15.
+# Canonical pattern: skipDelete + unique resource name per step; no inter-step deletes.
+#
+# IMPORTANT: ACK Policy CRD has NO spec.tags field. Tags are propagated to K8s metadata.labels
+# using the "aws.kropath.run/" prefix. Asserts check labels, NOT spec.tags.
+# policyEngineID resolves from policyEngineRef via BedrockPolicyEngine CR status.policyEngineID,
+# which is "" without a live ACK controller — assert ACK Policy CR is created only.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: bedrockpolicy
+spec:
+  skipDelete: true
+  namespace: bedrockpolicy
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: BedrockPolicy minimal create — required definition.cedar.statement.
+    - name: ac1-create-policy-minimal
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac1-cfg
+                namespace: bedrockpolicy
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac1-cfg -n bedrockpolicy \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac1-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac1-policy
+                namespace: bedrockpolicy
+              status:
+                resourceName: bedrockpolicy-ac1-policy
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac1-policy
+                namespace: bedrockpolicy
+              spec:
+                name: bedrockpolicy-ac1-policy
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+
+    # AC-2: BedrockPolicy full — all optional fields set.
+    - name: ac2-create-policy-full
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac2-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "forbid (principal, action, resource);"
+                policyEngineID: "engine-id-abc123"
+                description: "Full policy with all fields"
+                enforcementMode: ACTIVE
+                validationMode: "OFF"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac2-policy
+                namespace: bedrockpolicy
+              spec:
+                definition:
+                  cedar:
+                    statement: "forbid (principal, action, resource);"
+                description: "Full policy with all fields"
+                enforcementMode: ACTIVE
+                validationMode: "OFF"
+                policyEngineID: "engine-id-abc123"
+
+    # AC-3: policyEngineRef resolves to BedrockPolicyEngine CR status.policyEngineID.
+    # Without live ACK controller, status.policyEngineID is "". Verify ACK Policy is created.
+    - name: ac3-policy-engine-ref-resolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicyEngine
+              metadata:
+                name: ac3-engine
+                namespace: bedrockpolicy
+                labels:
+                  aws.kropath.run/resource-name: ac3-engine
+              spec:
+                configRef: ac1-cfg
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac3-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                policyEngineRef: ac3-engine
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac3-policy
+                namespace: bedrockpolicy
+              status:
+                resourceName: bedrockpolicy-ac3-policy
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac3-policy
+                namespace: bedrockpolicy
+
+    # AC-4+AC-5: Tags — Policy has NO ACK spec.tags field.
+    # Tags are propagated to K8s metadata.labels with "aws.kropath.run/" prefix on the ACK child.
+    - name: ac4-tags-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockConfig
+              metadata:
+                name: ac4-cfg
+                namespace: bedrockpolicy
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags:
+                    env: test
+        - script:
+            content: |
+              kubectl patch bedrockconfig ac4-cfg -n bedrockpolicy \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"","syncedAnnotations":{},"syncedLabels":{},"tags":{},"timeoutSeconds":0},"defaults":{"allowedModels":[],"foundationModel":"","guardrailIdentifier":"","guardrailVersion":"","idleSessionTTLInSeconds":0,"maxIterations":0,"maxTokens":0,"namingTemplate":"{namespace}-{name}","syncedAnnotations":{},"syncedLabels":{},"tags":{"env":"test"},"timeoutSeconds":0},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac4-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac4-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                tags:
+                  team: platform
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac4-policy
+                namespace: bedrockpolicy
+        - script:
+            content: |
+              # Policy tags propagate to K8s labels with aws.kropath.run/ prefix — not to spec.tags
+              POLICY_LABELS=$(kubectl get policy bedrockpolicy-ac4-policy -n bedrockpolicy -o jsonpath='{.metadata.labels}')
+              echo "$POLICY_LABELS" | jq -e '."aws.kropath.run/env" == "test"' || exit 1
+              echo "$POLICY_LABELS" | jq -e '."aws.kropath.run/team" == "platform"' || exit 1
+
+    # AC-6: Standard metadata — ownerReference, deletion-policy annotation, managed-by label.
+    - name: ac5-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac5-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac5-policy
+                namespace: bedrockpolicy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac5-policy
+
+    # AC-7+AC-8: deletionPolicy retain vs delete.
+    - name: ac6-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac6-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac6-policy
+                namespace: bedrockpolicy
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-9+AC-10: Naming — default template and nameOverride.
+    - name: ac7-naming-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac7-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac7-policy
+                namespace: bedrockpolicy
+              status:
+                resourceName: bedrockpolicy-ac7-policy
+                namingStatus: valid
+
+    - name: ac8-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac7b-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                nameOverride: my-policy-override
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac7b-policy
+                namespace: bedrockpolicy
+              status:
+                resourceName: my-policy-override
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: my-policy-override
+                namespace: bedrockpolicy
+              spec:
+                name: my-policy-override
+
+    # AC-11+AC-12: Immutability documentation — positive doc tests (kro v0.9.2 drops CEL validation).
+    # ACK Policy enforces policyEngineID immutability at the controller level.
+    - name: ac8-immutable-engine-id-doc
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac8-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                policyEngineID: "immutable-engine-id-xyz"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac8-policy
+                namespace: bedrockpolicy
+              spec:
+                policyEngineID: "immutable-engine-id-xyz"
+
+    # AC-13: Mutual exclusivity — policyEngineID and policyEngineRef both set → ConfigMap advisory.
+    - name: ac9-mutual-exclusivity-engine
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac9-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                policyEngineID: "engine-abc"
+                policyEngineRef: "my-engine"
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac9-policy-engine-exclusion-error
+                namespace: bedrockpolicy
+
+    # AC-14: definition field is required — positive doc test verifying correct wiring.
+    - name: ac10-required-definition
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac10-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal == User::\"alice\", action, resource);"
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac10-policy
+                namespace: bedrockpolicy
+              spec:
+                definition:
+                  cedar:
+                    statement: "permit (principal == User::\"alice\", action, resource);"
+
+    # AC-15+AC-16: Mutable fields — update enforcementMode and definition.
+    - name: ac11-update-enforcement-mode
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac11-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                enforcementMode: MONITOR
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac11-policy
+                namespace: bedrockpolicy
+              spec:
+                enforcementMode: MONITOR
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: BedrockPolicy
+              metadata:
+                name: ac11-policy
+                namespace: bedrockpolicy
+              spec:
+                configRef: ac1-cfg
+                definition:
+                  cedar:
+                    statement: "permit (principal, action, resource);"
+                enforcementMode: ACTIVE
+        - assert:
+            resource:
+              apiVersion: bedrockagentcorecontrol.services.k8s.aws/v1alpha1
+              kind: Policy
+              metadata:
+                name: bedrockpolicy-ac11-policy
+                namespace: bedrockpolicy
+              spec:
+                enforcementMode: ACTIVE
