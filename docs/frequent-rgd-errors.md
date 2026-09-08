@@ -1905,3 +1905,73 @@ common; the innocent RGD is a symptom, not the cause.
     mismatch until the resource reaches AWS.
 
 ---
+
+## 10. `has()` Is Always True on Object-Typed Schema Fields — and `null` Never Omits a Field
+
+*Discovered in KRO-1066 (NetworkFirewall). Two independent traps that compound: the first makes a
+presence check silently wrong, and the obvious fix for it walks straight into the second.*
+
+### 10.1 kro auto-defaults every object field, so `has()` can never be false
+
+kro emits `default: {}` for **every object-typed field** in the CRD it generates — you do **not**
+have to declare a default for this to happen. Kubernetes then materializes the field (recursively,
+including nested objects, `""` strings, `[]` lists and `{}` maps) on every instance, so
+`has(schema.spec.<objectField>)` is **unconditionally true**.
+
+This is the object analogue of the documented boolean `| default=false` trap, but strictly worse:
+with booleans you can avoid it by not declaring the default; here there is nothing to remove.
+
+* **Symptom:** an `includeWhen` gated on `has(schema.spec.foo)` never fires (or always fires), the
+  ACK child is silently never created, and the Chainsaw step fails with
+  `ASSERT ERROR / actual resource not found` after the full assert timeout. kro still reports
+  `Ready=True` / `AllResourcesReady`, so nothing looks broken from `kubectl get`.
+* **Confirm it in one command** — dump the *kro-generated* CRD (not the ACK one):
+    ```bash
+    kubectl get crd <plural>.aws.kropath.run -o json \
+      | jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.<field>
+            | {type, default}'
+    # {"type":"object","default":{}}   <-- has() will always be true
+    ```
+  Or just read a live instance: the field is present even though the manifest never set it.
+* **The one exception:** an object type whose fields are *all* `required=true` gets no default
+  (`"default": null`), so `has()` still answers honestly for it. Do not rely on this by accident —
+  adding one optional field to such a type silently flips the behaviour.
+* **What Works Instead:** decide presence on **leaf content**, never on key existence:
+    ```
+    ${schema.spec.ruleGroup.rulesSource.rulesString != ""
+       || schema.spec.ruleGroup.rulesSource.statefulRules.size() > 0
+       || has(schema.spec.ruleGroup.rulesSource.rulesSourceList)   # all-required type: has() is OK
+       || schema.spec.ruleGroup.ruleVariables.ipSets.size() > 0}
+    ```
+  Direct (non-optional) access is safe precisely *because* the defaults are guaranteed to be
+  materialized.
+
+### 10.2 A CEL `null` is rendered literally — it does not drop the key
+
+The instinctive fix — `${cond ? schema.spec.foo : null}` to "omit" the field — does not work. kro
+writes the null into the child object and the API server rejects it:
+
+```
+resource reconciliation failed: apply results contain errors:
+RuleGroup.networkfirewall.services.k8s.aws "x" is invalid: spec.ruleGroup:
+Invalid value: "null": spec.ruleGroup in body must be of type object: "null"
+```
+
+ACK CRDs type these fields as non-nullable objects, so **there is no CEL expression that omits a
+field** in kro v0.9.2.
+
+* **What Works Instead:** either pass the (defaulted, empty) object straight through when an empty
+  value is acceptable —
+    ```
+    ruleGroup: ${schema.spec.ruleGroup}
+    ```
+  — or, when the field genuinely must be absent, split the resource into `includeWhen` variants,
+  one with the field and one without. That is the same mechanism the RGDs already use to omit
+  `encryptionConfiguration`. Note that a variant split multiplies with any existing split
+  (ruleGroup/rules × encryption = 4 variants), so weigh it against passing an empty value.
+* **Watch for the dead-ternary smell:** `${has(schema.spec.<object>) ? schema.spec.<object> : null}`
+  is *always* dead code by §10.1 — the null branch is unreachable **and** invalid. It works only by
+  accident, and detonates the moment the type's fields all become required. Grep for `: null}` in
+  `rgds/` and rewrite each hit.
+
+---
