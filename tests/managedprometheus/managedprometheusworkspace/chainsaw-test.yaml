@@ -313,6 +313,17 @@ spec:
                 namespace: managedprometheusworkspace
                 labels:
                   aws.kropath.run/team: monitoring
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 10); do
+                kubectl get workspace ac6-ws -n managedprometheusworkspace -o json 2>/dev/null > /tmp/chainsaw-ac6-ws.json
+                VAL=$(jq -r '.spec.tags.team // empty' /tmp/chainsaw-ac6-ws.json)
+                [ "$VAL" = "monitoring" ] && echo "PASS: syncedLabel team also in spec.tags (dual-sync)" && exit 0
+                sleep 3
+              done
+              echo "FAIL: syncedLabel team not found in ACK Workspace spec.tags"
+              exit 1
 
     # AC-7: syncedAnnotations propagated to ACK Workspace K8s annotations with aws.kropath.run/ prefix.
     - name: ac7-synced-annotations-propagated
@@ -391,6 +402,44 @@ spec:
                 namespace: managedprometheusworkspace
                 annotations:
                   services.k8s.aws/deletion-policy: retain
+
+    # AC-8 (delete path): deletionPolicy=delete annotation applied to ACK Workspace.
+    - name: ac8b-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac8b-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac8b-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac8b-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac8b-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac8b-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac8b-ws
+                namespace: managedprometheusworkspace
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
 
     # AC-9: status.workspaceID exposed from ACK Workspace status.
     - name: ac9-status-workspace-id-exposed
@@ -488,4 +537,22 @@ spec:
                 sleep 2
               done
               echo "FAIL: workspaceStatus not propagated"
+              exit 1
+
+    # AC-10 (naming-exemption): ManagedPrometheusWorkspace schema must NOT expose nameOverride/resourceName/namingStatus.
+    - name: ac11-naming-exemption-schema-inspection
+      try:
+        - script:
+            timeout: 30s
+            content: |
+              CRD=managedprometheusworkspaces.aws.kropath.run
+              kubectl get crd "$CRD" -o json > /tmp/chainsaw-ws-crd.json
+              HAS_NAME_OVERRIDE=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | has("nameOverride")' /tmp/chainsaw-ws-crd.json)
+              HAS_RESOURCE_NAME=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("resourceName")' /tmp/chainsaw-ws-crd.json)
+              HAS_NAMING_STATUS=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("namingStatus")' /tmp/chainsaw-ws-crd.json)
+              if [ "$HAS_NAME_OVERRIDE" = "false" ] && [ "$HAS_RESOURCE_NAME" = "false" ] && [ "$HAS_NAMING_STATUS" = "false" ]; then
+                echo "PASS: naming-exemption fields absent from Workspace schema"
+                exit 0
+              fi
+              echo "FAIL: naming-exemption violated — nameOverride=$HAS_NAME_OVERRIDE resourceName=$HAS_RESOURCE_NAME namingStatus=$HAS_NAMING_STATUS"
               exit 1

@@ -671,3 +671,87 @@ spec:
               done
               echo "FAIL: statusCode not propagated"
               exit 1
+
+    # AC-7 (delete path): deletionPolicy=delete annotation on ACK LoggingConfiguration child.
+    - name: ac10b-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac10b-cfg
+                namespace: managedprometheusloggingconfiguration
+                labels:
+                  aws.kropath.run/resource-name: ac10b-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac10b-cfg -n managedprometheusloggingconfiguration \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac10b-ws
+                namespace: managedprometheusloggingconfiguration
+                labels:
+                  aws.kropath.run/resource-name: ac10b-ws
+              spec:
+                configRef: ac10b-cfg
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get workspace ac10b-ws -n managedprometheusloggingconfiguration 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac10b-ws -n managedprometheusloggingconfiguration \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac10b-lctest"}}'
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac10b-ws -n managedprometheusloggingconfiguration \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-ac10b-lctest" ] && break
+                sleep 2
+              done
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusLoggingConfiguration
+              metadata:
+                name: ac10b-lc
+                namespace: managedprometheusloggingconfiguration
+              spec:
+                configRef: ac10b-cfg
+                workspaceRef: ac10b-ws
+                logGroupARN: "arn:aws:logs:us-east-1:123456789012:log-group:test"
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: LoggingConfiguration
+              metadata:
+                name: ac10b-lc
+                namespace: managedprometheusloggingconfiguration
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-9 (naming-exemption): ManagedPrometheusLoggingConfiguration schema must NOT expose nameOverride/resourceName/namingStatus.
+    - name: ac12-naming-exemption-schema-inspection
+      try:
+        - script:
+            timeout: 30s
+            content: |
+              CRD=managedprometheusloggingconfigurations.aws.kropath.run
+              kubectl get crd "$CRD" -o json > /tmp/chainsaw-lc-crd.json
+              HAS_NAME_OVERRIDE=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | has("nameOverride")' /tmp/chainsaw-lc-crd.json)
+              HAS_RESOURCE_NAME=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("resourceName")' /tmp/chainsaw-lc-crd.json)
+              HAS_NAMING_STATUS=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("namingStatus")' /tmp/chainsaw-lc-crd.json)
+              if [ "$HAS_NAME_OVERRIDE" = "false" ] && [ "$HAS_RESOURCE_NAME" = "false" ] && [ "$HAS_NAMING_STATUS" = "false" ]; then
+                echo "PASS: naming-exemption fields absent from LoggingConfiguration schema"
+                exit 0
+              fi
+              echo "FAIL: naming-exemption violated — nameOverride=$HAS_NAME_OVERRIDE resourceName=$HAS_RESOURCE_NAME namingStatus=$HAS_NAMING_STATUS"
+              exit 1
