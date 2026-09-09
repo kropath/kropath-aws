@@ -1,0 +1,559 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step
+# deletes. ACK Workspace finalizers are never removed in the test cluster (no ACK controller),
+# so deletes would hang. The ephemeral cluster is discarded after the suite.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: managedprometheusworkspace
+spec:
+  skipDelete: true
+  namespace: managedprometheusworkspace
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: Default configRef="general-policy" resolves and ACK Workspace is created.
+    - name: ac1-default-configref-creates-workspace
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac1-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac1-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac1-ws
+                namespace: managedprometheusworkspace
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac1-ws
+                namespace: managedprometheusworkspace
+
+    # AC-2: Alias governance — mandatory.alias overrides instance spec.alias and defaults.alias.
+    - name: ac2-alias-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac2-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  alias: "mandatory-alias"
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac2-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"mandatory-alias","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"instance-alias","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac2-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac2-cfg
+                alias: "instance-alias"
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac2-ws
+                namespace: managedprometheusworkspace
+              spec:
+                alias: "mandatory-alias"
+
+    # AC-2b: Alias governance — instance spec.alias overrides defaults.alias when mandatory absent.
+    - name: ac2b-alias-instance-over-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac2b-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac2b-cfg
+              spec:
+                defaults:
+                  alias: "defaults-alias"
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac2b-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"defaults-alias","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac2b-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac2b-cfg
+                alias: "instance-alias"
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac2b-ws
+                namespace: managedprometheusworkspace
+              spec:
+                alias: "instance-alias"
+
+    # AC-3: Tags from defaults applied to ACK Workspace spec.tags (verified via script).
+    - name: ac3-defaults-tags-applied
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac3-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  tags:
+                    env: dev
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac3-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{"env":"dev"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac3-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac3-cfg
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 10); do
+                VAL=$(kubectl get workspace ac3-ws -n managedprometheusworkspace -o json 2>/dev/null | jq -r '.spec.tags.env // empty')
+                [ "$VAL" = "dev" ] && echo "PASS: env=dev" && exit 0
+                sleep 3
+              done
+              echo "FAIL: env tag not found"
+              exit 1
+
+    # AC-4: spec.tags override defaults.tags (last-writer-wins merge).
+    - name: ac4-spec-tags-override-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac4-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  tags:
+                    env: dev
+                    team: platform
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac4-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{"env":"dev","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac4-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac4-cfg
+                tags:
+                  env: prod
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 10); do
+                JSON=$(kubectl get workspace ac4-ws -n managedprometheusworkspace -o json 2>/dev/null)
+                ENV=$(echo "$JSON" | jq -r '.spec.tags.env // empty')
+                TEAM=$(echo "$JSON" | jq -r '.spec.tags.team // empty')
+                [ "$ENV" = "prod" ] && [ "$TEAM" = "platform" ] && echo "PASS" && exit 0
+                sleep 3
+              done
+              echo "FAIL: expected env=prod team=platform"
+              exit 1
+
+    # AC-5: mandatory.tags override spec.tags and defaults.tags.
+    - name: ac5-mandatory-tags-override-all
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac5-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  tags:
+                    cost-center: "1234"
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac5-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{"cost-center":"1234"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{"cost-center":"9999"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac5-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac5-cfg
+                tags:
+                  cost-center: "5678"
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 10); do
+                VAL=$(kubectl get workspace ac5-ws -n managedprometheusworkspace -o json 2>/dev/null | jq -r '.spec.tags["cost-center"] // empty')
+                [ "$VAL" = "1234" ] && echo "PASS: mandatory wins" && exit 0
+                sleep 3
+              done
+              echo "FAIL: mandatory tag not applied"
+              exit 1
+
+    # AC-6: syncedLabels propagated to ACK Workspace K8s labels with aws.kropath.run/ prefix.
+    - name: ac6-synced-labels-propagated
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac6-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    team: monitoring
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac6-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{"team":"monitoring"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac6-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac6-cfg
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac6-ws
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/team: monitoring
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 10); do
+                kubectl get workspace ac6-ws -n managedprometheusworkspace -o json 2>/dev/null > /tmp/chainsaw-ac6-ws.json
+                VAL=$(jq -r '.spec.tags.team // empty' /tmp/chainsaw-ac6-ws.json)
+                [ "$VAL" = "monitoring" ] && echo "PASS: syncedLabel team also in spec.tags (dual-sync)" && exit 0
+                sleep 3
+              done
+              echo "FAIL: syncedLabel team not found in ACK Workspace spec.tags"
+              exit 1
+
+    # AC-7: syncedAnnotations propagated to ACK Workspace K8s annotations with aws.kropath.run/ prefix.
+    - name: ac7-synced-annotations-propagated
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac7-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  syncedAnnotations:
+                    owner: "ops-team"
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac7-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"ops-team"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac7-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac7-cfg
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac7-ws
+                namespace: managedprometheusworkspace
+                annotations:
+                  aws.kropath.run/owner: "ops-team"
+
+    # AC-8: deletionPolicy=retain annotation applied to ACK Workspace (default behaviour).
+    - name: ac8-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac8-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac8-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac8-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac8-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac8-ws
+                namespace: managedprometheusworkspace
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-8 (delete path): deletionPolicy=delete annotation applied to ACK Workspace.
+    - name: ac8b-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac8b-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac8b-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac8b-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac8b-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac8b-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: Workspace
+              metadata:
+                name: ac8b-ws
+                namespace: managedprometheusworkspace
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-9: status.workspaceID exposed from ACK Workspace status.
+    - name: ac9-status-workspace-id-exposed
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac9-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac9-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac9-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac9-cfg
+        - script:
+            content: |
+              # Wait for ACK Workspace child to be created, then mock workspaceID
+              for i in $(seq 1 15); do
+                kubectl get workspace ac9-ws -n managedprometheusworkspace 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac9-ws -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-abc123xyz"}}'
+        - script:
+            timeout: 30s
+            content: |
+              # kro should propagate workspaceID to ManagedPrometheusWorkspace status
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac9-ws -n managedprometheusworkspace \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-abc123xyz" ] && echo "PASS: workspaceID propagated" && exit 0
+                sleep 2
+              done
+              echo "FAIL: workspaceID not propagated"
+              exit 1
+
+    # AC-10: status.workspaceStatus exposed from nested ACK status.status.statusCode.
+    - name: ac10-nested-workspace-status-exposed
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac10-cfg
+                namespace: managedprometheusworkspace
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac10-cfg -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac10-ws
+                namespace: managedprometheusworkspace
+              spec:
+                configRef: ac10-cfg
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get workspace ac10-ws -n managedprometheusworkspace 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac10-ws -n managedprometheusworkspace \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-xyz789","status":{"statusCode":"ACTIVE"}}}'
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac10-ws -n managedprometheusworkspace \
+                  -o jsonpath='{.status.workspaceStatus}' 2>/dev/null)
+                [ "$VAL" = "ACTIVE" ] && echo "PASS: workspaceStatus=ACTIVE" && exit 0
+                sleep 2
+              done
+              echo "FAIL: workspaceStatus not propagated"
+              exit 1
+
+    # AC-10 (naming-exemption): ManagedPrometheusWorkspace schema must NOT expose nameOverride/resourceName/predictedArn/namingStatus.
+    - name: ac11-naming-exemption-schema-inspection
+      try:
+        - script:
+            timeout: 30s
+            content: |
+              CRD=managedprometheusworkspaces.aws.kropath.run
+              kubectl get crd "$CRD" -o json > /tmp/chainsaw-ws-crd.json
+              HAS_NAME_OVERRIDE=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | has("nameOverride")' /tmp/chainsaw-ws-crd.json)
+              HAS_RESOURCE_NAME=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("resourceName")' /tmp/chainsaw-ws-crd.json)
+              HAS_PREDICTED_ARN=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("predictedArn")' /tmp/chainsaw-ws-crd.json)
+              HAS_NAMING_STATUS=$(jq '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("namingStatus")' /tmp/chainsaw-ws-crd.json)
+              if [ "$HAS_NAME_OVERRIDE" = "false" ] && [ "$HAS_RESOURCE_NAME" = "false" ] && [ "$HAS_PREDICTED_ARN" = "false" ] && [ "$HAS_NAMING_STATUS" = "false" ]; then
+                echo "PASS: naming-exemption fields absent from Workspace schema"
+                exit 0
+              fi
+              echo "FAIL: naming-exemption violated — nameOverride=$HAS_NAME_OVERRIDE resourceName=$HAS_RESOURCE_NAME predictedArn=$HAS_PREDICTED_ARN namingStatus=$HAS_NAMING_STATUS"
+              exit 1

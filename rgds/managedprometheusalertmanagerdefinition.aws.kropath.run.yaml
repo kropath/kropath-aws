@@ -1,0 +1,118 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Naming exemption (KRO-236): AlertManagerDefinition is a singleton per workspace;
+# no provider name field. effectiveName, nameOverride, resourceName, predictedArn,
+# namingStatus are all omitted.
+#
+# Tag exemption: upstream ACK AlertManagerDefinition CRD has no spec.tags field.
+# spec.tags is not present in this schema.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: managedprometheusalertmanagerdefinition.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: ManagedPrometheusAlertManagerDefinition
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # AlertManagerDefinition-specific: opaque YAML or JSON alert manager config.
+      # Not governed via effectiveConfig — workspace-specific blob.
+      # Empty string = no config provided; ACK CR is not created until non-empty.
+      configuration: string | default=""
+      # Reference to a ManagedPrometheusWorkspace CR (metadata.name in same namespace).
+      # Empty string = no workspace resolved; ACK CR is not created until non-empty.
+      workspaceRef: string | default=""
+    status:
+      statusCode: >-
+        ${ackAlertManagerDefinition.?status.?statusCode.orValue("")}
+      statusReason: >-
+        ${ackAlertManagerDefinition.?status.?statusReason.orValue("")}
+      conditions: >-
+        ${ackAlertManagerDefinition.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: StatusCode
+        type: string
+        jsonPath: .status.statusCode
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ManagedPrometheusConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Workspace lookup — read status.workspaceID from the referenced workspace CR.
+    # Convention: the ManagedPrometheusWorkspace CR must carry label
+    # aws.kropath.run/resource-name: <name> matching spec.workspaceRef.
+    # (Consistent with configRef lookup pattern.)
+    - id: workspace
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: ManagedPrometheusWorkspace
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?workspaceRef.orValue("")}
+
+    # ACK AlertManagerDefinition CR — only created when configuration and workspaceRef are non-empty
+    # and the workspace has been assigned a workspaceID.
+    - id: ackAlertManagerDefinition
+      includeWhen:
+        - >-
+          ${schema.spec.configuration != ""
+            && schema.spec.workspaceRef != ""
+            && workspace.size() > 0
+            && workspace[0].?status.?workspaceID.orValue("") != ""}
+      template:
+        apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+        kind: AlertManagerDefinition
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Opaque alert manager config — not governed; pass through instance value.
+          configuration: ${schema.spec.configuration}
+          # workspaceID resolved from referenced ManagedPrometheusWorkspace CR status.
+          workspaceID: ${workspace[0].status.workspaceID}
