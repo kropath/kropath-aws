@@ -1,0 +1,603 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Tag exemption: AlertManagerDefinition has no spec.tags (upstream ACK CRD has no tags field).
+# Naming exemption (KRO-236): no effectiveName/nameOverride (singleton per workspace).
+# Canonical pattern: unique name per step, skipDelete: true, no inter-step ACK deletes.
+#
+# Workspace lookup: dependent resources find ManagedPrometheusWorkspace via label
+# aws.kropath.run/resource-name matching spec.workspaceRef.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: managedprometheusalertmanagerdefinition
+spec:
+  skipDelete: true
+  namespace: managedprometheusalertmanagerdefinition
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: ACK AlertManagerDefinition NOT created when configuration is empty.
+    - name: ac1-no-cr-when-configuration-empty
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac1-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac1-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac1-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac1-ws
+              spec:
+                configRef: ac1-cfg
+        - script:
+            content: |
+              kubectl patch workspace ac1-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac1-test"}}' 2>/dev/null || true
+              # Patch ManagedPrometheusWorkspace status directly
+              kubectl patch managedprometheusworkspace ac1-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac1-test"}}' 2>/dev/null || true
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac1-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac1-cfg
+                workspaceRef: ac1-ws
+                # configuration is empty (default) — ACK child must NOT be created
+        - script:
+            timeout: 15s
+            content: |
+              sleep 5
+              COUNT=$(kubectl get alertmanagerdefinition ac1-amd -n managedprometheusalertmanagerdefinition 2>/dev/null | wc -l)
+              [ "$COUNT" -eq 0 ] && echo "PASS: ACK child not created" && exit 0
+              echo "FAIL: ACK child was created unexpectedly"
+              exit 1
+
+    # AC-2: ACK AlertManagerDefinition NOT created when workspaceRef is empty.
+    - name: ac2-no-cr-when-workspaceref-empty
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac2-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac2-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac2-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac2-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                # workspaceRef is empty (default) — ACK child must NOT be created
+        - script:
+            timeout: 15s
+            content: |
+              sleep 5
+              COUNT=$(kubectl get alertmanagerdefinition ac2-amd -n managedprometheusalertmanagerdefinition 2>/dev/null | wc -l)
+              [ "$COUNT" -eq 0 ] && echo "PASS: ACK child not created" && exit 0
+              echo "FAIL: ACK child was created unexpectedly"
+              exit 1
+
+    # AC-3: ACK AlertManagerDefinition NOT created when referenced workspace has no workspaceID.
+    - name: ac3-no-cr-when-workspace-has-no-id
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac3-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac3-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac3-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac3-ws
+              spec:
+                configRef: ac3-cfg
+            # No status.workspaceID patched — workspace has no ID yet
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac3-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac3-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                workspaceRef: ac3-ws
+        - script:
+            timeout: 15s
+            content: |
+              sleep 5
+              COUNT=$(kubectl get alertmanagerdefinition ac3-amd -n managedprometheusalertmanagerdefinition 2>/dev/null | wc -l)
+              [ "$COUNT" -eq 0 ] && echo "PASS: ACK child not created (no workspaceID)" && exit 0
+              echo "FAIL: ACK child created despite no workspaceID"
+              exit 1
+
+    # AC-4: ACK AlertManagerDefinition created with correct workspaceID and configuration.
+    - name: ac4-cr-created-with-workspace-id-and-config
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac4-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac4-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac4-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac4-ws
+              spec:
+                configRef: ac4-cfg
+        - script:
+            content: |
+              # Wait for ACK Workspace child, then mock workspaceID
+              for i in $(seq 1 15); do
+                kubectl get workspace ac4-ws -n managedprometheusalertmanagerdefinition 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac4-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac4-12345"}}'
+              # Propagate to ManagedPrometheusWorkspace status
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac4-ws -n managedprometheusalertmanagerdefinition \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-ac4-12345" ] && echo "workspaceID propagated" && break
+                sleep 2
+              done
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac4-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac4-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                workspaceRef: ac4-ws
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: AlertManagerDefinition
+              metadata:
+                name: ac4-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                workspaceID: "ws-ac4-12345"
+
+    # AC-5: Tag exemption — no spec.tags field in ManagedPrometheusAlertManagerDefinition schema.
+    - name: ac5-tag-exemption-no-tags-field
+      try:
+        - script:
+            content: |
+              # Verify schema has no .spec.tags by inspecting the CRD
+              FIELD=$(kubectl get crd managedprometheusalertmanagerdefinitions.aws.kropath.run \
+                -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.tags}' 2>/dev/null)
+              [ -z "$FIELD" ] && echo "PASS: no tags field in schema" && exit 0
+              echo "FAIL: tags field unexpectedly present"
+              exit 1
+
+    # AC-6: syncedLabels propagated to ACK child K8s labels with aws.kropath.run/ prefix.
+    - name: ac6-synced-labels-propagated
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac6-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    team: alerts
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac6-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{"team":"alerts"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac6-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac6-ws
+              spec:
+                configRef: ac6-cfg
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get workspace ac6-ws -n managedprometheusalertmanagerdefinition 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac6-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac6-test"}}'
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac6-ws -n managedprometheusalertmanagerdefinition \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-ac6-test" ] && break
+                sleep 2
+              done
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac6-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac6-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                workspaceRef: ac6-ws
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: AlertManagerDefinition
+              metadata:
+                name: ac6-amd
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/team: alerts
+
+    # AC-7: syncedAnnotations propagated to ACK child K8s annotations with aws.kropath.run/ prefix.
+    - name: ac7-synced-annotations-propagated
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac7-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  syncedAnnotations:
+                    owner: "alerting-team"
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac7-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"alerting-team"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac7-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac7-ws
+              spec:
+                configRef: ac7-cfg
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get workspace ac7-ws -n managedprometheusalertmanagerdefinition 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac7-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac7-test"}}'
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac7-ws -n managedprometheusalertmanagerdefinition \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-ac7-test" ] && break
+                sleep 2
+              done
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac7-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac7-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                workspaceRef: ac7-ws
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: AlertManagerDefinition
+              metadata:
+                name: ac7-amd
+                namespace: managedprometheusalertmanagerdefinition
+                annotations:
+                  aws.kropath.run/owner: "alerting-team"
+
+    # AC-8: deletionPolicy=retain annotation on ACK child.
+    - name: ac8-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac8-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac8-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac8-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac8-ws
+              spec:
+                configRef: ac8-cfg
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get workspace ac8-ws -n managedprometheusalertmanagerdefinition 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac8-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac8-test"}}'
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac8-ws -n managedprometheusalertmanagerdefinition \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-ac8-test" ] && break
+                sleep 2
+              done
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac8-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac8-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                workspaceRef: ac8-ws
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: AlertManagerDefinition
+              metadata:
+                name: ac8-amd
+                namespace: managedprometheusalertmanagerdefinition
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-9: status.statusCode exposed from flat ACK AlertManagerDefinition status.statusCode.
+    - name: ac9-flat-status-code-exposed
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac9-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac9-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac9-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac9-ws
+              spec:
+                configRef: ac9-cfg
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get workspace ac9-ws -n managedprometheusalertmanagerdefinition 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac9-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac9-test"}}'
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac9-ws -n managedprometheusalertmanagerdefinition \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-ac9-test" ] && break
+                sleep 2
+              done
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac9-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac9-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                workspaceRef: ac9-ws
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get alertmanagerdefinition ac9-amd -n managedprometheusalertmanagerdefinition 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch alertmanagerdefinition ac9-amd -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"statusCode":"ACTIVE"}}'
+        - script:
+            timeout: 30s
+            content: |
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusalertmanagerdefinition ac9-amd \
+                  -n managedprometheusalertmanagerdefinition \
+                  -o jsonpath='{.status.statusCode}' 2>/dev/null)
+                [ "$VAL" = "ACTIVE" ] && echo "PASS: statusCode=ACTIVE" && exit 0
+                sleep 2
+              done
+              echo "FAIL: statusCode not propagated"
+              exit 1
+
+    # AC-10: Workspace lookup uses aws.kropath.run/resource-name label convention.
+    - name: ac10-workspace-lookup-by-label
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusConfig
+              metadata:
+                name: ac10-cfg
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl patch managedprometheusconfig ac10-cfg -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"alias":"","logGroupARN":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusWorkspace
+              metadata:
+                name: ac10-ws
+                namespace: managedprometheusalertmanagerdefinition
+                labels:
+                  aws.kropath.run/resource-name: "my-workspace-ref"
+              spec:
+                configRef: ac10-cfg
+        - script:
+            content: |
+              for i in $(seq 1 15); do
+                kubectl get workspace ac10-ws -n managedprometheusalertmanagerdefinition 2>/dev/null && break
+                sleep 2
+              done
+              kubectl patch workspace ac10-ws -n managedprometheusalertmanagerdefinition \
+                --subresource=status --type=merge \
+                -p '{"status":{"workspaceID":"ws-ac10-test"}}'
+              for i in $(seq 1 15); do
+                VAL=$(kubectl get managedprometheusworkspace ac10-ws -n managedprometheusalertmanagerdefinition \
+                  -o jsonpath='{.status.workspaceID}' 2>/dev/null)
+                [ "$VAL" = "ws-ac10-test" ] && break
+                sleep 2
+              done
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ManagedPrometheusAlertManagerDefinition
+              metadata:
+                name: ac10-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                configRef: ac10-cfg
+                configuration: "route:\n  receiver: 'null'\nreceivers:\n  - name: 'null'"
+                # workspaceRef matches the label value, not the metadata.name
+                workspaceRef: "my-workspace-ref"
+        - assert:
+            resource:
+              apiVersion: prometheusservice.services.k8s.aws/v1alpha1
+              kind: AlertManagerDefinition
+              metadata:
+                name: ac10-amd
+                namespace: managedprometheusalertmanagerdefinition
+              spec:
+                workspaceID: "ws-ac10-test"
