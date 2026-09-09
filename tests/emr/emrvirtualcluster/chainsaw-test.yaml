@@ -1,0 +1,651 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern: unique resource name per step, skipDelete: true.
+# No inter-step deletes for ACK resources (no ACK controller → finalizer never cleared).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: emrvirtualcluster
+spec:
+  skipDelete: true
+  namespace: emrvirtualcluster
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: container provider ID and namespace map to ACK VirtualCluster spec
+    - name: ac1-container-provider-mapping
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac1-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac1-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac1-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac1-cfg
+                containerProviderID: my-eks-cluster
+                containerProviderNamespace: spark-jobs
+        - assert:
+            resource:
+              apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+              kind: VirtualCluster
+              metadata:
+                name: ac1-vc
+                namespace: emrvirtualcluster
+              spec:
+                name: emrvirtualcluster-ac1-vc
+                containerProvider:
+                  id: my-eks-cluster
+                  type_: EKS
+                  info:
+                    eksInfo:
+                      namespace: spark-jobs
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac1-vc
+                namespace: emrvirtualcluster
+              status:
+                resourceName: emrvirtualcluster-ac1-vc
+                namingStatus: valid
+
+    # AC-2: default naming template {namespace}-{name}
+    - name: ac2-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac2-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac2-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac2-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac2-cfg
+                containerProviderID: eks-cluster-a
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac2-vc
+                namespace: emrvirtualcluster
+              status:
+                resourceName: emrvirtualcluster-ac2-vc
+                namingStatus: valid
+
+    # AC-3: mandatory namingTemplate overrides defaults
+    - name: ac3-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac3-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "mandatory-{name}"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac3-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"mandatory-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac3-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac3-cfg
+                containerProviderID: eks-cluster-b
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac3-vc
+                namespace: emrvirtualcluster
+              status:
+                resourceName: mandatory-ac3-vc
+                namingStatus: valid
+
+    # AC-4: spec.nameOverride takes precedence over all config templates
+    - name: ac4-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac4-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac4-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac4-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac4-cfg
+                nameOverride: my-custom-vc-name
+                containerProviderID: eks-cluster-c
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac4-vc
+                namespace: emrvirtualcluster
+              status:
+                resourceName: my-custom-vc-name
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+              kind: VirtualCluster
+              metadata:
+                name: ac4-vc
+                namespace: emrvirtualcluster
+              spec:
+                name: my-custom-vc-name
+
+    # AC-5: unresolved {tag.X} token → namingStatus=invalid-unresolved-tokens, no ACK resource
+    - name: ac5-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac5-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{tag.missing-tag}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac5-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{tag.missing-tag}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac5-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac5-cfg
+                containerProviderID: eks-cluster-d
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac5-vc
+                namespace: emrvirtualcluster
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-6: tags merged mandatory > spec > defaults (last-writer-wins)
+    - name: ac6-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac6-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac6-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{"env":"prod","owner":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{"env":"dev","cost-center":"analytics"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac6-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac6-cfg
+                containerProviderID: eks-cluster-e
+                containerProviderNamespace: emr-ns
+                tags:
+                  team: data-eng
+        - script:
+            content: |
+              # mandatory.env=prod wins over defaults.env=dev; spec.team and defaults.cost-center merge in
+              kubectl get virtualclusters.emrcontainers.services.k8s.aws ac6-vc -n emrvirtualcluster -o json | \
+                python3 -c "
+              import json, sys
+              obj = json.load(sys.stdin)
+              tags = obj['spec']['tags']
+              assert tags.get('env') == 'prod', f'expected env=prod got {tags.get(\"env\")}'
+              assert tags.get('cost-center') == 'analytics', f'expected cost-center=analytics got {tags.get(\"cost-center\")}'
+              assert tags.get('team') == 'data-eng', f'expected team=data-eng got {tags.get(\"team\")}'
+              print('TAGS OK:', tags)
+              "
+
+    # AC-7: syncedLabels applied with aws.kropath.run/ prefix on K8s labels
+    - name: ac7-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac7-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac7-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{"app":"emr-prod"},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{"team":"platform"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac7-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac7-cfg
+                containerProviderID: eks-cluster-f
+                containerProviderNamespace: emr-ns
+                syncedLabels:
+                  department: engineering
+        - assert:
+            resource:
+              apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+              kind: VirtualCluster
+              metadata:
+                name: ac7-vc
+                namespace: emrvirtualcluster
+                labels:
+                  (contains(keys(@), 'aws.kropath.run/app')): true
+                  (contains(keys(@), 'aws.kropath.run/team')): true
+                  (contains(keys(@), 'aws.kropath.run/department')): true
+
+    # AC-8: syncedAnnotations applied with aws.kropath.run/ prefix on K8s annotations
+    - name: ac8-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac8-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac8-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-center":"fin"}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac8-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac8-cfg
+                containerProviderID: eks-cluster-g
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+              kind: VirtualCluster
+              metadata:
+                name: ac8-vc
+                namespace: emrvirtualcluster
+                annotations:
+                  (contains(keys(@), 'aws.kropath.run/cost-center')): true
+
+    # AC-9: spec.tags passed through to ACK VirtualCluster spec.tags (map passthrough)
+    - name: ac9-tags-map-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac9-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac9-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac9-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac9-cfg
+                containerProviderID: eks-cluster-h
+                containerProviderNamespace: emr-ns
+                tags:
+                  project: my-ml-project
+                  stage: prod
+        - script:
+            content: |
+              kubectl get virtualclusters.emrcontainers.services.k8s.aws ac9-vc -n emrvirtualcluster -o json | \
+                python3 -c "
+              import json, sys
+              obj = json.load(sys.stdin)
+              tags = obj['spec']['tags']
+              assert tags.get('project') == 'my-ml-project', f'project tag wrong: {tags}'
+              assert tags.get('stage') == 'prod', f'stage tag wrong: {tags}'
+              print('TAGS MAP PASSTHROUGH OK:', tags)
+              "
+
+    # AC-10: standard metadata — managed-by label, ownerRef
+    - name: ac10-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac10-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac10-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac10-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac10-cfg
+                containerProviderID: eks-cluster-i
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+              kind: VirtualCluster
+              metadata:
+                name: ac10-vc
+                namespace: emrvirtualcluster
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac10-vc
+
+    # AC-11: deletionPolicy: delete sets services.k8s.aws/deletion-policy=delete
+    - name: ac11-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac11-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac11-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac11-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac11-cfg
+                deletionPolicy: delete
+                containerProviderID: eks-cluster-j
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+              kind: VirtualCluster
+              metadata:
+                name: ac11-vc
+                namespace: emrvirtualcluster
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-12: deletionPolicy: retain sets services.k8s.aws/deletion-policy=retain (default)
+    - name: ac12-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac12-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac12-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac12-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac12-cfg
+                deletionPolicy: retain
+                containerProviderID: eks-cluster-k
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+              kind: VirtualCluster
+              metadata:
+                name: ac12-vc
+                namespace: emrvirtualcluster
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-13: configRef selects a named EMRConfig profile
+    - name: ac13-config-profile-selection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: ac13-special-cfg
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: ac13-special-cfg
+              spec:
+                defaults:
+                  namingTemplate: "special-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig ac13-special-cfg -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"special-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac13-vc
+                namespace: emrvirtualcluster
+              spec:
+                configRef: ac13-special-cfg
+                containerProviderID: eks-cluster-l
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac13-vc
+                namespace: emrvirtualcluster
+              status:
+                resourceName: special-ac13-vc
+
+    # AC-14: no configRef → defaults to "general-policy" label selector
+    - name: ac14-config-default-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRConfig
+              metadata:
+                name: general-policy
+                namespace: emrvirtualcluster
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch emrconfig general-policy -n emrvirtualcluster \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","releaseLabel":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac14-vc
+                namespace: emrvirtualcluster
+              spec:
+                containerProviderID: eks-cluster-m
+                containerProviderNamespace: emr-ns
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: EMRVirtualCluster
+              metadata:
+                name: ac14-vc
+                namespace: emrvirtualcluster
+              status:
+                resourceName: emrvirtualcluster-ac14-vc
+                namingStatus: valid
