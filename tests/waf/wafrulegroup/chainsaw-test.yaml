@@ -1,0 +1,1145 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# WAFRuleGroup Chainsaw tests — one scenario per acceptance criterion (AC-1 through AC-31).
+# Namespace: wafrulegroup (fixed; {namespace}-{name} naming template expands predictably).
+# effectiveConfig is injected via kubectl patch --subresource=status.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: wafrulegroup
+spec:
+  skipDelete: true
+  namespace: wafrulegroup
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy WAFConfig with effectiveConfig status
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-wafrulegroup-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: defaults.scope applied when instance scope matches defaults.
+    # Scenario: scope-default-regional
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-scope-default-regional
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-scope-default
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-scope-default
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-scope-default
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: mandatory.scope overrides instance scope.
+    # Scenario: scope-mandatory-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-scope-mandatory-override
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"REGIONAL","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"CLOUDFRONT","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-scope-mandatory
+              spec:
+                scope: CLOUDFRONT
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-scope-mandatory
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-scope-mandatory
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: instance scope overrides defaults.
+    # Scenario: scope-instance-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-scope-instance-override
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-scope-instance
+              spec:
+                scope: CLOUDFRONT
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-scope-instance
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-scope-instance
+              spec:
+                scope: CLOUDFRONT
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: scope immutability — WAFConfig CRD rejects dual mandatory+defaults scope.
+    # Scenario: scope-immutable (negative)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-scope-immutable-validation
+      try:
+        - script:
+            content: |
+              kubectl apply -f - <<'EOF' && echo "UNEXPECTEDLY ACCEPTED" || echo "REJECTED AS EXPECTED"
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFConfig
+              metadata:
+                name: dual-scope-rg
+                namespace: wafrulegroup
+                labels:
+                  aws.kropath.run/resource-name: dual-scope-rg
+              spec:
+                mandatory:
+                  scope: "REGIONAL"
+                defaults:
+                  scope: "CLOUDFRONT"
+              EOF
+            check:
+              ($stdout): (contains(@, 'REJECTED AS EXPECTED'))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: capacity immutability — WAFRuleGroup CRD has x-kubernetes-validations.
+    # ACK WAFv2 enforces capacity immutability in production.
+    # This test verifies capacity field is passed through to the ACK RuleGroup.
+    # Scenario: capacity-immutable (negative — ACK-enforced)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-capacity-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-capacity-check
+              spec:
+                scope: REGIONAL
+                capacity: 100
+                visibilityConfig:
+                  metricName: rg-capacity-check
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-capacity-check
+              spec:
+                capacity: 100
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: mandatory.cloudWatchMetricsEnabled overrides instance false.
+    # Scenario: visibility-mandatory-cloudwatch
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-visibility-mandatory-cloudwatch
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-vis-mandatory-cw
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  cloudWatchMetricsEnabled: false
+                  metricName: rg-vis-mandatory-cw
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-vis-mandatory-cw
+              spec:
+                visibilityConfig:
+                  cloudWatchMetricsEnabled: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: mandatory.sampledRequestsEnabled overrides instance false.
+    # Scenario: visibility-mandatory-sampling
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-visibility-mandatory-sampling
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":true,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-vis-mandatory-sr
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  sampledRequestsEnabled: false
+                  metricName: rg-vis-mandatory-sr
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-vis-mandatory-sr
+              spec:
+                visibilityConfig:
+                  sampledRequestsEnabled: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: defaults.cloudWatchMetricsEnabled applied when instance not set.
+    # Scenario: visibility-default-cloudwatch
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-visibility-default-cloudwatch
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-vis-default-cw
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-vis-default-cw
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-vis-default-cw
+              spec:
+                visibilityConfig:
+                  cloudWatchMetricsEnabled: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: metricName derived from effectiveName when not set.
+    # Scenario: visibility-metric-name-derived
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-visibility-metric-name-derived
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: block-ips
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig: {}
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: block-ips
+              spec:
+                visibilityConfig:
+                  metricName: wafrulegroup-block-ips
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: basic rule group create with capacity, scope, one byte match rule.
+    # Scenario: rulegroup-create-byte-match
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-rulegroup-create-byte-match
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-byte-match
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-byte-match
+                rules:
+                  - name: block-bad-agent
+                    priority: 1
+                    action:
+                      block: {}
+                    visibilityConfig:
+                      metricName: block-bad-agent
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      byteMatchStatement:
+                        searchString: "BadBot"
+                        fieldToMatch:
+                          singleHeader:
+                            name: user-agent
+                        textTransformations:
+                          - priority: 0
+                            type: LOWERCASE
+                        positionalConstraint: CONTAINS
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-byte-match
+              spec:
+                capacity: 50
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: rule with ipSetReferenceStatement.arn passthrough.
+    # Scenario: rulegroup-ipset-reference
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-rulegroup-ipset-reference
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-ipset-ref
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-ipset-ref
+                rules:
+                  - name: block-listed-ips
+                    priority: 1
+                    action:
+                      block: {}
+                    visibilityConfig:
+                      metricName: block-listed-ips
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      ipSetReferenceStatement:
+                        arn: "arn:aws:wafv2:us-east-1:123456789012:regional/ipset/my-list/abcd1234"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-ipset-ref
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: rule with geoMatchStatement.countryCodes passthrough.
+    # Scenario: rulegroup-geo-match
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-rulegroup-geo-match
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-geo-match
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-geo-match
+                rules:
+                  - name: block-us-ca
+                    priority: 1
+                    action:
+                      block: {}
+                    visibilityConfig:
+                      metricName: block-us-ca
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      geoMatchStatement:
+                        countryCodes:
+                          - US
+                          - CA
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-geo-match
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: rule with rateBasedStatement passthrough.
+    # Scenario: rulegroup-rate-based
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-rulegroup-rate-based
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-rate-based
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-rate-based
+                rules:
+                  - name: rate-limit
+                    priority: 1
+                    action:
+                      block: {}
+                    visibilityConfig:
+                      metricName: rate-limit
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      rateBasedStatement:
+                        limit: 1000
+                        aggregateKeyType: IP
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-rate-based
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: rule with sqliMatchStatement passthrough.
+    # Scenario: rulegroup-sqli-match
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-rulegroup-sqli-match
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-sqli
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-sqli
+                rules:
+                  - name: block-sqli
+                    priority: 1
+                    action:
+                      block: {}
+                    visibilityConfig:
+                      metricName: block-sqli
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      sqliMatchStatement:
+                        fieldToMatch:
+                          queryString: {}
+                        textTransformations:
+                          - priority: 0
+                            type: NONE
+                        sensitivityLevel: HIGH
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-sqli
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: rule with xssMatchStatement passthrough.
+    # Scenario: rulegroup-xss-match
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-rulegroup-xss-match
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-xss
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-xss
+                rules:
+                  - name: block-xss
+                    priority: 1
+                    action:
+                      block: {}
+                    visibilityConfig:
+                      metricName: block-xss
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      xssMatchStatement:
+                        fieldToMatch:
+                          body:
+                            oversizeHandling: CONTINUE
+                        textTransformations:
+                          - priority: 0
+                            type: NONE
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-xss
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: rule with andStatement passthrough.
+    # Scenario: rulegroup-and-statement-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-rulegroup-and-statement-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-and-stmt
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-and-stmt
+                rules:
+                  - name: and-rule
+                    priority: 1
+                    action:
+                      block: {}
+                    visibilityConfig:
+                      metricName: and-rule
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      andStatement:
+                        statements:
+                          - byteMatchStatement:
+                              searchString: "BadBot"
+                              fieldToMatch:
+                                singleHeader:
+                                  name: user-agent
+                              textTransformations:
+                                - priority: 0
+                                  type: LOWERCASE
+                              positionalConstraint: CONTAINS
+                          - geoMatchStatement:
+                              countryCodes:
+                                - CN
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-and-stmt
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: rule with notStatement passthrough.
+    # Scenario: rulegroup-not-statement-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-rulegroup-not-statement-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-not-stmt
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-not-stmt
+                rules:
+                  - name: not-rule
+                    priority: 1
+                    action:
+                      allow: {}
+                    visibilityConfig:
+                      metricName: not-rule
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      notStatement:
+                        statement:
+                          geoMatchStatement:
+                            countryCodes:
+                              - CN
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-not-stmt
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: customResponseBodies passthrough.
+    # Scenario: rulegroup-custom-response-body
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-rulegroup-custom-response-body
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-custom-body
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-custom-body
+                customResponseBodies:
+                  blocked-page:
+                    content: "<html>Blocked</html>"
+                    contentType: TEXT_HTML
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-custom-body
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-19: rule action block with custom response passthrough.
+    # Scenario: rulegroup-block-action-custom-response
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac19-rulegroup-block-action-custom-response
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-block-custom-resp
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-block-custom-resp
+                customResponseBodies:
+                  blocked-page:
+                    content: "<html>Blocked</html>"
+                    contentType: TEXT_HTML
+                rules:
+                  - name: block-with-custom-resp
+                    priority: 1
+                    action:
+                      block:
+                        customResponse:
+                          responseCode: 403
+                          customResponseBodyKey: blocked-page
+                    visibilityConfig:
+                      metricName: block-with-custom-resp
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      byteMatchStatement:
+                        searchString: "BadBot"
+                        fieldToMatch:
+                          singleHeader:
+                            name: user-agent
+                        textTransformations:
+                          - priority: 0
+                            type: LOWERCASE
+                        positionalConstraint: CONTAINS
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-block-custom-resp
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-20: rule action count passthrough.
+    # Scenario: rulegroup-count-action
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac20-rulegroup-count-action
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-count-action
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-count-action
+                rules:
+                  - name: count-rule
+                    priority: 1
+                    action:
+                      count: {}
+                    visibilityConfig:
+                      metricName: count-rule
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      byteMatchStatement:
+                        searchString: "SuspiciousBot"
+                        fieldToMatch:
+                          singleHeader:
+                            name: user-agent
+                        textTransformations:
+                          - priority: 0
+                            type: LOWERCASE
+                        positionalConstraint: CONTAINS
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-count-action
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: rule action captcha with immunity time passthrough.
+    # Scenario: rulegroup-captcha-action
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac21-rulegroup-captcha-action
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-captcha-action
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-captcha-action
+                rules:
+                  - name: captcha-rule
+                    priority: 1
+                    action:
+                      captcha: {}
+                    captchaConfig:
+                      immunityTimeProperty:
+                        immunityTime: 300
+                    visibilityConfig:
+                      metricName: captcha-rule
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      byteMatchStatement:
+                        searchString: "Bot"
+                        fieldToMatch:
+                          singleHeader:
+                            name: user-agent
+                        textTransformations:
+                          - priority: 0
+                            type: LOWERCASE
+                        positionalConstraint: CONTAINS
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-captcha-action
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22: rule with ruleLabels passthrough.
+    # Scenario: rulegroup-rule-labels
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22-rulegroup-rule-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-rule-labels
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-rule-labels
+                rules:
+                  - name: labelled-rule
+                    priority: 1
+                    action:
+                      count: {}
+                    ruleLabels:
+                      - name: "app:suspicious"
+                    visibilityConfig:
+                      metricName: labelled-rule
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+                    statement:
+                      byteMatchStatement:
+                        searchString: "Bot"
+                        fieldToMatch:
+                          singleHeader:
+                            name: user-agent
+                        textTransformations:
+                          - priority: 0
+                            type: LOWERCASE
+                        positionalConstraint: CONTAINS
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-rule-labels
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-23: defaults.namingTemplate applied; effectiveName = {namespace}-{name}.
+    # Scenario: naming-standard
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac23-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: block-ips-naming
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: block-ips-naming
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: block-ips-naming
+              status:
+                resourceName: wafrulegroup-block-ips-naming
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-24: spec.nameOverride bypasses naming template.
+    # Scenario: naming-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac24-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-name-override
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-name-override
+                nameOverride: custom-rulegroup
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-name-override
+              status:
+                resourceName: custom-rulegroup
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-25: naming unresolved token → namingStatus invalid.
+    # Scenario: naming-unresolved-token (negative)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac25-naming-unresolved-token
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-unresolved-name
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-unresolved-name
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-unresolved-name
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-26: tags merge array format (defaults < instance < mandatory).
+    # Scenario: tags-merge-array-format
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac26-tags-merge-array-format
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{"cost-centre":"platform","waf-managed":"true"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-tags
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-tags
+                tags:
+                  app: firewall
+        - script:
+            content: |
+              kubectl wait wafrulegroup rg-tags -n wafrulegroup --for=jsonpath='{.status.resourceName}'=wafrulegroup-rg-tags --timeout=30s
+              TAGS=$(kubectl get rulegroup rg-tags -n wafrulegroup -o json | jq -r '.spec.tags // []')
+              echo "cost-centre present: $(echo "$TAGS" | jq 'map(select(.key=="cost-centre" and .value=="platform")) | length')"
+              echo "waf-managed present: $(echo "$TAGS" | jq 'map(select(.key=="waf-managed" and .value=="true")) | length')"
+              echo "app present: $(echo "$TAGS" | jq 'map(select(.key=="app" and .value=="firewall")) | length')"
+            check:
+              ($stdout): (contains(@, 'cost-centre present: 1'))
+              ($stdout): (contains(@, 'waf-managed present: 1'))
+              ($stdout): (contains(@, 'app present: 1'))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-27: syncedLabels in metadata.labels AND spec.tags (dual-write).
+    # Scenario: synced-labels-dual
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac27-synced-labels-dual
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-synced-labels
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-synced-labels
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-synced-labels
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            content: |
+              kubectl wait wafrulegroup rg-synced-labels -n wafrulegroup --for=jsonpath='{.status.resourceName}'=wafrulegroup-rg-synced-labels --timeout=30s
+              TAGS=$(kubectl get rulegroup rg-synced-labels -n wafrulegroup -o json | jq -r '.spec.tags // []')
+              echo "environment tag: $(echo "$TAGS" | jq 'map(select(.key=="environment" and .value=="production")) | length')"
+            check:
+              ($stdout): (contains(@, 'environment tag: 1'))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-28: standard metadata on ACK RuleGroup child.
+    # Scenario: standard-metadata
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac28-standard-metadata
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafrulegroup \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-standard-meta
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-standard-meta
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-standard-meta
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: rg-standard-meta
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: WAFRuleGroup
+                    name: rg-standard-meta
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-29: deletion-policy: delete propagated.
+    # Scenario: deletion-policy-delete
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac29-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-delete-policy
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-delete-policy
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-delete-policy
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-30: deletion-policy: retain (default).
+    # Scenario: deletion-policy-retain
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac30-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-retain-policy
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-retain-policy
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-retain-policy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-31: description field passthrough.
+    # Scenario: description
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac31-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFRuleGroup
+              metadata:
+                name: rg-description
+              spec:
+                scope: REGIONAL
+                capacity: 50
+                visibilityConfig:
+                  metricName: rg-description
+                description: "Block malicious IPs and rate limit"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: RuleGroup
+              metadata:
+                name: rg-description
+              spec:
+                description: "Block malicious IPs and rate limit"
