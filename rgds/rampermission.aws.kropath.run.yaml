@@ -1,0 +1,206 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ram-02 — RAMPermission (Atomic). Wraps ACK ram.services.k8s.aws/Permission.
+# A customer-managed RAM permission: a reusable policy template naming the actions a
+# principal may perform on shared resources of one resource type.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: rampermission.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: RAMPermission
+    scope: Namespaced
+    spec:
+      # ── Standard governance surface (ADR-015) ────────────────────────────
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # ── Permission properties ────────────────────────────────────────────
+      # policyTemplate: JSON string defining the permission policy template. Must include
+      # Effect: ALLOW and Action; may include Condition. Must NOT include Resource or
+      # Principal — RAM fills those in at share-association time. Passed to ACK verbatim.
+      policyTemplate: string | required=true
+      # resourceType: resource type this permission applies to, in <service>:<resourceType>
+      # form (e.g. "ec2:Subnet"). Case-insensitive. Passed to ACK verbatim.
+      resourceType: string | required=true
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      # RAM permission ARNs embed an AWS-assigned unique identifier, not the user-chosen
+      # name, so predictedArn cannot be constructed before creation (ADR-015 §9.4 carve-out).
+      # Both fields are populated post-creation from the ACK child's status; permissionArn
+      # is the canonical name and predictedArn mirrors it for cross-RGD ARN consistency.
+      predictedArn: >-
+        ${ackPermission.?status.?ackResourceMetadata.?arn.orValue("")}
+      permissionArn: >-
+        ${ackPermission.?status.?ackResourceMetadata.?arn.orValue("")}
+      permissionStatus: >-
+        ${ackPermission.?status.?status.orValue("")}
+      conditions: >-
+        ${ackPermission.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: PermissionArn
+        type: string
+        jsonPath: .status.permissionArn
+
+  resources:
+    # ── Governance config lookup (ADR-010 D-1, Theme 28) ─────────────────────
+    # selector.matchLabels — CEL in externalRef.metadata.name is never evaluated.
+    # Result is a list: always guard with rsrcCfg.size() > 0 before indexing.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: RAMConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ── Naming ConfigMap (status block cannot access schema.* directly) ───────
+    # Precedence per aws-ram-02/03 §Governance: mandatory.namingTemplate → instance
+    # nameOverride → defaults.namingTemplate → "{namespace}-{name}". Note this differs from
+    # older RGDs in this repo, where nameOverride is checked first; the RAM specs state
+    # explicitly that the mandatory tier outranks nameOverride, which is what a mandatory
+    # governance tier is for.
+    # Tag token resolution order: mandatory (wins) → spec → defaults → literal passthrough.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+              : (schema.spec.nameOverride != ""
+                  ? schema.spec.nameOverride
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (part.split("}")[0] in schema.spec.tags
+                              ? schema.spec.tags[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                      ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                          : "{tag." + part.split("}")[0] + "}"))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+
+    # ── ACK Permission CR ────────────────────────────────────────────────────
+    # Gated on naming validity — an unresolved {tag.X} token must not reach AWS.
+    - id: ackPermission
+      includeWhen:
+        - >-
+          ${!naming.data.effectiveName.contains("{")}
+      template:
+        apiVersion: ram.services.k8s.aws/v1alpha1
+        kind: Permission
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # ACK field: name (required, unique per Region, doc pattern ^[\w.-]*$)
+          name: ${naming.data.effectiveName}
+          policyTemplate: ${schema.spec.policyTemplate}
+          resourceType: ${schema.spec.resourceType}
+          # Cross-tier tag merge: defaults → spec → mandatory (last writer wins), then
+          # map→list transform. sortBy is REQUIRED: an unsorted transformList renders a
+          # different order each reconcile and kro never converges (frequent-rgd-errors §6.1).
+          tags: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)
+                ? rsrcCfg[0].status.effectiveConfig.defaults.tags
+                : {})
+              .merge(schema.spec.syncedAnnotations)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                : {})
+              .merge(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
