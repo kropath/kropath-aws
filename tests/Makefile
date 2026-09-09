@@ -26,7 +26,7 @@ CLUSTER_NAME ?= kropath-aws-test
 	test-lambda test-memorydb test-mq test-msk test-opensearch test-organizations test-pipes test-policy test-rds test-route53 test-s3 test-secretsmanager \
 	test-sagemaker test-ses test-sns test-sqs test-ssm test-stepfunctions test-waf \
 	test-networkfirewall test-mwaa test-ram \
-	test-managedprometheus
+	test-managedprometheus test-emr
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -221,3 +221,6 @@ test-backup:
 
 test-ram:
 	chainsaw test ram/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-emr:
+	chainsaw test emr/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
