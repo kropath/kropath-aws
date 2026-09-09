@@ -1,0 +1,656 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ram-02 Chainsaw tests — one scenario per acceptance criterion (12 ACs).
+#
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): every step creates a uniquely-named RAMConfig + RAMPermission and deletes
+# nothing between steps, so no ACK finalizer ever blocks a delete and kro's per-object-key
+# backoff never compounds.
+#
+# The spec's ACs name namespaces "networking-prod" / "platform-team"; the suite runs in the
+# fixed namespace "rampermission", so every expected cloud name is "rampermission-<step>".
+#
+# ACK spec.tags is a CEL .merge().transformList() product — asserted with jq scripts, never
+# positionally (docs/frequent-rgd-errors.md §6 "Flaky List/Array Asserts").
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: rampermission
+spec:
+  skipDelete: true
+  namespace: rampermission
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # ── AC-1: happy-path: defaults-create ──────────────────────────────────
+    # Given defaults.namingTemplate "{namespace}-{name}" and an instance carrying
+    # policyTemplate + resourceType, the ACK Permission is created with the templated name
+    # and both permission fields passed through verbatim.
+    - name: ac1-defaults-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac1-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac1-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac1-subnet-readonly
+                namespace: rampermission
+              spec:
+                configRef: ac1-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac1-subnet-readonly
+                namespace: rampermission
+              spec:
+                name: rampermission-ac1-subnet-readonly
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+            timeout: 90s
+
+    # ── AC-2: happy-path: name-override ────────────────────────────────────
+    - name: ac2-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac2-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac2-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac2-override
+                namespace: rampermission
+              spec:
+                configRef: ac2-cfg
+                nameOverride: custom-perm-name
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac2-override
+                namespace: rampermission
+              status:
+                resourceName: custom-perm-name
+                namingStatus: valid
+            timeout: 90s
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac2-override
+                namespace: rampermission
+              spec:
+                name: custom-perm-name
+            timeout: 90s
+
+    # ── AC-3: happy-path: mandatory-naming ─────────────────────────────────
+    # mandatory.namingTemplate outranks both spec.nameOverride and defaults.namingTemplate.
+    - name: ac3-mandatory-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac3-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  namingTemplate: 'corp-{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac3-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"corp-{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac3-subnet-readonly
+                namespace: rampermission
+              spec:
+                configRef: ac3-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac3-subnet-readonly
+                namespace: rampermission
+              spec:
+                name: corp-rampermission-ac3-subnet-readonly
+            timeout: 90s
+
+    # ── AC-4: happy-path: tag-merge ────────────────────────────────────────
+    # KropathConfig.mandatory.tags {cost-centre} and RAMConfig.mandatory.tags {family} are
+    # pre-merged into effectiveConfig.mandatory.tags by the controller; the instance adds
+    # {team}. Mandatory wins on key collision (here: cost-centre).
+    - name: ac4-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac4-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  tags:
+                    family: ram
+        - script:
+            content: |
+              kubectl patch ramconfig ac4-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{"cost-centre":"shared-services","family":"ram"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac4-tag-merge
+                namespace: rampermission
+              spec:
+                configRef: ac4-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+                tags:
+                  team: networking
+                  cost-centre: instance-value-must-lose
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac4-tag-merge
+                namespace: rampermission
+              spec:
+                name: rampermission-ac4-tag-merge
+            timeout: 90s
+        - script:
+            content: |
+              set -eu
+              TAGS=$(kubectl get permissions.ram.services.k8s.aws ac4-tag-merge -n rampermission -o json | jq -c '.spec.tags')
+              COUNT=$(echo "$TAGS" | jq 'length')
+              [ "$COUNT" -eq 3 ] || { echo "FAIL: expected 3 tags, got $COUNT: $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.key == "cost-centre" and .value == "shared-services")' >/dev/null || { echo "FAIL: mandatory cost-centre did not win: $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.key == "family" and .value == "ram")' >/dev/null || { echo "FAIL: missing family=ram: $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e 'any(.key == "team" and .value == "networking")' >/dev/null || { echo "FAIL: missing team=networking: $TAGS"; exit 1; }
+
+    # ── AC-5: happy-path: synced-labels ────────────────────────────────────
+    # A syncedLabel lands in BOTH metadata.labels (aws.kropath.run/-prefixed) and the cloud
+    # tag list (unprefixed) — ADR-015 §6.1.
+    - name: ac5-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac5-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    environment: production
+        - script:
+            content: |
+              kubectl patch ramconfig ac5-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac5-synced-labels
+                namespace: rampermission
+              spec:
+                configRef: ac5-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac5-synced-labels
+                namespace: rampermission
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac5-synced-labels
+                  aws.kropath.run/environment: production
+              spec:
+                name: rampermission-ac5-synced-labels
+            timeout: 90s
+        - script:
+            content: |
+              set -eu
+              TAGS=$(kubectl get permissions.ram.services.k8s.aws ac5-synced-labels -n rampermission -o json | jq -c '.spec.tags')
+              echo "$TAGS" | jq -e 'any(.key == "environment" and .value == "production")' >/dev/null || { echo "FAIL: syncedLabel not mirrored into cloud tags: $TAGS"; exit 1; }
+
+    # ── AC-6: happy-path: naming-valid ─────────────────────────────────────
+    - name: ac6-naming-valid
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac6-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac6-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac6-tgw-share-perm
+                namespace: rampermission
+              spec:
+                configRef: ac6-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:DescribeTransitGateways"]}'
+                resourceType: 'ec2:TransitGateway'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac6-tgw-share-perm
+                namespace: rampermission
+              status:
+                resourceName: rampermission-ac6-tgw-share-perm
+                namingStatus: valid
+            timeout: 90s
+
+    # ── AC-7: negative: naming-unresolved-token ────────────────────────────
+    # {tag.env} has no matching tag in any tier, so the token survives substitution: the
+    # instance reports invalid-unresolved-tokens and the ACK child is never created.
+    - name: ac7-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac7-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{tag.env}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac7-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{tag.env}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac7-unresolved
+                namespace: rampermission
+              spec:
+                configRef: ac7-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac7-unresolved
+                namespace: rampermission
+              status:
+                namingStatus: invalid-unresolved-tokens
+            timeout: 90s
+        - script:
+            content: |
+              set -eu
+              sleep 5
+              COUNT=$(kubectl get permissions.ram.services.k8s.aws ac7-unresolved -n rampermission \
+                --ignore-not-found --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              [ "$COUNT" = "0" ] || { echo "FAIL: child Permission must not exist when naming is invalid"; exit 1; }
+
+    # ── AC-8: happy-path: standard-metadata ────────────────────────────────
+    - name: ac8-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac8-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac8-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac8-standard-metadata
+                namespace: rampermission
+              spec:
+                configRef: ac8-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac8-standard-metadata
+                namespace: rampermission
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac8-standard-metadata
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: RAMPermission
+                    name: ac8-standard-metadata
+                    controller: true
+                    blockOwnerDeletion: true
+            timeout: 90s
+
+    # ── AC-9: happy-path: deletion-policy-delete ───────────────────────────
+    - name: ac9-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac9-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac9-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac9-deletion-delete
+                namespace: rampermission
+              spec:
+                configRef: ac9-cfg
+                deletionPolicy: delete
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac9-deletion-delete
+                namespace: rampermission
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+            timeout: 90s
+
+    # ── AC-10: happy-path: deletion-policy-retain (schema default) ─────────
+    - name: ac10-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac10-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac10-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac10-deletion-retain
+                namespace: rampermission
+              spec:
+                configRef: ac10-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac10-deletion-retain
+                namespace: rampermission
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+            timeout: 90s
+
+    # ── AC-11: happy-path: arn-exposure ────────────────────────────────────
+    # RAM permission ARNs carry an AWS-assigned id, so predictedArn cannot be constructed —
+    # it is populated post-creation from the ACK child. The test cluster runs no ACK
+    # controller, so the child's status is patched by hand to simulate reconciliation
+    # (docs/frequent-rgd-errors.md §"Simulating ACK Status: Patch the ACK CHILD"). All three
+    # ackResourceMetadata fields are required by the ACK CRD.
+    - name: ac11-arn-exposure
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac11-cfg
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: '{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac11-cfg -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac11-arn-exposure
+                namespace: rampermission
+              spec:
+                configRef: ac11-cfg
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac11-arn-exposure
+                namespace: rampermission
+            timeout: 90s
+        - script:
+            content: |
+              kubectl patch permissions.ram.services.k8s.aws ac11-arn-exposure -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:ram::123456789012:permission/ac11-abc-123","ownerAccountID":"123456789012","region":"ap-southeast-2"},"status":"ATTACHABLE"}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac11-arn-exposure
+                namespace: rampermission
+              status:
+                permissionArn: arn:aws:ram::123456789012:permission/ac11-abc-123
+                predictedArn: arn:aws:ram::123456789012:permission/ac11-abc-123
+                permissionStatus: ATTACHABLE
+            timeout: 90s
+
+    # ── AC-12: happy-path: configref-fallthrough ───────────────────────────
+    # Spec deviation, deliberate: ADR-015 §3.4 "unknown profile falls through to
+    # general-policy" is a kropath-controller behaviour. The RGD does ONE externalRef lookup
+    # (the repo-wide single-effCfg rule), so an unmatched selector simply yields an empty
+    # list. This step therefore asserts the two behaviours the RGD actually owns:
+    #   (a) omitting configRef resolves the "general-policy"-labelled RAMConfig;
+    #   (b) an unknown configRef does not stall the instance — it reconciles against the
+    #       RGD's built-in "{namespace}-{name}" fallback and still creates its child.
+    - name: ac12-configref-fallthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMConfig
+              metadata:
+                name: ac12-general-policy
+                namespace: rampermission
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+              spec:
+                defaults:
+                  namingTemplate: 'gp-{namespace}-{name}'
+        - script:
+            content: |
+              kubectl patch ramconfig ac12-general-policy -n rampermission \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"gp-{namespace}-{name}","allowedResourceTypes":[],"tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac12-default-ref
+                namespace: rampermission
+              spec:
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+              # spec.configRef omitted → defaults to "general-policy"
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac12-default-ref
+                namespace: rampermission
+              spec:
+                name: gp-rampermission-ac12-default-ref
+            timeout: 90s
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RAMPermission
+              metadata:
+                name: ac12-unknown-ref
+                namespace: rampermission
+              spec:
+                configRef: nonexistent-profile
+                policyTemplate: '{"Effect":"ALLOW","Action":["ec2:RunInstances"]}'
+                resourceType: 'ec2:Subnet'
+        - assert:
+            resource:
+              apiVersion: ram.services.k8s.aws/v1alpha1
+              kind: Permission
+              metadata:
+                name: ac12-unknown-ref
+                namespace: rampermission
+              spec:
+                name: rampermission-ac12-unknown-ref
+            timeout: 90s
