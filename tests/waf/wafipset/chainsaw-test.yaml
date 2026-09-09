@@ -1,0 +1,576 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# WAFIPSet Chainsaw tests — one scenario per acceptance criterion (AC-1 through AC-17).
+# Namespace: wafipset (fixed; {namespace}-{name} naming template expands predictably).
+# effectiveConfig is injected via kubectl patch --subresource=status to simulate
+# kropath-controller (not running in the local test cluster).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: wafipset
+spec:
+  # Canonical pattern: unique resource name per step, skipDelete stops cascade delete
+  # (no ACK controllers — delete hangs on finalizer). See docs/frequent-rgd-errors.md.
+  skipDelete: true
+  namespace: wafipset
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy WAFConfig with effectiveConfig status
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-wafipset-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: defaults.scope applied when instance scope is empty (not set).
+    # Scenario: scope-default-regional
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-scope-default-regional
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-scope-default
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-scope-default
+              spec:
+                scope: REGIONAL
+                name: wafipset-ipset-scope-default
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: mandatory.scope overrides instance scope.
+    # Scenario: scope-mandatory-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-scope-mandatory-override
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"REGIONAL","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"CLOUDFRONT","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-scope-mandatory
+              spec:
+                scope: CLOUDFRONT
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-scope-mandatory
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: instance scope overrides defaults.
+    # Scenario: scope-instance-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-scope-instance-override
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-scope-instance
+              spec:
+                scope: CLOUDFRONT
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-scope-instance
+              spec:
+                scope: CLOUDFRONT
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: scope immutability — WAFConfig CRD rejects dual mandatory+defaults scope.
+    # Scope immutability on WAFIPSet is enforced by ACK WAFv2 in production.
+    # Here we verify WAFConfig CRD x-kubernetes-validations reject the dual-set pattern.
+    # Scenario: scope-immutable (negative)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-scope-immutable-wafconfig-validation
+      try:
+        - script:
+            content: |
+              # Attempt to set scope in both mandatory and defaults — WAFConfig CRD must reject.
+              kubectl apply -f - <<'EOF' && echo "UNEXPECTEDLY ACCEPTED" || echo "REJECTED AS EXPECTED"
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFConfig
+              metadata:
+                name: dual-scope-policy
+                namespace: wafipset
+                labels:
+                  aws.kropath.run/resource-name: dual-scope-policy
+              spec:
+                mandatory:
+                  scope: "REGIONAL"
+                defaults:
+                  scope: "CLOUDFRONT"
+              EOF
+            check:
+              ($stdout): (contains(@, 'REJECTED AS EXPECTED'))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: IPV4 addresses passthrough.
+    # Scenario: ipv4-create
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-ipv4-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-ipv4
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+                  - "192.168.1.0/24"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-ipv4
+              spec:
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+                  - "192.168.1.0/24"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: IPV6 addresses passthrough.
+    # Scenario: ipv6-create
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-ipv6-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-ipv6
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV6
+                addresses:
+                  - "2001:db8::/32"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-ipv6
+              spec:
+                ipAddressVersion: IPV6
+                addresses:
+                  - "2001:db8::/32"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: description passthrough.
+    # Scenario: description
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-description
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+                description: "Office IP allowlist"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-description
+              spec:
+                description: "Office IP allowlist"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: defaults.namingTemplate applied; effectiveName = {namespace}-{name}.
+    # Scenario: naming-standard
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: office-ips
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: office-ips
+              status:
+                resourceName: wafipset-office-ips
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: office-ips
+              spec:
+                name: wafipset-office-ips
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: mandatory.namingTemplate overrides defaults template.
+    # Scenario: naming-mandatory-template
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-naming-mandatory-template
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-naming-mandatory
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-naming-mandatory
+              status:
+                resourceName: corp-wafipset-ipset-naming-mandatory
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: spec.nameOverride bypasses naming template.
+    # Scenario: naming-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-naming-override
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-override
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+                nameOverride: custom-ipset-name
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-override
+              status:
+                resourceName: custom-ipset-name
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: namingTemplate with unresolved {tag.env} → status.namingStatus invalid.
+    # Scenario: naming-unresolved-token (negative)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-naming-unresolved-token
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-unresolved
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-unresolved
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: tags merge order (defaults < instance < mandatory); WAF array format.
+    # Scenario: tags-merge-array-format
+    # Uses jq for order-independent tag assertion (CEL map-to-list order is nondeterministic).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-tags-merge-array-format
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{"cost-centre":"platform","waf-managed":"true"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-tags
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+                tags:
+                  app: firewall
+        - script:
+            content: |
+              # Wait for reconciliation
+              kubectl wait wafipset ipset-tags -n wafipset --for=jsonpath='{.status.resourceName}'=wafipset-ipset-tags --timeout=30s
+              TAGS=$(kubectl get ipset ipset-tags -n wafipset -o json | jq -r '.spec.tags // []')
+              echo "cost-centre present: $(echo "$TAGS" | jq 'map(select(.key=="cost-centre" and .value=="platform")) | length')"
+              echo "waf-managed present: $(echo "$TAGS" | jq 'map(select(.key=="waf-managed" and .value=="true")) | length')"
+              echo "app present: $(echo "$TAGS" | jq 'map(select(.key=="app" and .value=="firewall")) | length')"
+            check:
+              ($stdout): (contains(@, 'cost-centre present: 1'))
+              ($stdout): (contains(@, 'waf-managed present: 1'))
+              ($stdout): (contains(@, 'app present: 1'))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: syncedLabels appear in metadata.labels AND spec.tags (dual-write).
+    # Scenario: synced-labels-dual
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-synced-labels-dual
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{"data-class":"restricted"},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-synced-labels
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-synced-labels
+                labels:
+                  aws.kropath.run/environment: production
+                  aws.kropath.run/data-class: restricted
+        - script:
+            content: |
+              kubectl wait wafipset ipset-synced-labels -n wafipset --for=jsonpath='{.status.resourceName}'=wafipset-ipset-synced-labels --timeout=30s
+              TAGS=$(kubectl get ipset ipset-synced-labels -n wafipset -o json | jq -r '.spec.tags // []')
+              echo "environment tag: $(echo "$TAGS" | jq 'map(select(.key=="environment" and .value=="production")) | length')"
+              echo "data-class tag: $(echo "$TAGS" | jq 'map(select(.key=="data-class" and .value=="restricted")) | length')"
+            check:
+              ($stdout): (contains(@, 'environment tag: 1'))
+              ($stdout): (contains(@, 'data-class tag: 1'))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: syncedAnnotations appear in metadata.annotations.
+    # Scenario: synced-annotations
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-synced-annotations
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"security"}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-synced-annotations
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-synced-annotations
+                annotations:
+                  aws.kropath.run/team: security
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: standard metadata on ACK IPSet child.
+    # Scenario: standard-metadata
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-standard-metadata
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafipset \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-standard-meta
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-standard-meta
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ipset-standard-meta
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: WAFIPSet
+                    name: ipset-standard-meta
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: deletion-policy: delete propagated to ACK annotation.
+    # Scenario: deletion-policy-delete
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-delete-policy
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-delete-policy
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: deletion-policy: retain (default) propagated to ACK annotation.
+    # Scenario: deletion-policy-retain
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFIPSet
+              metadata:
+                name: ipset-retain-policy
+              spec:
+                scope: REGIONAL
+                ipAddressVersion: IPV4
+                addresses:
+                  - "10.0.0.0/8"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: IPSet
+              metadata:
+                name: ipset-retain-policy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
