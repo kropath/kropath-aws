@@ -55,6 +55,7 @@ ACK_BARE_NAMES=(
   metricstream
   mounttarget
   openidconnectprovider
+  packagegroup
   parametergroup
   pullthroughcacherule
   replicationgroup
