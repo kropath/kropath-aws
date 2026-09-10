@@ -67,6 +67,7 @@ ACK_BARE_NAMES=(
   rulegroup
   scalabletargets
   scalingpolicies
+  securitypolicies
   serverlesscache
   snapshot
   streams

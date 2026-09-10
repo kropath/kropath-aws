@@ -1,0 +1,608 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-os-04 Chainsaw tests — all 16 acceptance criteria for OpenSearchSecurityPolicy RGD (KRO-886).
+# Canonical pattern: spec.skipDelete: true, unique resource names per step, no inter-step ACK deletes.
+# AC-to-scenario map: posted on Multica issue 95d8beda-e85a-4751-8d41-388b183b4aee (Theme 19-2).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: opensearchsecuritypolicy
+spec:
+  skipDelete: true
+  namespace: opensearchsecuritypolicy
+  steps:
+    # ── Setup: namespace + shared configs ───────────────────────────────────────
+
+    - name: setup-namespace-and-configs
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 01-general-policy.yaml
+        - apply:
+            file: 02-mandatory-tags-config.yaml
+        - apply:
+            file: 03-unresolved-naming-config.yaml
+        # Inject status.effectiveConfig — test cluster runs kro but NOT kropath-controller,
+        # so effectiveConfig must be manually seeded (follows DynamoDB canonical pattern).
+        - script:
+            content: |
+              NS=opensearchsecuritypolicy
+              kubectl patch opensearchconfig general-policy -n "$NS" --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"standbyReplicas":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"standbyReplicas":"ENABLED","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+              kubectl patch opensearchconfig mandatory-tags -n "$NS" --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"standbyReplicas":"","namingTemplate":"","tags":{"team":"search"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"standbyReplicas":"ENABLED","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+              kubectl patch opensearchconfig unresolved-naming -n "$NS" --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"standbyReplicas":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"standbyReplicas":"ENABLED","namingTemplate":"{namespace}-{tag.nonexistent}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        # Verify Theme 28 label present on configs as sanity check
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchConfig
+              metadata:
+                name: general-policy
+                namespace: opensearchsecuritypolicy
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+
+    # ── AC-1: encryption type with AWS-owned key ─────────────────────────────
+    # Given: spec.type: "encryption", policy with AWSOwnedKey: true
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: ACK SecurityPolicy spec.type: "encryption", spec.policy set
+
+    - name: ac1-encryption-aws-owned
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac1
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac1"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac1
+                namespace: opensearchsecuritypolicy
+              spec:
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac1"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+
+    # ── AC-2: encryption type with customer-managed key ──────────────────────
+    # Given: spec.type: "encryption", policy with AWSOwnedKey: false and KmsARN set
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: ACK SecurityPolicy spec.type: "encryption", spec.policy set with CMK
+
+    - name: ac2-encryption-cmk
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac2
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac2"],"ResourceType":"collection"}],"AWSOwnedKey":false,"KmsARN":"arn:aws:kms:ap-southeast-2:123456789012:key/12345678-1234-1234-1234-123456789012"}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac2
+                namespace: opensearchsecuritypolicy
+              spec:
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac2"],"ResourceType":"collection"}],"AWSOwnedKey":false,"KmsARN":"arn:aws:kms:ap-southeast-2:123456789012:key/12345678-1234-1234-1234-123456789012"}]'
+
+    # ── AC-3: network type allowing public access ─────────────────────────────
+    # Given: spec.type: "network", policy with AllowFromPublic: true
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: ACK SecurityPolicy spec.type: "network", spec.policy set
+
+    - name: ac3-network-public
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac3
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: network
+                policy: '[{"Rules":[{"ResourceType":"collection","Resource":["collection/acosp-ac3"]}],"AllowFromPublic":true}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac3
+                namespace: opensearchsecuritypolicy
+              spec:
+                type: network
+                policy: '[{"Rules":[{"ResourceType":"collection","Resource":["collection/acosp-ac3"]}],"AllowFromPublic":true}]'
+
+    # ── AC-4: network type with VPC endpoint access ───────────────────────────
+    # Given: spec.type: "network", policy with AllowFromPublic: false and SourceVPCEs set
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: ACK SecurityPolicy spec.type: "network", spec.policy set with VPC endpoint
+
+    - name: ac4-network-vpc
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac4
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: network
+                policy: '[{"Rules":[{"ResourceType":"collection","Resource":["collection/acosp-ac4"]}],"AllowFromPublic":false,"SourceVPCEs":["vpce-12345678"]}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac4
+                namespace: opensearchsecuritypolicy
+              spec:
+                type: network
+                policy: '[{"Rules":[{"ResourceType":"collection","Resource":["collection/acosp-ac4"]}],"AllowFromPublic":false,"SourceVPCEs":["vpce-12345678"]}]'
+
+    # ── AC-5: type field required — empty string triggers validation error ─────
+    # Given: spec.type: "" (empty string), spec.policy non-empty
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: status.validationError: "type is required"; ACK SecurityPolicy NOT created
+
+    - name: ac5-type-required
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac5
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: ""
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac5"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac5
+                namespace: opensearchsecuritypolicy
+              status:
+                validationError: "type is required"
+        # Verify ACK SecurityPolicy was NOT created (includeWhen excluded it)
+        - script:
+            content: |
+              sleep 3
+              if kubectl get securitypolicies.opensearchserverless.services.k8s.aws acosp-ac5 -n opensearchsecuritypolicy 2>/dev/null | grep -q acosp-ac5; then
+                echo "ERROR: ACK SecurityPolicy should not exist when type is empty" >&2
+                exit 1
+              fi
+              echo "OK: ACK SecurityPolicy correctly excluded for empty type"
+
+    # ── AC-6: policy field required — empty string triggers validation error ───
+    # Given: spec.type: "encryption" (valid), spec.policy: "" (empty)
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: status.validationError: "policy is required"; ACK SecurityPolicy NOT created
+
+    - name: ac6-policy-required
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac6
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: ""
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac6
+                namespace: opensearchsecuritypolicy
+              status:
+                validationError: "policy is required"
+        - script:
+            content: |
+              sleep 3
+              if kubectl get securitypolicies.opensearchserverless.services.k8s.aws acosp-ac6 -n opensearchsecuritypolicy 2>/dev/null | grep -q acosp-ac6; then
+                echo "ERROR: ACK SecurityPolicy should not exist when policy is empty" >&2
+                exit 1
+              fi
+              echo "OK: ACK SecurityPolicy correctly excluded for empty policy"
+
+    # ── AC-7: type enum validation — invalid type triggers validation error ────
+    # Given: spec.type: "invalid" (not "encryption" or "network"), spec.policy non-empty
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: status.validationError: "type must be 'encryption' or 'network'"; ACK SecurityPolicy NOT created
+
+    - name: ac7-type-invalid
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac7
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: invalid-type
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac7"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac7
+                namespace: opensearchsecuritypolicy
+              status:
+                validationError: "type must be 'encryption' or 'network'"
+        - script:
+            content: |
+              sleep 3
+              if kubectl get securitypolicies.opensearchserverless.services.k8s.aws acosp-ac7 -n opensearchsecuritypolicy 2>/dev/null | grep -q acosp-ac7; then
+                echo "ERROR: ACK SecurityPolicy should not exist for invalid type value" >&2
+                exit 1
+              fi
+              echo "OK: ACK SecurityPolicy correctly excluded for invalid type"
+
+    # ── AC-8: description field passthrough ───────────────────────────────────
+    # Given: spec.description: "Encryption policy for analytics"
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: ACK SecurityPolicy spec.description: "Encryption policy for analytics"
+
+    - name: ac8-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac8
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac8"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+                description: "Encryption policy for analytics"
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac8
+                namespace: opensearchsecuritypolicy
+              spec:
+                description: "Encryption policy for analytics"
+
+    # ── AC-9: default naming template ─────────────────────────────────────────
+    # Given: defaults.namingTemplate: "{namespace}-{name}"; namespace: opensearchsecuritypolicy; CR name: acosp-ac9
+    # When: OpenSearchSecurityPolicy CR reconciled
+    # Then: status.resourceName: "opensearchsecuritypolicy-acosp-ac9"; ACK SecurityPolicy spec.name set accordingly
+
+    - name: ac9-naming-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac9
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac9"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac9
+                namespace: opensearchsecuritypolicy
+              status:
+                resourceName: opensearchsecuritypolicy-acosp-ac9
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac9
+                namespace: opensearchsecuritypolicy
+              spec:
+                name: opensearchsecuritypolicy-acosp-ac9
+
+    # ── AC-10: spec.nameOverride takes precedence over template ──────────────
+    # Given: spec.nameOverride: "custom-policy-name"
+    # When: OpenSearchSecurityPolicy CR reconciled
+    # Then: status.resourceName: "custom-policy-name"; ACK SecurityPolicy spec.name: "custom-policy-name"
+
+    - name: ac10-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac10
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                nameOverride: custom-policy-name
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac10"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac10
+                namespace: opensearchsecuritypolicy
+              status:
+                resourceName: custom-policy-name
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac10
+                namespace: opensearchsecuritypolicy
+              spec:
+                name: custom-policy-name
+
+    # ── AC-11: unresolved naming token ────────────────────────────────────────
+    # Given: defaults.namingTemplate: "{namespace}-{tag.nonexistent}-{name}"; tag "nonexistent" absent
+    # When: OpenSearchSecurityPolicy CR reconciled
+    # Then: status.namingStatus: "invalid-unresolved-tokens" (effectiveName contains unresolved "{")
+    # Note: ACK SecurityPolicy is still created (includeWhen only checks type/policy, not naming validity).
+
+    - name: ac11-naming-unresolved
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac11
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: unresolved-naming
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac11"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac11
+                namespace: opensearchsecuritypolicy
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ── AC-12: K8s-only tags — mandatory + spec tags appear as labels, no spec.tags on ACK ─
+    # Given: mandatory.tags={team:search}; spec.tags={purpose:encryption}
+    # When: OpenSearchSecurityPolicy CR reconciled
+    # Then: ACK SecurityPolicy metadata.labels contains aws.kropath.run/team: search
+    #       AND aws.kropath.run/purpose: encryption; NO spec.tags field on ACK resource
+
+    - name: ac12-tags-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac12
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: mandatory-tags
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac12"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+                tags:
+                  purpose: encryption
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac12
+                namespace: opensearchsecuritypolicy
+                labels:
+                  # mandatory.tags wins over spec.tags for the same key (if conflict)
+                  aws.kropath.run/team: search
+                  # spec.tags propagated
+                  aws.kropath.run/purpose: encryption
+        # Verify no spec.tags on ACK SecurityPolicy — AOSS SecurityPolicy has no tags field.
+        # Uses script because asserting absence of a field requires jq.
+        - script:
+            content: |
+              TAGS=$(kubectl get securitypolicies.opensearchserverless.services.k8s.aws acosp-ac12 \
+                -n opensearchsecuritypolicy -o jsonpath='{.spec.tags}' 2>/dev/null || echo "")
+              if [ -n "$TAGS" ] && [ "$TAGS" != "null" ]; then
+                echo "ERROR: ACK SecurityPolicy must not have spec.tags (AOSS has no cloud tags) — found: $TAGS" >&2
+                exit 1
+              fi
+              echo "OK: ACK SecurityPolicy has no spec.tags"
+
+    # ── AC-13: standard K8s metadata wiring ──────────────────────────────────
+    # Given: any encryption security policy
+    # When: ACK child SecurityPolicy created
+    # Then: app.kubernetes.io/managed-by: kro; app.kubernetes.io/instance: <cr-name>;
+    #       services.k8s.aws/deletion-policy: retain; ownerReferences back to OpenSearchSecurityPolicy
+
+    - name: ac13-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac13
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac13"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac13
+                namespace: opensearchsecuritypolicy
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: acosp-ac13
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: OpenSearchSecurityPolicy
+                    name: acosp-ac13
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # ── AC-14: deletionPolicy: delete propagated as annotation ──────────────
+    # Given: spec.deletionPolicy: "delete"
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: ACK SecurityPolicy annotation services.k8s.aws/deletion-policy: delete
+
+    - name: ac14-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac14
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                deletionPolicy: delete
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac14"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac14
+                namespace: opensearchsecuritypolicy
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ── AC-15: deletionPolicy: retain (default) propagated as annotation ─────
+    # Given: spec.deletionPolicy not set (default: retain)
+    # When: OpenSearchSecurityPolicy CR applied
+    # Then: ACK SecurityPolicy annotation services.k8s.aws/deletion-policy: retain
+
+    - name: ac15-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac15
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: network
+                policy: '[{"Rules":[{"ResourceType":"collection","Resource":["collection/acosp-ac15"]}],"AllowFromPublic":true}]'
+                # deletionPolicy not set; schema default is "retain"
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac15
+                namespace: opensearchsecuritypolicy
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ── AC-16: policy document update ─────────────────────────────────────────
+    # Given: existing encryption policy; then spec.policy updated to a new document
+    # When: OpenSearchSecurityPolicy CR re-applied with new policy
+    # Then: ACK SecurityPolicy spec.policy reflects the updated document
+    # Note: Lifecycle test — same CR name acosp-ac16 used across both apply operations.
+
+    - name: ac16-policy-update-initial
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac16
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac16"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac16
+                namespace: opensearchsecuritypolicy
+              spec:
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac16"],"ResourceType":"collection"}],"AWSOwnedKey":true}]'
+
+    - name: ac16-policy-update-new-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              metadata:
+                name: acosp-ac16
+                namespace: opensearchsecuritypolicy
+              spec:
+                configRef: general-policy
+                type: encryption
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac16","collection/acosp-ac16-extra"],"ResourceType":"collection"}],"AWSOwnedKey":false,"KmsARN":"arn:aws:kms:ap-southeast-2:123456789012:key/99999999-9999-9999-9999-999999999999"}]'
+        - assert:
+            resource:
+              apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+              kind: SecurityPolicy
+              metadata:
+                name: acosp-ac16
+                namespace: opensearchsecuritypolicy
+              spec:
+                policy: '[{"Rules":[{"Resource":["collection/acosp-ac16","collection/acosp-ac16-extra"],"ResourceType":"collection"}],"AWSOwnedKey":false,"KmsARN":"arn:aws:kms:ap-southeast-2:123456789012:key/99999999-9999-9999-9999-999999999999"}]'
