@@ -26,7 +26,8 @@ CLUSTER_NAME ?= kropath-aws-test
 	test-lambda test-memorydb test-mq test-msk test-opensearch test-organizations test-pipes test-policy test-rds test-route53 test-s3 test-secretsmanager \
 	test-sagemaker test-ses test-sns test-sqs test-ssm test-stepfunctions test-waf \
 	test-networkfirewall test-mwaa test-ram \
-	test-managedprometheus test-emr test-quicksight test-ecrpublic
+	test-managedprometheus test-emr test-quicksight test-ecrpublic \
+	test-recyclebin
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -230,3 +231,6 @@ test-ram:
 
 test-emr:
 	chainsaw test emr/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-recyclebin:
+	chainsaw test recyclebin/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
