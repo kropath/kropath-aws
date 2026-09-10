@@ -1,0 +1,249 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-os-04 — OpenSearchSecurityPolicy kro RGD (KRO-886).
+# Atomic RGD: wraps one ACK opensearchserverless.services.k8s.aws/SecurityPolicy.
+# type and policy use sentinel default ""; the ConfigMap advisory enforces:
+#   - type must not be empty (typeError)
+#   - policy must not be empty (policyError)
+#   - type must be "encryption" or "network" (typeEnumError)
+# kro does not support the | required marker; x-kubernetes-validations cannot be preserved;
+# the ConfigMap advisory pattern is the only enforcement mechanism available in kro v0.9.2.
+# No predictedArn — AOSS SecurityPolicy has no ARN.
+# No cloud resource tags — AOSS SecurityPolicy has no spec.tags field.
+# Tags tracked in K8s metadata labels only (with aws.kropath.run/ prefix).
+# ackSecurityPolicyRef: always-bound self-lookup prevents unbound-variable freeze in status block.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: opensearchsecuritypolicy.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: OpenSearchSecurityPolicy
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Policy properties
+      description: string | default=""
+      # type and policy have sentinel default ""; the ConfigMap advisory enforces non-empty
+      # and enum constraints (kro does not support the `| required` marker).
+      type: string | default=""
+      policy: string | default=""
+
+    status:
+      # resourceName and namingStatus sourced from the naming ConfigMap's data field.
+      # status: block cannot reference schema.* (frequent-rgd-errors.md §3).
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      # validationError: first non-empty error from the always-created validationErrors ConfigMap.
+      # Aggregated from a single ConfigMap to avoid the variant-split status freeze
+      # (frequent-rgd-errors.md §"Variant-Split Resources Freeze") — referencing multiple
+      # includeWhen-gated resources in one status expression silently drops the field.
+      # has() guards defend against kro v0.9.2 zero-value stripping of empty-string ConfigMap data
+      # keys (same pattern as iampolicy.yaml's has(mutualExclusionError.data.error)).
+      validationError: >-
+        ${(has(validationErrors.data) && has(validationErrors.data.typeError) && validationErrors.data.typeError != "") ? validationErrors.data.typeError
+          : ((has(validationErrors.data) && has(validationErrors.data.policyError) && validationErrors.data.policyError != "") ? validationErrors.data.policyError
+            : ((has(validationErrors.data) && has(validationErrors.data.typeEnumError) && validationErrors.data.typeEnumError != "") ? validationErrors.data.typeEnumError : ""))}
+      # conditions from the always-bound self-lookup (ackSecurityPolicyRef).
+      # Direct reference to ackSecurityPolicy (includeWhen-gated) would freeze when excluded.
+      conditions: >-
+        ${ackSecurityPolicyRef.size() > 0 ? ackSecurityPolicyRef[0].?status.?conditions.orValue([]) : []}
+
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # kro returns externalRef as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: OpenSearchConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # SecurityPolicy name: lowercase a-z, 0-9, hyphens (3-32 chars, must start with a-z).
+    # .lowerAscii() applied as the final step.
+    # No includeWhen — kro v0.9.2 does not mark ConfigMap nodes "ready" for includeWhen
+    # dependency evaluation (KRO-919). Naming ConfigMap is output-only.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({})
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({})
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)
+              .lowerAscii())}
+
+    # Always-created validation ConfigMap — computes all three admission checks inline.
+    # Using a single non-gated ConfigMap avoids the variant-split status freeze that occurs
+    # when two or more includeWhen-gated resources are mentioned in one status expression.
+    # typeError: catches empty type string (after | required prevents omission).
+    # policyError: catches empty policy string.
+    # typeEnumError: catches non-empty but invalid type values.
+    - id: validationErrors
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          typeError: >-
+            ${schema.spec.type == "" ? "type is required" : ""}
+          policyError: >-
+            ${schema.spec.policy == "" ? "policy is required" : ""}
+          typeEnumError: >-
+            ${schema.spec.type != "" && schema.spec.type != "encryption" && schema.spec.type != "network" ? "type must be 'encryption' or 'network'" : ""}
+
+    # Always-bound self-lookup: fetches the ACK SecurityPolicy child to read status.conditions.
+    # Using the app.kubernetes.io/instance label that ackSecurityPolicy receives.
+    # Returns an empty list before the policy is created or when ackSecurityPolicy is excluded.
+    # This pattern prevents unbound-variable freeze in the status block (frequent-rgd-errors.md §4).
+    - id: ackSecurityPolicyRef
+      externalRef:
+        apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+        kind: SecurityPolicy
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # ACK SecurityPolicy CR — primary cloud resource.
+    # Excluded when validation fails (empty type/policy or invalid type enum) to prevent
+    # creating an ACK CR that would be rejected by the ACK controller or AOSS API.
+    - id: ackSecurityPolicy
+      includeWhen:
+        - >-
+          ${schema.spec.type != "" && schema.spec.policy != "" && (schema.spec.type == "encryption" || schema.spec.type == "network")}
+      template:
+        apiVersion: opensearchserverless.services.k8s.aws/v1alpha1
+        kind: SecurityPolicy
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)) ? rsrcCfg[0].status.effectiveConfig.defaults.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(schema.spec.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchSecurityPolicy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # Cloud resource name — effectiveName from naming ConfigMap (lowercase per AWS constraint).
+          # SecurityPolicy.name is immutable after creation (enforced by ACK CRD).
+          name: ${naming.data.effectiveName}
+
+          # Policy type — direct passthrough; immutable after creation (enforced by ACK CRD).
+          type: ${schema.spec.type}
+
+          # JSON policy document — direct passthrough; ACK controller manages policyVersion internally.
+          policy: ${schema.spec.policy}
+
+          # Description — direct passthrough.
+          description: ${schema.spec.description}
+          # Note: AOSS SecurityPolicy has no spec.tags field — tags tracked in K8s metadata only.
+          # The aws.kropath.run/-prefixed labels above carry all tag, syncedLabel, and
+          # syncedAnnotation governance values for K8s metadata observability.
