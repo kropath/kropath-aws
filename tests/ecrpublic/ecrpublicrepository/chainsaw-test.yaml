@@ -1,0 +1,575 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ecrpub-02 Chainsaw tests — one scenario per acceptance criterion.
+# Namespace: ecrpublicrepository (fixed; {namespace}/{name} template expands predictably).
+# accountId: 123456789012 | region: us-east-1
+# effectiveConfig is injected via kubectl patch --subresource=status to simulate
+# kropath-controller (which is not running in the local test cluster).
+#
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step
+# deletes for ACK child resources — see CLAUDE.md §"Canonical chainsaw test structure".
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: ecrpublicrepository
+spec:
+  skipDelete: true
+  namespace: ecrpublicrepository
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy ECRPublicConfig with effectiveConfig patched in
+    # so the RGD can resolve governance values without a live controller.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-ecrpublicrepository-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch ecrpublicconfig general-policy -n ecrpublicrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: Basic creation — spec.name resolves via default naming template {namespace}/{name}.
+    #       status.resourceName, status.namingStatus, status.predictedArn are set.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-ecrpub-repo-basic-creation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: my-tool
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: my-tool
+                namespace: ecrpublicrepository
+              spec:
+                name: ecrpublicrepository/my-tool
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: my-tool
+                namespace: ecrpublicrepository
+              status:
+                resourceName: ecrpublicrepository/my-tool
+                namingStatus: valid
+                predictedArn: "arn:aws:ecr-public::123456789012:repository/ecrpublicrepository/my-tool"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: ACK populates status.repositoryURI after reconciliation.
+    #       In the test cluster there is no ACK controller, so we simulate the
+    #       URI population via kubectl patch --subresource=status on the child.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-ecrpub-repo-repository-uri
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: repo-uri-test
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: repo-uri-test
+                namespace: ecrpublicrepository
+        - script:
+            content: |
+              kubectl patch repositories.ecrpublic.services.k8s.aws repo-uri-test -n ecrpublicrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"repositoryURI":"public.ecr.aws/a1b2c3d4/ecrpublicrepository/repo-uri-test","registryID":"123456789012","createdAt":"2026-09-01T00:00:00Z"}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: repo-uri-test
+                namespace: ecrpublicrepository
+              status:
+                repositoryURI: "public.ecr.aws/a1b2c3d4/ecrpublicrepository/repo-uri-test"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: Three-way tag merge — mandatory + instance + defaults; emitted as
+    #       {key, value} list. Uses kubectl+jq script for order-independent check.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-ecrpub-repo-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicConfig
+              metadata:
+                name: tags-merge-policy
+                namespace: ecrpublicrepository
+                labels:
+                  aws.kropath.run/resource-name: tags-merge-policy
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags:
+                    org: my-company
+                    visibility: public
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{namespace}/{name}"
+                  tags:
+                    team: platform
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrpublicconfig tags-merge-policy -n ecrpublicrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"org":"my-company","visibility":"public"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}/{name}","tags":{"team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: tags-merge-repo
+              spec:
+                configRef: tags-merge-policy
+                tags:
+                  app: my-tool
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: tags-merge-repo
+                namespace: ecrpublicrepository
+        # Verify all four expected tags are present (order-independent via jq)
+        - script:
+            content: |
+              set -eu
+              tags=$(kubectl get repositories.ecrpublic.services.k8s.aws tags-merge-repo -n ecrpublicrepository -o json | jq -r '.spec.tags // [] | map(.key + "=" + .value) | sort | .[]')
+              echo "$tags" | grep -qx "app=my-tool"
+              echo "$tags" | grep -qx "org=my-company"
+              echo "$tags" | grep -qx "team=platform"
+              echo "$tags" | grep -qx "visibility=public"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: Mandatory tag wins over instance tag with the same key.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-ecrpub-repo-mandatory-tag-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicConfig
+              metadata:
+                name: mandatory-tag-policy
+                namespace: ecrpublicrepository
+                labels:
+                  aws.kropath.run/resource-name: mandatory-tag-policy
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags:
+                    org: my-company
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrpublicconfig mandatory-tag-policy -n ecrpublicrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"org":"my-company"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: mandatory-tag-repo
+              spec:
+                configRef: mandatory-tag-policy
+                tags:
+                  org: other-company
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: mandatory-tag-repo
+                namespace: ecrpublicrepository
+        # Mandatory org=my-company must win over instance org=other-company
+        - script:
+            content: |
+              set -eu
+              org=$(kubectl get repositories.ecrpublic.services.k8s.aws mandatory-tag-repo -n ecrpublicrepository -o json \
+                | jq -r '.spec.tags // [] | map(select(.key == "org")) | .[0].value')
+              test "$org" = "my-company"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: mandatory.namingTemplate applied with all tokens.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-ecrpub-repo-mandatory-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicConfig
+              metadata:
+                name: open-source
+                namespace: ecrpublicrepository
+                labels:
+                  aws.kropath.run/resource-name: open-source
+              spec:
+                mandatory:
+                  namingTemplate: "{configRef}/{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrpublicconfig open-source -n ecrpublicrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"{configRef}/{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: nginx
+              spec:
+                configRef: open-source
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: nginx
+                namespace: ecrpublicrepository
+              spec:
+                name: open-source/ecrpublicrepository/nginx
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: nginx
+                namespace: ecrpublicrepository
+              status:
+                resourceName: open-source/ecrpublicrepository/nginx
+                namingStatus: valid
+                predictedArn: "arn:aws:ecr-public::123456789012:repository/open-source/ecrpublicrepository/nginx"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: defaults.namingTemplate applied when no mandatory naming is set.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-ecrpub-repo-defaults-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicConfig
+              metadata:
+                name: defaults-naming-policy
+                namespace: ecrpublicrepository
+                labels:
+                  aws.kropath.run/resource-name: defaults-naming-policy
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{namespace}/{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrpublicconfig defaults-naming-policy -n ecrpublicrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}/{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: builder
+              spec:
+                configRef: defaults-naming-policy
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: builder
+                namespace: ecrpublicrepository
+              spec:
+                name: ecrpublicrepository/builder
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: builder
+                namespace: ecrpublicrepository
+              status:
+                resourceName: ecrpublicrepository/builder
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: spec.nameOverride bypasses naming template entirely.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-ecrpub-repo-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: override-repo
+              spec:
+                nameOverride: "legacy/public-repo"
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: override-repo
+                namespace: ecrpublicrepository
+              spec:
+                name: legacy/public-repo
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: override-repo
+                namespace: ecrpublicrepository
+              status:
+                resourceName: legacy/public-repo
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: spec.syncedLabels written to child CR labels (prefixed aws.kropath.run/)
+    #       AND to cloud tags.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-ecrpub-repo-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: synced-labels-repo
+              spec:
+                syncedLabels:
+                  data-class: public
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: synced-labels-repo
+                namespace: ecrpublicrepository
+                labels:
+                  aws.kropath.run/data-class: public
+        # Synced label must also appear as a cloud tag
+        - script:
+            content: |
+              set -eu
+              val=$(kubectl get repositories.ecrpublic.services.k8s.aws synced-labels-repo -n ecrpublicrepository -o json \
+                | jq -r '.spec.tags // [] | map(select(.key == "data-class")) | .[0].value')
+              test "$val" = "public"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: deletionPolicy "delete" → annotation on ACK CR.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-ecrpub-repo-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: delete-policy-repo
+              spec:
+                deletionPolicy: "delete"
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: delete-policy-repo
+                namespace: ecrpublicrepository
+                annotations:
+                  services.k8s.aws/deletion-policy: "delete"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: deletionPolicy "retain" (default) → annotation on ACK CR.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-ecrpub-repo-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: retain-policy-repo
+              spec:
+                deletionPolicy: "retain"
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: retain-policy-repo
+                namespace: ecrpublicrepository
+                annotations:
+                  services.k8s.aws/deletion-policy: "retain"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: Standard labels (managed-by: kro, instance) on ACK CR.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-ecrpub-repo-standard-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: standard-labels-repo
+              spec: {}
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: standard-labels-repo
+                namespace: ecrpublicrepository
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: standard-labels-repo
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: Non-existent configRef falls through to general-policy.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-ecrpub-repo-configref-fallthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: fallthrough-repo
+              spec:
+                configRef: "nonexistent-profile"
+        # With nonexistent configRef the selector finds no config; the naming ConfigMap
+        # falls through to the built-in "{namespace}/{name}" default template.
+        - assert:
+            resource:
+              apiVersion: ecrpublic.services.k8s.aws/v1alpha1
+              kind: Repository
+              metadata:
+                name: fallthrough-repo
+                namespace: ecrpublicrepository
+              spec:
+                name: ecrpublicrepository/fallthrough-repo
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: fallthrough-repo
+                namespace: ecrpublicrepository
+              status:
+                resourceName: ecrpublicrepository/fallthrough-repo
+                namingStatus: valid
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: Unresolvable naming token → namingStatus: "invalid-unresolved-tokens";
+    #        repository NOT created.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-ecrpub-repo-naming-unresolved-tokens
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicConfig
+              metadata:
+                name: bad-token-policy
+                namespace: ecrpublicrepository
+                labels:
+                  aws.kropath.run/resource-name: bad-token-policy
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{namespace}/{tag.missing-key}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch ecrpublicconfig bad-token-policy -n ecrpublicrepository \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}/{tag.missing-key}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: unresolved-token-repo
+              spec:
+                configRef: bad-token-policy
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: ECRPublicRepository
+              metadata:
+                name: unresolved-token-repo
+                namespace: ecrpublicrepository
+              status:
+                namingStatus: invalid-unresolved-tokens
+        # Verify the ACK Repository CR was NOT created (naming invalid blocks repo creation)
+        - script:
+            content: |
+              set -eu
+              # Short wait to let reconciliation complete, then verify absence
+              sleep 3
+              count=$(kubectl get repositories.ecrpublic.services.k8s.aws unresolved-token-repo -n ecrpublicrepository --ignore-not-found 2>/dev/null | wc -l | tr -d ' ')
+              test "$count" = "0"
