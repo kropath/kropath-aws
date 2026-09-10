@@ -1,0 +1,1504 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# WAFWebACL Chainsaw tests — one scenario per acceptance criterion (AC-1 through AC-41).
+# Namespace: wafwebacl (fixed; {namespace}-{name} naming template expands predictably).
+# effectiveConfig is injected via kubectl patch --subresource=status.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: wafwebacl
+spec:
+  skipDelete: true
+  namespace: wafwebacl
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy WAFConfig with effectiveConfig status
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy
+      try:
+        - apply:
+            file: 00-wafwebacl-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: defaults.scope applied when instance scope matches defaults.
+    # Scenario: scope-default-regional
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-scope-default-regional
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-scope-default
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-scope-default
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-scope-default
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: mandatory.scope overrides instance scope.
+    # Scenario: scope-mandatory-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-scope-mandatory-override
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"REGIONAL","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"CLOUDFRONT","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-scope-mandatory
+              spec:
+                scope: CLOUDFRONT
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-scope-mandatory
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-scope-mandatory
+              spec:
+                scope: REGIONAL
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: instance scope overrides defaults.
+    # Scenario: scope-instance-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-scope-instance-override
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-scope-instance
+              spec:
+                scope: CLOUDFRONT
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-scope-instance
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-scope-instance
+              spec:
+                scope: CLOUDFRONT
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: scope immutability — WAFConfig CRD rejects dual mandatory+defaults scope.
+    # Scope immutability on WAFWebACL is enforced by ACK WAFv2 in production.
+    # Scenario: scope-immutable (negative)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-scope-immutable-validation
+      try:
+        - script:
+            content: |
+              kubectl apply -f - <<'EOF' && echo "UNEXPECTEDLY ACCEPTED" || echo "REJECTED AS EXPECTED"
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFConfig
+              metadata:
+                name: dual-scope-webacl
+                namespace: wafwebacl
+                labels:
+                  aws.kropath.run/resource-name: dual-scope-webacl
+              spec:
+                mandatory:
+                  scope: "REGIONAL"
+                defaults:
+                  scope: "CLOUDFRONT"
+              EOF
+            check:
+              (contains($stdout, 'REJECTED AS EXPECTED')): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: mandatory.defaultAction=block overrides instance allow.
+    # Scenario: default-action-mandatory-block
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-default-action-mandatory-block
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"block","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"allow","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-da-mandatory-block
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  allow: {}
+                visibilityConfig:
+                  metricName: webacl-da-mandatory-block
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-da-mandatory-block
+              spec:
+                defaultAction:
+                  block: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: mandatory.defaultAction=allow overrides instance block.
+    # Scenario: default-action-mandatory-allow
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-default-action-mandatory-allow
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"allow","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-da-mandatory-allow
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-da-mandatory-allow
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-da-mandatory-allow
+              spec:
+                defaultAction:
+                  allow: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: instance defaultAction with custom allow handling passthrough (webACLInstance variant).
+    # No mandatory defaultAction, instance sets allow with customRequestHandling.
+    # Scenario: default-action-instance-custom-allow
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-default-action-instance-custom-allow
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-da-instance-custom
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  allow:
+                    customRequestHandling:
+                      insertHeaders:
+                        - name: X-Custom-Header
+                          value: custom-value
+                visibilityConfig:
+                  metricName: webacl-da-instance-custom
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-da-instance-custom
+              spec:
+                defaultAction:
+                  allow:
+                    customRequestHandling:
+                      insertHeaders:
+                        - name: X-Custom-Header
+                          value: custom-value
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: defaults.defaultAction=block applied when no mandatory or instance defaultAction.
+    # Scenario: default-action-default-block
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-default-action-default-block
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-da-default-block
+              spec:
+                scope: REGIONAL
+                visibilityConfig:
+                  metricName: webacl-da-default-block
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-da-default-block
+              spec:
+                defaultAction:
+                  block: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: mandatory.cloudWatchMetricsEnabled overrides instance false.
+    # Scenario: visibility-mandatory-cloudwatch
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-visibility-mandatory-cloudwatch
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-vis-mandatory-cw
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-vis-mandatory-cw
+                  cloudWatchMetricsEnabled: false
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-vis-mandatory-cw
+              spec:
+                visibilityConfig:
+                  cloudWatchMetricsEnabled: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: mandatory.sampledRequestsEnabled overrides instance false.
+    # Scenario: visibility-mandatory-sampling
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-visibility-mandatory-sampling
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":true,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-vis-mandatory-sample
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-vis-mandatory-sample
+                  sampledRequestsEnabled: false
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-vis-mandatory-sample
+              spec:
+                visibilityConfig:
+                  sampledRequestsEnabled: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: defaults.cloudWatchMetricsEnabled applied when no mandatory override.
+    # Scenario: visibility-default-cloudwatch
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-visibility-default-cloudwatch
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-vis-default-cw
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-vis-default-cw
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-vis-default-cw
+              spec:
+                visibilityConfig:
+                  cloudWatchMetricsEnabled: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: visibilityConfig.metricName derived from effectiveName.
+    # Scenario: visibility-metric-name-derived
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-visibility-metric-name-derived
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: block-ips
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: block-ips
+              spec:
+                visibilityConfig:
+                  metricName: wafwebacl-block-ips
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: rules passthrough — basic IP-based rate limit rule.
+    # Scenario: rules-custom-rule
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-rules-custom-rule
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-custom
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-custom
+                rules:
+                  - name: block-bad-ips
+                    priority: 1
+                    action:
+                      block: {}
+                    statement:
+                      ipSetReferenceStatement:
+                        arn: arn:aws:wafv2:us-east-1:123456789012:regional/ipset/bad-ips/abc123
+                    visibilityConfig:
+                      metricName: block-bad-ips
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-custom
+              spec:
+                rules:
+                  - name: block-bad-ips
+                    priority: 1
+                    action:
+                      block: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: rule group reference passthrough.
+    # Scenario: rules-rule-group-reference
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-rules-rule-group-reference
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-rgref
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-rgref
+                rules:
+                  - name: custom-rule-group
+                    priority: 2
+                    statement:
+                      ruleGroupReferenceStatement:
+                        arn: arn:aws:wafv2:us-east-1:123456789012:regional/rulegroup/my-group/xyz789
+                    overrideAction:
+                      none: {}
+                    visibilityConfig:
+                      metricName: custom-rule-group
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-rgref
+              spec:
+                rules:
+                  - name: custom-rule-group
+                    priority: 2
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: managed rule group reference passthrough.
+    # Scenario: rules-managed-rule-group
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-rules-managed-rule-group
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-mrg
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-mrg
+                rules:
+                  - name: aws-core-rules
+                    priority: 10
+                    statement:
+                      managedRuleGroupStatement:
+                        vendorName: AWS
+                        name: AWSManagedRulesCommonRuleSet
+                    overrideAction:
+                      none: {}
+                    visibilityConfig:
+                      metricName: aws-core-rules
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-mrg
+              spec:
+                rules:
+                  - name: aws-core-rules
+                    priority: 10
+                    statement:
+                      managedRuleGroupStatement:
+                        vendorName: AWS
+                        name: AWSManagedRulesCommonRuleSet
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: managed rule group with excluded rules passthrough.
+    # Scenario: rules-excluded-rules
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-rules-excluded-rules
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-excl
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-excl
+                rules:
+                  - name: core-rules-with-exclusions
+                    priority: 10
+                    statement:
+                      managedRuleGroupStatement:
+                        vendorName: AWS
+                        name: AWSManagedRulesCommonRuleSet
+                        excludedRules:
+                          - name: SizeRestrictions_BODY
+                          - name: CrossSiteScripting_BODY
+                    overrideAction:
+                      none: {}
+                    visibilityConfig:
+                      metricName: core-rules-with-exclusions
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-excl
+              spec:
+                rules:
+                  - name: core-rules-with-exclusions
+                    statement:
+                      managedRuleGroupStatement:
+                        excludedRules:
+                          - name: SizeRestrictions_BODY
+                          - name: CrossSiteScripting_BODY
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: rule action overrides on managed rule group passthrough.
+    # Scenario: rules-action-overrides
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-rules-action-overrides
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-overrides
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-overrides
+                rules:
+                  - name: core-rules-overrides
+                    priority: 10
+                    statement:
+                      managedRuleGroupStatement:
+                        vendorName: AWS
+                        name: AWSManagedRulesCommonRuleSet
+                        ruleActionOverrides:
+                          - name: SizeRestrictions_BODY
+                            actionToUse:
+                              count: {}
+                    overrideAction:
+                      none: {}
+                    visibilityConfig:
+                      metricName: core-rules-overrides
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-overrides
+              spec:
+                rules:
+                  - name: core-rules-overrides
+                    statement:
+                      managedRuleGroupStatement:
+                        ruleActionOverrides:
+                          - name: SizeRestrictions_BODY
+                            actionToUse:
+                              count: {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: IPSet reference statement in a rule passthrough.
+    # Scenario: rules-ipset-reference
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-rules-ipset-reference
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-ipref
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-ipref
+                rules:
+                  - name: ip-allow-list
+                    priority: 1
+                    action:
+                      allow: {}
+                    statement:
+                      ipSetReferenceStatement:
+                        arn: arn:aws:wafv2:us-east-1:123456789012:regional/ipset/allow-list/def456
+                        ipSetForwardedIPConfig:
+                          headerName: X-Forwarded-For
+                          fallbackBehavior: MATCH
+                          position: FIRST
+                    visibilityConfig:
+                      metricName: ip-allow-list
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-ipref
+              spec:
+                rules:
+                  - name: ip-allow-list
+                    action:
+                      allow: {}
+                    statement:
+                      ipSetReferenceStatement:
+                        arn: arn:aws:wafv2:us-east-1:123456789012:regional/ipset/allow-list/def456
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-19: AND statement combining multiple conditions passthrough.
+    # Scenario: rules-and-statement
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac19-rules-and-statement
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-and
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-and
+                rules:
+                  - name: and-combined-rule
+                    priority: 5
+                    action:
+                      block: {}
+                    statement:
+                      andStatement:
+                        statements:
+                          - byteMatchStatement:
+                              searchString: /admin
+                              fieldToMatch:
+                                uriPath: {}
+                              textTransformations:
+                                - type: LOWERCASE
+                                  priority: 0
+                              positionalConstraint: STARTS_WITH
+                          - geoMatchStatement:
+                              countryCodes:
+                                - CN
+                                - RU
+                    visibilityConfig:
+                      metricName: and-combined-rule
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-and
+              spec:
+                rules:
+                  - name: and-combined-rule
+                    statement:
+                      andStatement:
+                        statements:
+                          - byteMatchStatement:
+                              positionalConstraint: STARTS_WITH
+                          - geoMatchStatement:
+                              countryCodes:
+                                - CN
+                                - RU
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-20: NOT statement passthrough.
+    # Scenario: rules-not-statement
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac20-rules-not-statement
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-rules-not
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-rules-not
+                rules:
+                  - name: not-geo-rule
+                    priority: 3
+                    action:
+                      allow: {}
+                    statement:
+                      notStatement:
+                        statement:
+                          geoMatchStatement:
+                            countryCodes:
+                              - CN
+                              - RU
+                    visibilityConfig:
+                      metricName: not-geo-rule
+                      cloudWatchMetricsEnabled: true
+                      sampledRequestsEnabled: true
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-rules-not
+              spec:
+                rules:
+                  - name: not-geo-rule
+                    statement:
+                      notStatement:
+                        statement:
+                          geoMatchStatement:
+                            countryCodes:
+                              - CN
+                              - RU
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: captchaConfig passthrough.
+    # Scenario: captcha-config-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac21-captcha-config-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-captcha
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-captcha
+                captchaConfig:
+                  immunityTimeProperty:
+                    immunityTime: 300
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-captcha
+              spec:
+                captchaConfig:
+                  immunityTimeProperty:
+                    immunityTime: 300
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22: challengeConfig passthrough.
+    # Scenario: challenge-config-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22-challenge-config-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-challenge
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-challenge
+                challengeConfig:
+                  immunityTimeProperty:
+                    immunityTime: 300
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-challenge
+              spec:
+                challengeConfig:
+                  immunityTimeProperty:
+                    immunityTime: 300
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-23: loggingConfiguration passthrough.
+    # Scenario: logging-config-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac23-logging-config-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-logging
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-logging
+                loggingConfiguration:
+                  logDestinationConfigs:
+                    - arn:aws:kinesis:us-east-1:123456789012:stream/waf-logs
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-logging
+              spec:
+                loggingConfiguration:
+                  logDestinationConfigs:
+                    - arn:aws:kinesis:us-east-1:123456789012:stream/waf-logs
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-24: loggingConfiguration with redactedFields passthrough.
+    # Scenario: logging-redacted-fields
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac24-logging-redacted-fields
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-logging-redact
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-logging-redact
+                loggingConfiguration:
+                  logDestinationConfigs:
+                    - arn:aws:kinesis:us-east-1:123456789012:stream/waf-logs
+                  redactedFields:
+                    - queryString: {}
+                    - singleHeader:
+                        name: authorization
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-logging-redact
+              spec:
+                loggingConfiguration:
+                  redactedFields:
+                    - queryString: {}
+                    - singleHeader:
+                        name: authorization
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-25: loggingConfiguration with filter conditions passthrough.
+    # Scenario: logging-filter-conditions
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac25-logging-filter-conditions
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-logging-filter
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-logging-filter
+                loggingConfiguration:
+                  logDestinationConfigs:
+                    - arn:aws:kinesis:us-east-1:123456789012:stream/waf-logs
+                  loggingFilter:
+                    defaultBehavior: KEEP
+                    filters:
+                      - behavior: DROP
+                        requirement: MEETS_ANY
+                        conditions:
+                          - actionCondition:
+                              action: ALLOW
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-logging-filter
+              spec:
+                loggingConfiguration:
+                  loggingFilter:
+                    defaultBehavior: KEEP
+                    filters:
+                      - behavior: DROP
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-26: customResponseBodies passthrough.
+    # Scenario: custom-response-bodies-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac26-custom-response-bodies-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-custom-resp
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-custom-resp
+                customResponseBodies:
+                  ForbiddenPage:
+                    contentType: TEXT_HTML
+                    content: "<html><body>403 Forbidden</body></html>"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-custom-resp
+              spec:
+                customResponseBodies:
+                  ForbiddenPage:
+                    contentType: TEXT_HTML
+                    content: "<html><body>403 Forbidden</body></html>"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-27: association configuration passthrough.
+    # Scenario: association-config-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac27-association-config-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-assoc-config
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-assoc-config
+                associationConfig:
+                  requestBody:
+                    CLOUDFRONT:
+                      defaultSizeInspectionLimit: KB_16
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-assoc-config
+              spec:
+                associationConfig:
+                  requestBody:
+                    CLOUDFRONT:
+                      defaultSizeInspectionLimit: KB_16
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-28: tokenDomains passthrough.
+    # Scenario: token-domains-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac28-token-domains-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-token-domains
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-token-domains
+                tokenDomains:
+                  - example.com
+                  - app.example.com
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-token-domains
+              spec:
+                tokenDomains:
+                  - example.com
+                  - app.example.com
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-29: naming template produces effectiveName from {namespace}-{name}.
+    # Scenario: naming-default-template
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac29-naming-default-template
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: my-webacl
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: my-webacl
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: my-webacl
+              spec:
+                name: wafwebacl-my-webacl
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-30: spec.nameOverride overrides naming template.
+    # Scenario: naming-override
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac30-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-name-override
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-name-override
+                nameOverride: custom-webacl-name
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-name-override
+              spec:
+                name: custom-webacl-name
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-31: naming with unresolved tokens produces namingStatus=invalid-unresolved-tokens.
+    # Scenario: naming-unresolved-token (negative)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac31-naming-unresolved-token
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-unresolved-token
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-unresolved-token
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-unresolved-token
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-32: spec.tags merged into WAFv2 tags array (mandatory wins).
+    # Scenario: tags-spec-merge
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac32-tags-spec-merge
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{"env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{"team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-tags-merge
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-tags-merge
+                tags:
+                  service: api-gateway
+        - script:
+            content: |
+              # Order-independent tag assertion using jq
+              kubectl wait wafwebacl webacl-tags-merge -n wafwebacl --for=condition=Ready --timeout=60s
+              TAGS=$(kubectl get webacls.wafv2.services.k8s.aws webacl-tags-merge -n wafwebacl -o json | jq -r '.spec.tags // []')
+              for kv in '{"key":"env","value":"prod"}' '{"key":"team","value":"platform"}' '{"key":"service","value":"api-gateway"}'; do
+                echo "$TAGS" | jq -e --argjson kv "$kv" 'any(.[]; .key == $kv.key and .value == $kv.value)' > /dev/null \
+                  || { echo "MISSING TAG: $kv"; exit 1; }
+              done
+              echo "ALL TAGS PRESENT"
+            check:
+              (contains($stdout, 'ALL TAGS PRESENT')): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-33: mandatory.tags override spec.tags with same key (mandatory wins).
+    # Scenario: tags-mandatory-wins
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac33-tags-mandatory-wins
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{"env":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-tags-mandatory
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-tags-mandatory
+                tags:
+                  env: staging
+        - script:
+            content: |
+              kubectl wait wafwebacl webacl-tags-mandatory -n wafwebacl --for=condition=Ready --timeout=60s
+              ENV_VAL=$(kubectl get webacls.wafv2.services.k8s.aws webacl-tags-mandatory -n wafwebacl -o json \
+                | jq -r '.spec.tags // [] | map(select(.key == "env")) | .[0].value // "MISSING"')
+              [ "$ENV_VAL" = "prod" ] && echo "MANDATORY WINS" || echo "WRONG VALUE: $ENV_VAL"
+            check:
+              (contains($stdout, 'MANDATORY WINS')): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-34: syncedLabels from mandatory applied to WAFWebACL Kubernetes metadata labels.
+    # Scenario: synced-labels-mandatory
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac34-synced-labels-mandatory
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{"cost-center":"platform-team"},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-synced-labels
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-synced-labels
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-synced-labels
+                labels:
+                  aws.kropath.run/cost-center: platform-team
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-35: syncedAnnotations from defaults applied to ACK WebACL metadata annotations.
+    # Scenario: synced-annotations-defaults
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac35-synced-annotations-defaults
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"security"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-synced-annots
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-synced-annots
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-synced-annots
+                annotations:
+                  aws.kropath.run/team: security
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-36: mandatory.syncedLabels override spec-level labels with same key.
+    # Scenario: synced-labels-mandatory-wins
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac36-synced-labels-mandatory-wins
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{"env":"production"},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-labels-mandatory
+                labels:
+                  env: staging
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-labels-mandatory
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-labels-mandatory
+                labels:
+                  aws.kropath.run/env: production
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-37: syncedAnnotations merge: spec.annotations + mandatory.syncedAnnotations.
+    # Scenario: synced-annotations-merge
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac37-synced-annotations-merge
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"governed-by":"security-policy"}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{"team":"platform"}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-annots-merge
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-annots-merge
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-annots-merge
+                annotations:
+                  aws.kropath.run/governed-by: security-policy
+                  aws.kropath.run/team: platform
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-38: standard metadata — labels, annotations, ownerReferences applied to ACK WebACL.
+    # Scenario: standard-metadata
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac38-standard-metadata
+      try:
+        - script:
+            content: |
+              kubectl patch wafconfig general-policy -n wafwebacl \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"scope":"","defaultAction":"","cloudWatchMetricsEnabled":false,"sampledRequestsEnabled":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"scope":"REGIONAL","defaultAction":"block","cloudWatchMetricsEnabled":true,"sampledRequestsEnabled":true,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-std-metadata
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-std-metadata
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-std-metadata
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: webacl-std-metadata
+                ownerReferences:
+                  - kind: WAFWebACL
+                    name: webacl-std-metadata
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-39: deletion policy retain annotation applied to ACK WebACL.
+    # Scenario: deletion-policy-retain
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac39-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-dp-retain
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-dp-retain
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-dp-retain
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-40: deletion policy delete annotation applied when not retain.
+    # Scenario: deletion-policy-delete
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac40-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-dp-delete
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-dp-delete
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-dp-delete
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-41: description passthrough.
+    # Scenario: description-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac41-description-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: WAFWebACL
+              metadata:
+                name: webacl-description
+              spec:
+                scope: REGIONAL
+                defaultAction:
+                  block: {}
+                visibilityConfig:
+                  metricName: webacl-description
+                description: "Managed by kropath - blocks all traffic by default"
+        - assert:
+            resource:
+              apiVersion: wafv2.services.k8s.aws/v1alpha1
+              kind: WebACL
+              metadata:
+                name: webacl-description
+              spec:
+                description: "Managed by kropath - blocks all traffic by default"

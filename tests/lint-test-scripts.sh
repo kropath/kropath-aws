@@ -49,6 +49,7 @@ ACK_BARE_NAMES=(
   functionurlconfig
   group
   instanceprofile
+  ipset
   layerversion
   metricalarm
   metricstream
@@ -63,6 +64,7 @@ ACK_BARE_NAMES=(
   restapi
   role
   route
+  rulegroup
   scalabletargets
   scalingpolicies
   serverlesscache
@@ -74,6 +76,7 @@ ACK_BARE_NAMES=(
   user
   usergroup
   version
+  webacl
 )
 
 # Build a grep alternation pattern: word\|word\|...
