@@ -1,0 +1,521 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-os-05 Chainsaw tests — all 12 acceptance criteria for OpenSearchVPCEndpoint RGD (KRO-887).
+# Canonical pattern: spec.skipDelete: true, unique resource names per step, no inter-step ACK deletes.
+# AC-to-scenario map: posted on Multica issue abfb41a7-bfde-48d7-a646-afcf551ebc45 (Theme 19-2).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: opensearchvpcendpoint
+spec:
+  skipDelete: true
+  namespace: opensearchvpcendpoint
+  steps:
+    # ── Setup: namespace + shared configs ───────────────────────────────────────
+
+    - name: setup-namespace-and-configs
+      try:
+        - apply:
+            file: 00-namespace.yaml
+        - apply:
+            file: 01-general-policy.yaml
+        - apply:
+            file: 02-mandatory-tags-config.yaml
+        # Inject status.effectiveConfig — test cluster runs kro but NOT kropath-controller,
+        # so effectiveConfig must be manually seeded (follows DynamoDB canonical pattern).
+        - script:
+            content: |
+              NS=opensearchvpcendpoint
+              kubectl patch opensearchconfig general-policy -n "$NS" --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+              kubectl patch opensearchconfig mandatory-tags -n "$NS" --subresource=status --type=merge -p '{"status":{"effectiveConfig":{"mandatory":{"namingTemplate":"","tags":{"team":"search"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        # Verify Theme 28 label present on configs as sanity check
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchConfig
+              metadata:
+                name: general-policy
+                namespace: opensearchvpcendpoint
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+
+    # ── AC-2 setup: OpenSearchDomain stub for domainRef resolution ──────────────
+    # Create an OpenSearchDomain stub with the aws.kropath.run/resource-name label.
+    # kro will reconcile it, computing status.predictedArn from the general-policy effectiveConfig.
+    # nameOverride ensures a predictable effectiveName (and thus predictedArn).
+    # Applied early so kro has time to reconcile before AC-2 uses domainRef.
+
+    - name: setup-domain-stub
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: vpe-domain-stub
+                namespace: opensearchvpcendpoint
+                labels:
+                  aws.kropath.run/resource-name: vpe-domain-stub
+              spec:
+                configRef: general-policy
+                nameOverride: prod-vpe-stub
+                vpcSubnetIDs: []
+                vpcSecurityGroupIDs: []
+        # Wait for kro to reconcile the domain and populate status.predictedArn.
+        # predictedArn formula: arn:aws:es:{region}:{accountId}:domain/{effectiveName}
+        # = arn:aws:es:ap-southeast-2:123456789012:domain/prod-vpe-stub
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchDomain
+              metadata:
+                name: vpe-domain-stub
+                namespace: opensearchvpcendpoint
+              status:
+                predictedArn: "arn:aws:es:ap-southeast-2:123456789012:domain/prod-vpe-stub"
+
+    # ── AC-1: domain ARN direct ───────────────────────────────────────────────
+    # Given: spec.domainARN: "arn:aws:es:us-east-1:123:domain/my-domain", spec.vpcSubnetIDs: ["subnet-aaa"]
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: ACK VPCEndpoint spec.domainARN passthrough, spec.vpcOptions.subnetIDs: ["subnet-aaa"]
+
+    - name: ac1-domain-arn-direct
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac1
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcSubnetIDs:
+                  - subnet-aaa
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac1
+                namespace: opensearchvpcendpoint
+              spec:
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcOptions:
+                  subnetIDs:
+                    - subnet-aaa
+
+    # ── AC-2: domain ref local ────────────────────────────────────────────────
+    # Given: spec.domainRef: "vpe-domain-stub" (OpenSearchDomain CR exists with predictedArn set)
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: ACK VPCEndpoint spec.domainARN resolved from domain CR status.predictedArn
+
+    - name: ac2-domain-ref-local
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac2
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainRef: vpe-domain-stub
+                vpcSubnetIDs:
+                  - subnet-bbb
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac2
+                namespace: opensearchvpcendpoint
+              spec:
+                domainARN: "arn:aws:es:ap-southeast-2:123456789012:domain/prod-vpe-stub"
+                vpcOptions:
+                  subnetIDs:
+                    - subnet-bbb
+
+    # ── AC-3: domain mutual exclusion ─────────────────────────────────────────
+    # Given: spec.domainARN AND spec.domainRef both set
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: status.validationError: "domainARN and domainRef are mutually exclusive";
+    #       ACK VPCEndpoint NOT created
+
+    - name: ac3-domain-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac3
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                domainRef: vpe-domain-stub
+                vpcSubnetIDs:
+                  - subnet-aaa
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac3
+                namespace: opensearchvpcendpoint
+              status:
+                validationError: "domainARN and domainRef are mutually exclusive"
+        # Verify ACK VPCEndpoint was NOT created (includeWhen excluded it)
+        - script:
+            content: |
+              sleep 3
+              if kubectl get vpcendpoints.opensearchservice.services.k8s.aws avovpe-ac3 -n opensearchvpcendpoint 2>/dev/null | grep -q avovpe-ac3; then
+                echo "ERROR: ACK VPCEndpoint should not exist when both domainARN and domainRef are set" >&2
+                exit 1
+              fi
+              echo "OK: ACK VPCEndpoint correctly excluded for mutual exclusion violation"
+
+    # ── AC-4: domain neither set ──────────────────────────────────────────────
+    # Given: spec.domainARN: "" (default) and spec.domainRef: "" (default) — neither set
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: status.validationError: "one of domainARN or domainRef is required";
+    #       ACK VPCEndpoint NOT created
+
+    - name: ac4-domain-neither-set
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac4
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: ""
+                domainRef: ""
+                vpcSubnetIDs:
+                  - subnet-aaa
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac4
+                namespace: opensearchvpcendpoint
+              status:
+                validationError: "one of domainARN or domainRef is required"
+        - script:
+            content: |
+              sleep 3
+              if kubectl get vpcendpoints.opensearchservice.services.k8s.aws avovpe-ac4 -n opensearchvpcendpoint 2>/dev/null | grep -q avovpe-ac4; then
+                echo "ERROR: ACK VPCEndpoint should not exist when neither domainARN nor domainRef is set" >&2
+                exit 1
+              fi
+              echo "OK: ACK VPCEndpoint correctly excluded when neither domain reference is set"
+
+    # ── AC-5: VPC multi-subnet ────────────────────────────────────────────────
+    # Given: spec.vpcSubnetIDs: ["subnet-aaa", "subnet-bbb"], spec.vpcSecurityGroupIDs: ["sg-ccc"]
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: ACK VPCEndpoint spec.vpcOptions.subnetIDs: ["subnet-aaa", "subnet-bbb"],
+    #       spec.vpcOptions.securityGroupIDs: ["sg-ccc"]
+
+    - name: ac5-vpc-multi-subnet
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac5
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: "arn:aws:es:us-east-1:123:domain/multi-subnet-domain"
+                vpcSubnetIDs:
+                  - subnet-aaa
+                  - subnet-bbb
+                vpcSecurityGroupIDs:
+                  - sg-ccc
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac5
+                namespace: opensearchvpcendpoint
+              spec:
+                domainARN: "arn:aws:es:us-east-1:123:domain/multi-subnet-domain"
+                vpcOptions:
+                  subnetIDs:
+                    - subnet-aaa
+                    - subnet-bbb
+                  securityGroupIDs:
+                    - sg-ccc
+
+    # ── AC-6: subnet required ─────────────────────────────────────────────────
+    # Given: spec.vpcSubnetIDs: [] (empty)
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: status.validationError: "vpcSubnetIDs is required and must not be empty";
+    #       ACK VPCEndpoint NOT created
+
+    - name: ac6-subnet-required
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac6
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcSubnetIDs: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac6
+                namespace: opensearchvpcendpoint
+              status:
+                validationError: "vpcSubnetIDs is required and must not be empty"
+        - script:
+            content: |
+              sleep 3
+              if kubectl get vpcendpoints.opensearchservice.services.k8s.aws avovpe-ac6 -n opensearchvpcendpoint 2>/dev/null | grep -q avovpe-ac6; then
+                echo "ERROR: ACK VPCEndpoint should not exist when vpcSubnetIDs is empty" >&2
+                exit 1
+              fi
+              echo "OK: ACK VPCEndpoint correctly excluded for empty vpcSubnetIDs"
+
+    # ── AC-7: VPC default security group ──────────────────────────────────────
+    # Given: spec.vpcSubnetIDs: ["subnet-aaa"], spec.vpcSecurityGroupIDs: [] (empty — default SG)
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: ACK VPCEndpoint spec.vpcOptions.subnetIDs: ["subnet-aaa"];
+    #       securityGroupIDs empty/omitted (default VPC security group)
+
+    - name: ac7-vpc-default-sg
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac7
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcSubnetIDs:
+                  - subnet-aaa
+                vpcSecurityGroupIDs: []
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac7
+                namespace: opensearchvpcendpoint
+              spec:
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcOptions:
+                  subnetIDs:
+                    - subnet-aaa
+
+    # ── AC-8: no naming fields ─────────────────────────────────────────────────
+    # Given: any OpenSearchVPCEndpoint CR (using avovpe-ac1 already created above)
+    # When: inspect the RGD schema and OpenSearchVPCEndpoint status
+    # Then: No effectiveName, spec.nameOverride, status.resourceName, status.predictedArn,
+    #       or status.namingStatus fields present (KRO-236 naming exemption)
+
+    - name: ac8-no-naming-fields
+      try:
+        - script:
+            content: |
+              # Verify no naming fields in the RGD schema
+              SCHEMA=$(kubectl get rgd opensearchvpcendpoint.aws.kropath.run -o json)
+              for field in effectiveName nameOverride resourceName predictedArn namingStatus; do
+                if echo "$SCHEMA" | grep -q "\"$field\""; then
+                  echo "ERROR: Naming field '$field' found in RGD schema (KRO-236 violation)" >&2
+                  exit 1
+                fi
+              done
+              echo "OK: No naming fields in RGD schema"
+
+              # Verify no naming fields on the OpenSearchVPCEndpoint CR status
+              STATUS=$(kubectl get opensearchvpcendpoint avovpe-ac1 -n opensearchvpcendpoint -o json)
+              for field in resourceName predictedArn namingStatus; do
+                if echo "$STATUS" | python3 -c "import sys,json; s=json.load(sys.stdin).get('status',{}); exit(0 if '$field' not in s else 1)" 2>/dev/null; then
+                  echo "OK: status.$field absent"
+                else
+                  echo "ERROR: status.$field found on OpenSearchVPCEndpoint (KRO-236 violation)" >&2
+                  exit 1
+                fi
+              done
+
+              # Verify no spec.nameOverride on OpenSearchVPCEndpoint schema
+              if echo "$SCHEMA" | python3 -c "import sys,json; d=json.load(sys.stdin); spec=d.get('spec',{}).get('schema',{}).get('spec',{}); exit(0 if 'nameOverride' not in spec else 1)" 2>/dev/null; then
+                echo "OK: spec.nameOverride absent from schema"
+              else
+                echo "ERROR: spec.nameOverride found in OpenSearchVPCEndpoint schema (KRO-236 violation)" >&2
+                exit 1
+              fi
+
+    # ── AC-9: tags K8s-only ───────────────────────────────────────────────────
+    # Given: OpenSearchConfig.mandatory.tags: {team: search}; spec.tags: {purpose: vpc}
+    # When: OpenSearchVPCEndpoint reconciled
+    # Then: ACK VPCEndpoint metadata.labels contains aws.kropath.run/team: search
+    #       AND aws.kropath.run/purpose: vpc; NO spec.tags forwarded to ACK VPCEndpoint
+
+    - name: ac9-tags-k8s-only
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac9
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: mandatory-tags
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcSubnetIDs:
+                  - subnet-aaa
+                tags:
+                  purpose: vpc
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac9
+                namespace: opensearchvpcendpoint
+                labels:
+                  aws.kropath.run/team: search
+                  aws.kropath.run/purpose: vpc
+        # Verify no spec.tags on ACK VPCEndpoint — VPCEndpoint has no cloud tags field.
+        - script:
+            content: |
+              TAGS=$(kubectl get vpcendpoints.opensearchservice.services.k8s.aws avovpe-ac9 \
+                -n opensearchvpcendpoint -o jsonpath='{.spec.tags}' 2>/dev/null || echo "")
+              if [ -n "$TAGS" ] && [ "$TAGS" != "null" ]; then
+                echo "ERROR: ACK VPCEndpoint must not have spec.tags (VPCEndpoint has no cloud tags) — found: $TAGS" >&2
+                exit 1
+              fi
+              echo "OK: ACK VPCEndpoint has no spec.tags"
+
+    # ── AC-10: standard metadata ──────────────────────────────────────────────
+    # Given: any vpc endpoint CR
+    # When: ACK VPCEndpoint child created
+    # Then: app.kubernetes.io/managed-by: kro; app.kubernetes.io/instance: <cr-name>;
+    #       services.k8s.aws/deletion-policy: retain; ownerReferences back to OpenSearchVPCEndpoint
+
+    - name: ac10-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac10
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcSubnetIDs:
+                  - subnet-aaa
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac10
+                namespace: opensearchvpcendpoint
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: avovpe-ac10
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: OpenSearchVPCEndpoint
+                    name: avovpe-ac10
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # ── AC-11: deletion policy delete ────────────────────────────────────────
+    # Given: spec.deletionPolicy: "delete"
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: ACK VPCEndpoint annotation services.k8s.aws/deletion-policy: delete
+
+    - name: ac11-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac11
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                deletionPolicy: delete
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcSubnetIDs:
+                  - subnet-aaa
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac11
+                namespace: opensearchvpcendpoint
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ── AC-12: deletion policy retain (default) ───────────────────────────────
+    # Given: spec.deletionPolicy not set (default: retain)
+    # When: OpenSearchVPCEndpoint CR applied
+    # Then: ACK VPCEndpoint annotation services.k8s.aws/deletion-policy: retain
+
+    - name: ac12-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              metadata:
+                name: avovpe-ac12
+                namespace: opensearchvpcendpoint
+              spec:
+                configRef: general-policy
+                domainARN: "arn:aws:es:us-east-1:123:domain/my-domain"
+                vpcSubnetIDs:
+                  - subnet-aaa
+                # deletionPolicy not set; schema default is "retain"
+        - assert:
+            resource:
+              apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+              kind: VPCEndpoint
+              metadata:
+                name: avovpe-ac12
+                namespace: opensearchvpcendpoint
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
