@@ -1,0 +1,941 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-org-02 Chainsaw tests -- 21 acceptance criteria for OrganizationsAccount RGD.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: organizationsaccount
+spec:
+  skipDelete: true
+  namespace: organizationsaccount
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: defaults applied; ACK Account gets correct name, email, iamUserAccessToBilling=ALLOW, roleName.
+    - name: ac1-account-create-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac1-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  iamUserAccessToBilling: allow
+                  roleName: OrganizationAccountAccessRole
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac1-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"allow","roleName":"OrganizationAccountAccessRole","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac1-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac1-cfg
+                email: ac1@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac1-acct
+                namespace: organizationsaccount
+              spec:
+                name: organizationsaccount-ac1-acct
+                email: ac1@example.com
+                iamUserAccessToBilling: "ALLOW"
+                roleName: OrganizationAccountAccessRole
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac1-acct
+                namespace: organizationsaccount
+              status:
+                resourceName: organizationsaccount-ac1-acct
+                namingStatus: valid
+
+    # AC-2: ACK reports state=SUCCEEDED, accountID set → OrganizationsAccount status surfaces both.
+    - name: ac2-account-status-succeeded
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac2-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac2-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac2-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac2-cfg
+                email: ac2@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac2-acct
+                namespace: organizationsaccount
+        - script:
+            content: |
+              kubectl patch account ac2-acct -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"state":"SUCCEEDED","accountID":"210987654321","createAccountRequestID":"car-abc123","failureReason":""}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac2-acct
+                namespace: organizationsaccount
+              status:
+                accountState: SUCCEEDED
+                accountID: "210987654321"
+                createAccountRequestID: car-abc123
+
+    # AC-3: mandatory.iamUserAccessToBilling=deny wins over instance allow → ACK gets DENY.
+    - name: ac3-mandatory-iamUserAccessToBilling
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac3-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  iamUserAccessToBilling: deny
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac3-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"deny","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"allow","roleName":"OrganizationAccountAccessRole","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac3-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac3-cfg
+                email: ac3@example.com
+                iamUserAccessToBilling: allow
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac3-acct
+                namespace: organizationsaccount
+              spec:
+                iamUserAccessToBilling: "DENY"
+
+    # AC-4: mandatory.roleName wins over instance value.
+    - name: ac4-mandatory-roleName
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac4-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  roleName: SecureAccessRole
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac4-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"SecureAccessRole","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac4-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac4-cfg
+                email: ac4@example.com
+                roleName: InstanceAccessRole
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac4-acct
+                namespace: organizationsaccount
+              spec:
+                roleName: SecureAccessRole
+
+    # AC-5: instance iamUserAccessToBilling=deny wins over defaults.iamUserAccessToBilling=allow.
+    - name: ac5-instance-override-billing
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac5-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                defaults:
+                  iamUserAccessToBilling: allow
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac5-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"allow","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac5-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac5-cfg
+                email: ac5@example.com
+                iamUserAccessToBilling: deny
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac5-acct
+                namespace: organizationsaccount
+              spec:
+                iamUserAccessToBilling: "DENY"
+
+    # AC-6: instance roleName wins over defaults.
+    - name: ac6-instance-override-roleName
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac6-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  roleName: DefaultRole
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac6-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"DefaultRole","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac6-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac6-cfg
+                email: ac6@example.com
+                roleName: DevAccessRole
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac6-acct
+                namespace: organizationsaccount
+              spec:
+                roleName: DevAccessRole
+
+    # AC-7: empty instance → defaults.iamUserAccessToBilling and defaults.roleName applied.
+    - name: ac7-defaults-fallback
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac7-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                defaults:
+                  iamUserAccessToBilling: deny
+                  roleName: OrgRole
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac7-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"deny","roleName":"OrgRole","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac7-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac7-cfg
+                email: ac7@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac7-acct
+                namespace: organizationsaccount
+              spec:
+                iamUserAccessToBilling: "DENY"
+                roleName: OrgRole
+
+    # AC-8: no tier sets the fields → RGD built-in defaults ALLOW and OrganizationAccountAccessRole.
+    - name: ac8-builtin-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac8-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac8-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac8-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac8-cfg
+                email: ac8@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac8-acct
+                namespace: organizationsaccount
+              spec:
+                iamUserAccessToBilling: "ALLOW"
+                roleName: OrganizationAccountAccessRole
+
+    # AC-9: {namespace}-{name} template → status.resourceName correct; namingStatus: valid.
+    - name: ac9-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac9-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac9-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac9-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac9-cfg
+                email: ac9@example.com
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac9-acct
+                namespace: organizationsaccount
+              status:
+                resourceName: organizationsaccount-ac9-acct
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac9-acct
+                namespace: organizationsaccount
+              spec:
+                name: organizationsaccount-ac9-acct
+
+    # AC-10: mandatory.namingTemplate=corp-{name} overrides defaults template.
+    - name: ac10-naming-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac10-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory:
+                  namingTemplate: corp-{name}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac10-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"corp-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac10-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac10-cfg
+                email: ac10@example.com
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac10-acct
+                namespace: organizationsaccount
+              status:
+                resourceName: corp-ac10-acct
+                namingStatus: valid
+
+    # AC-11: spec.nameOverride bypasses naming template.
+    - name: ac11-nameOverride
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac11-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac11-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac11-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac11-cfg
+                email: ac11@example.com
+                nameOverride: my-special-account
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac11-acct
+                namespace: organizationsaccount
+              status:
+                resourceName: my-special-account
+                namingStatus: valid
+
+    # AC-12 (negative): template references absent tag {tag.env} → namingStatus: invalid-unresolved-tokens.
+    - name: ac12-naming-invalid-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac12-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}-{tag.env}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac12-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}-{tag.env}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac12-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac12-cfg
+                email: ac12@example.com
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac12-acct
+                namespace: organizationsaccount
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-13: KropathConfig + OrganizationsConfig mandatory tags + instance tags all merged; mandatory wins.
+    - name: ac13-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac13-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac13-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{"compliance":"sox","environment":"prod"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{"environment":"dev","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac13-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac13-cfg
+                email: ac13@example.com
+                tags:
+                  project: myapp
+        - script:
+            content: |
+              # Tags are a sorted [{key,value}] list; use jq for order-independent verification.
+              TAGS=$(kubectl get account ac13-acct -n organizationsaccount -o jsonpath='{.spec.tags}')
+              echo "$TAGS" | python3 -c "
+              import sys, json
+              tags = {t['key']: t['value'] for t in json.load(sys.stdin)}
+              assert tags.get('compliance') == 'sox', f'expected sox, got {tags.get(\"compliance\")}'
+              assert tags.get('environment') == 'prod', f'mandatory must win: expected prod, got {tags.get(\"environment\")}'
+              assert tags.get('team') == 'platform', f'expected platform, got {tags.get(\"team\")}'
+              assert tags.get('project') == 'myapp', f'expected myapp, got {tags.get(\"project\")}'
+              print('tag merge assertion passed')
+              "
+
+    # AC-14: mandatory.syncedLabels → child metadata.labels has aws.kropath.run/ prefix AND cloud tags.
+    - name: ac14-syncedLabels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac14-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory:
+                  syncedLabels:
+                    data-class: restricted
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac14-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{"data-class":"restricted"},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac14-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac14-cfg
+                email: ac14@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac14-acct
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/data-class: restricted
+
+    # AC-15: syncedAnnotations → child metadata.annotations has aws.kropath.run/ prefix.
+    - name: ac15-syncedAnnotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac15-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory:
+                  syncedAnnotations:
+                    owner: platform
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac15-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"platform"}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac15-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac15-cfg
+                email: ac15@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac15-acct
+                namespace: organizationsaccount
+                annotations:
+                  aws.kropath.run/owner: platform
+
+    # AC-16: any OrganizationsAccount → child has managed-by kro, instance label, deletion-policy annotation.
+    - name: ac16-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac16-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac16-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac16-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac16-cfg
+                email: ac16@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac16-acct
+                namespace: organizationsaccount
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac16-acct
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-17: spec.deletionPolicy=delete → annotation services.k8s.aws/deletion-policy: delete.
+    - name: ac17-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac17-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac17-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac17-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac17-cfg
+                email: ac17@example.com
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac17-acct
+                namespace: organizationsaccount
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-18: spec.deletionPolicy=retain (default) → annotation retain.
+    - name: ac18-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac18-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac18-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac18-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac18-cfg
+                email: ac18@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac18-acct
+                namespace: organizationsaccount
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-19 (negative): ACK reports state=FAILED → OrganizationsAccount surfaces accountState=FAILED, failureReason.
+    - name: ac19-account-creation-failed
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: ac19-cfg
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig ac19-cfg -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac19-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: ac19-cfg
+                email: ac19@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac19-acct
+                namespace: organizationsaccount
+        - script:
+            content: |
+              kubectl patch account ac19-acct -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"state":"FAILED","failureReason":"EMAIL_ALREADY_EXISTS"}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac19-acct
+                namespace: organizationsaccount
+              status:
+                accountState: FAILED
+                failureReason: EMAIL_ALREADY_EXISTS
+
+    # AC-20: spec.configRef=security-baseline selects that profile's mandatory settings.
+    - name: ac20-configRef-selection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsConfig
+              metadata:
+                name: security-baseline
+                namespace: organizationsaccount
+                labels:
+                  aws.kropath.run/resource-name: security-baseline
+              spec:
+                mandatory:
+                  iamUserAccessToBilling: deny
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch organizationsconfig security-baseline -n organizationsaccount \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"iamUserAccessToBilling":"deny","roleName":"","parentID":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"iamUserAccessToBilling":"","roleName":"","parentID":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac20-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: security-baseline
+                email: ac20@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac20-acct
+                namespace: organizationsaccount
+              spec:
+                iamUserAccessToBilling: "DENY"
+
+    # AC-21: spec.configRef=nonexistent-profile → no config found, falls through to RGD built-in defaults.
+    - name: ac21-configRef-fallthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: OrganizationsAccount
+              metadata:
+                name: ac21-acct
+                namespace: organizationsaccount
+              spec:
+                configRef: nonexistent-profile
+                email: ac21@example.com
+        - assert:
+            resource:
+              apiVersion: organizations.services.k8s.aws/v1alpha1
+              kind: Account
+              metadata:
+                name: ac21-acct
+                namespace: organizationsaccount
+              spec:
+                iamUserAccessToBilling: "ALLOW"
+                roleName: OrganizationAccountAccessRole
