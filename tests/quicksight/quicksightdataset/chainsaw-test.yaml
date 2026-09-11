@@ -1,0 +1,1183 @@
+# Chainsaw test suite for QuickSightDataSet RGD.
+# Acceptance criteria: DST-AC-1 through DST-AC-21.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step ACK deletes.
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: quicksightdataset
+spec:
+  namespace: quicksightdataset
+  skipDelete: true
+  steps:
+
+    # DST-AC-1: Tags merge — defaults + spec + mandatory, mandatory wins; list format {key,value}.
+    - name: dstac1-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac1-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory:
+                  tags:
+                    env: prod
+                    owner: mandatory-owner
+                defaults:
+                  tags:
+                    env: dev
+                    team: platform
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac1-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{"env":"prod","owner":"mandatory-owner"},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{"env":"dev","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac1-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac1-cfg
+                resourceId: ac1-dataset-id
+                physicalTableMap:
+                  Table1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: table1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac1-ds
+                namespace: quicksightdataset
+              spec:
+                dataSetID: ac1-dataset-id
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac1-ds -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e '
+                (map(select(.key=="env")) | length == 1) and
+                (map(select(.key=="env"))[0].value == "prod") and
+                (map(select(.key=="owner")) | length == 1) and
+                (map(select(.key=="owner"))[0].value == "mandatory-owner") and
+                (map(select(.key=="team")) | length == 1) and
+                (map(select(.key=="team"))[0].value == "platform")
+              ' || { echo "FAIL: tags merge incorrect: $TAGS"; exit 1; }
+              echo "PASS: tags merged correctly with mandatory-wins"
+
+    # DST-AC-2: syncedLabels dual-write — K8s metadata.labels (prefixed) AND cloud spec.tags (plain).
+    - name: dstac2-syncedlabels-dualwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac2-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    team: infra
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac2-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{"team":"infra"},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac2-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac2-cfg
+                resourceId: ac2-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac2-ds
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/team: infra
+        - script:
+            content: |
+              # Cloud tags must contain plain key "team" (no prefix)
+              TAGS=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac2-ds -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="team")) | length == 1 and .[0].value == "infra"' \
+                || { echo "FAIL: syncedLabels not in cloud tags: $TAGS"; exit 1; }
+              echo "PASS: syncedLabels dual-write verified"
+
+    # DST-AC-3: syncedAnnotations dual-write — K8s metadata.annotations (prefixed) AND cloud spec.tags (plain).
+    - name: dstac3-syncedannotations-dualwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac3-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  syncedAnnotations:
+                    cost-center: "9900"
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac3-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-center":"9900"}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac3-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac3-cfg
+                resourceId: ac3-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac3-ds
+                namespace: quicksightdataset
+                annotations:
+                  aws.kropath.run/cost-center: "9900"
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac3-ds -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="cost-center")) | length == 1 and .[0].value == "9900"' \
+                || { echo "FAIL: syncedAnnotations not in cloud tags: $TAGS"; exit 1; }
+              echo "PASS: syncedAnnotations dual-write verified"
+
+    # DST-AC-4: Default naming template {namespace}-{name} applied.
+    - name: dstac4-default-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac4-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac4-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac4-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac4-cfg
+                resourceId: ac4-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac4-ds
+                namespace: quicksightdataset
+              spec:
+                name: quicksightdataset-ac4-ds
+
+    # DST-AC-5: mandatory.namingTemplate overrides default.
+    - name: dstac5-mandatory-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac5-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "acme-{name}"
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac5-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"namingTemplate":"acme-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac5-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac5-cfg
+                resourceId: ac5-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac5-ds
+                namespace: quicksightdataset
+              spec:
+                name: acme-ac5-ds
+
+    # DST-AC-6: spec.nameOverride bypasses all templates.
+    - name: dstac6-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac6-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac6-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac6-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac6-cfg
+                nameOverride: my-custom-dataset
+                resourceId: ac6-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac6-ds
+                namespace: quicksightdataset
+              spec:
+                name: my-custom-dataset
+
+    # DST-AC-7 (negative): Unresolved {tag.env} in naming template → namingStatus: invalid-unresolved-tokens, no ACK DataSet.
+    - name: dstac7-negative-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac7-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "ds-{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac7-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"namingTemplate":"ds-{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac7-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac7-cfg
+                resourceId: ac7-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac7-ds
+                namespace: quicksightdataset
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              # ACK DataSet must NOT be created when naming is invalid
+              COUNT=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac7-ds 2>/dev/null | grep -c ac7-ds || true)
+              if [ "$COUNT" -gt 0 ]; then
+                echo "FAIL: ACK DataSet was created despite invalid naming token"
+                exit 1
+              fi
+              echo "PASS: ACK DataSet correctly absent when naming is invalid"
+
+    # DST-AC-8: awsAccountID injected from effectiveConfig.aws.accountId.
+    - name: dstac8-account-id-injection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac8-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac8-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"999888777666","region":"eu-west-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac8-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac8-cfg
+                resourceId: ac8-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:eu-west-1:999888777666:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac8-ds
+                namespace: quicksightdataset
+              spec:
+                awsAccountID: "999888777666"
+
+    # DST-AC-9: importMode instance-level — spec.importMode = DIRECT_QUERY used when no governance override.
+    - name: dstac9-importmode-instance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac9-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac9-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac9-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac9-cfg
+                resourceId: ac9-dataset-id
+                importMode: DIRECT_QUERY
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac9-ds
+                namespace: quicksightdataset
+              spec:
+                importMode: DIRECT_QUERY
+              (status.effectiveImportMode): DIRECT_QUERY
+
+    # DST-AC-10: importMode defaults cascade — defaults.importMode = SPICE when no mandatory or instance.
+    - name: dstac10-importmode-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac10-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                defaults:
+                  importMode: SPICE
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac10-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"importMode":"SPICE","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac10-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac10-cfg
+                resourceId: ac10-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac10-ds
+                namespace: quicksightdataset
+              spec:
+                importMode: SPICE
+              (status.effectiveImportMode): SPICE
+
+    # DST-AC-11: importMode mandatory override — mandatory.importMode wins over instance and defaults.
+    - name: dstac11-importmode-mandatory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac11-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory:
+                  importMode: SPICE
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac11-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"importMode":"SPICE","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac11-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac11-cfg
+                resourceId: ac11-dataset-id
+                importMode: DIRECT_QUERY
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac11-ds
+                namespace: quicksightdataset
+              spec:
+                importMode: SPICE
+              (status.effectiveImportMode): SPICE
+
+    # DST-AC-12: importMode built-in default SPICE when no governance and no spec value.
+    - name: dstac12-importmode-builtin-default
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac12-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac12-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac12-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac12-cfg
+                resourceId: ac12-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac12-ds
+                namespace: quicksightdataset
+              spec:
+                importMode: SPICE
+              (status.effectiveImportMode): SPICE
+
+    # DST-AC-13: physicalTableMap required field — S3Source variant.
+    - name: dstac13-physical-table-map-s3
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac13-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac13-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac13-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac13-cfg
+                resourceId: ac13-dataset-id
+                physicalTableMap:
+                  S3Table:
+                    s3Source:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/s3ds
+                      uploadSettings:
+                        format: CSV
+                        startFromRow: 1
+                      inputColumns:
+                        - name: col1
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac13-ds
+                namespace: quicksightdataset
+        - script:
+            content: |
+              PTM=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac13-ds -o json | jq '.spec.physicalTableMap')
+              echo "$PTM" | jq -e '.S3Table.s3Source.uploadSettings.format == "CSV"' \
+                || { echo "FAIL: physicalTableMap s3Source not passed through: $PTM"; exit 1; }
+              echo "PASS: physicalTableMap s3Source passed through"
+
+    # DST-AC-14: logicalTableMap optional — passed through when provided.
+    - name: dstac14-logical-table-map
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac14-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac14-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac14-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac14-cfg
+                resourceId: ac14-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+                logicalTableMap:
+                  L1:
+                    alias: MyView
+                    source:
+                      physicalTableId: T1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac14-ds
+                namespace: quicksightdataset
+        - script:
+            content: |
+              LTM=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac14-ds -o json | jq '.spec.logicalTableMap')
+              echo "$LTM" | jq -e '.L1.alias == "MyView"' \
+                || { echo "FAIL: logicalTableMap not passed through: $LTM"; exit 1; }
+              echo "PASS: logicalTableMap passed through"
+
+    # DST-AC-15: Optional fields absent when not provided — logicalTableMap, dataSetUsageConfiguration, fieldFolders, rowLevelPermissionDataSet.
+    - name: dstac15-optional-fields-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac15-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac15-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac15-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac15-cfg
+                resourceId: ac15-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac15-ds
+                namespace: quicksightdataset
+        - script:
+            content: |
+              SPEC=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac15-ds -o json | jq '.spec')
+              echo "$SPEC" | jq -e '
+                (.logicalTableMap == null) and
+                (.dataSetUsageConfiguration == null) and
+                (.fieldFolders == null) and
+                (.rowLevelPermissionDataSet == null)
+              ' || { echo "FAIL: optional fields should be absent: $SPEC"; exit 1; }
+              echo "PASS: optional fields correctly absent"
+
+    # DST-AC-16: permissions pass-through.
+    - name: dstac16-permissions
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac16-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac16-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac16-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac16-cfg
+                resourceId: ac16-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:111111111111:user/default/admin
+                    actions:
+                      - quicksight:DescribeDataSet
+                      - quicksight:PassDataSet
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac16-ds
+                namespace: quicksightdataset
+              spec:
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:111111111111:user/default/admin
+
+    # DST-AC-17: Standard K8s metadata — ownerReference, managed-by label.
+    - name: dstac17-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac17-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac17-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac17-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac17-cfg
+                resourceId: ac17-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac17-ds
+                namespace: quicksightdataset
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac17-ds
+        - script:
+            content: |
+              OWNERREFS=$(kubectl -n quicksightdataset get datasets.quicksight.services.k8s.aws ac17-ds -o json | jq '.metadata.ownerReferences')
+              echo "$OWNERREFS" | jq -e '
+                length == 1 and
+                .[0].kind == "QuickSightDataSet" and
+                .[0].name == "ac17-ds" and
+                .[0].controller == true
+              ' || { echo "FAIL: ownerReference wrong: $OWNERREFS"; exit 1; }
+              echo "PASS: ownerReference correct"
+
+    # DST-AC-18: deletionPolicy: delete → annotation services.k8s.aws/deletion-policy: delete.
+    - name: dstac18-deletionpolicy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac18-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac18-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac18-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac18-cfg
+                deletionPolicy: delete
+                resourceId: ac18-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac18-ds
+                namespace: quicksightdataset
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # DST-AC-19: deletionPolicy: retain (default) → annotation services.k8s.aws/deletion-policy: retain.
+    - name: dstac19-deletionpolicy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac19-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac19-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac19-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac19-cfg
+                resourceId: ac19-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac19-ds
+                namespace: quicksightdataset
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # DST-AC-20: folderARNs pass-through.
+    - name: dstac20-folder-arns
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac20-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac20-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac20-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac20-cfg
+                resourceId: ac20-dataset-id
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:us-east-1:111111111111:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder1
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder2
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac20-ds
+                namespace: quicksightdataset
+              spec:
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder1
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder2
+
+    # DST-AC-21: predictedArn includes resourceId (not effectiveName).
+    - name: dstac21-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac21-cfg
+                namespace: quicksightdataset
+                labels:
+                  aws.kropath.run/resource-name: ac21-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdataset patch quicksightconfigs.aws.kropath.run ac21-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"123456789012","region":"ap-southeast-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              metadata:
+                name: ac21-ds
+                namespace: quicksightdataset
+              spec:
+                configRef: ac21-cfg
+                nameOverride: display-name-only
+                resourceId: immutable-resource-id-789
+                physicalTableMap:
+                  T1:
+                    relationalTable:
+                      dataSourceArn: arn:aws:quicksight:ap-southeast-1:123456789012:datasource/ds1
+                      name: t1
+                      inputColumns:
+                        - name: id
+                          type: STRING
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSet
+              metadata:
+                name: ac21-ds
+                namespace: quicksightdataset
+              spec:
+                name: display-name-only
+                dataSetID: immutable-resource-id-789
+        - script:
+            content: |
+              # predictedArn must use resourceId, NOT nameOverride
+              ARN=$(kubectl -n quicksightdataset get quicksightdatasets.aws.kropath.run ac21-ds -o jsonpath='{.status.predictedArn}')
+              EXPECTED="arn:aws:quicksight:ap-southeast-1:123456789012:dataset/immutable-resource-id-789"
+              if [ "$ARN" != "$EXPECTED" ]; then
+                echo "FAIL: predictedArn='$ARN', expected='$EXPECTED'"
+                exit 1
+              fi
+              echo "PASS: predictedArn uses resourceId correctly: $ARN"
