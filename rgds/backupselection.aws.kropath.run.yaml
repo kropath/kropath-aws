@@ -1,0 +1,139 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Naming: EXEMPT (OD-4, Option B). BackupSelection has no meaningful cloud name field;
+# identity is an opaque selectionId UUID. No effectiveName, nameOverride, namingTemplate,
+# predictedArn, or resourceName in schema or status.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: backupselection.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: BackupSelection
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      # tags, syncedLabels, syncedAnnotations applied to K8s metadata only (OD-4).
+      # BackupSelection has no cloud-side tag surface; ACK spec carries no tags field.
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Plan binding — exactly one of backupPlanRef or backupPlanID must be set.
+      # backupPlanRef: name of a BackupPlan CR in the same namespace (ACK resolves to planId).
+      # backupPlanID: direct AWS plan UUID (immutable after creation).
+      backupPlanRef: string | default=""
+      backupPlanID: string | default=""
+      # IAM role — exactly one of iamRoleRef or iamRoleARN must be set (or governance supplies it).
+      # iamRoleRef: name of an ACK IAMRole CR in the same namespace.
+      # iamRoleARN: direct ARN; governance cascade falls back to BackupConfig.mandatory.iamRoleARN.
+      iamRoleRef: string | default=""
+      iamRoleARN: string | default=""
+      # displayName → ACK spec.name (human-readable label; derived from metadata.name when empty).
+      displayName: string | default=""
+      # Resource assignment — at least one of resources, listOfTags, or conditions required.
+      resources: "[]string"
+      notResources: "[]string"
+      listOfTags: "[]object"
+      conditions: object | default={}
+    status:
+      selectionId: >-
+        ${selection.?status.?selectionID.orValue("")}
+      backupPlanID: >-
+        ${selection.?status.?backupPlanID.orValue("")}
+      conditions: >-
+        ${selection.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: SelectionId
+        type: string
+        jsonPath: .status.selectionId
+      - name: BackupPlanID
+        type: string
+        jsonPath: .status.backupPlanID
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: BackupConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACK BackupSelection CR — primary cloud resource.
+    # Naming: EXEMPT — uses metadata.name as ACK spec.name (or displayName override).
+    # Tags: K8s metadata only — merged onto labels/annotations with kropath.run/ prefix.
+    # IAM role: mandatory governance → instance spec → defaults governance.
+    - id: selection
+      template:
+        apiVersion: backup.services.k8s.aws/v1alpha1
+        kind: BackupSelection
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.tags.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BackupSelection
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # displayName → ACK spec.name; derived from metadata.name when empty.
+          name: >-
+            ${schema.spec.displayName != "" ? schema.spec.displayName : schema.metadata.name}
+          # Plan binding: ACK resolves backupPlanRef.from.name to planId automatically.
+          # When backupPlanID is provided directly, omit backupPlanRef.
+          backupPlanID: >-
+            ${schema.spec.backupPlanID}
+          backupPlanRef: >-
+            ${schema.spec.backupPlanRef != "" ? {"from": {"name": schema.spec.backupPlanRef}} : {}}
+          # IAM role: iamRoleRef takes precedence over iamRoleARN when both set.
+          # Governance cascade: mandatory.iamRoleARN → instance iamRoleARN → defaults.iamRoleARN.
+          iamRoleARN: >-
+            ${schema.spec.iamRoleRef != "" ? "" :
+              ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?iamRoleARN.orValue("") != "")
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.iamRoleARN
+                : (schema.spec.iamRoleARN != ""
+                    ? schema.spec.iamRoleARN
+                    : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?iamRoleARN.orValue("") : "")))}
+          iamRoleRef: >-
+            ${schema.spec.iamRoleRef != "" ? {"from": {"name": schema.spec.iamRoleRef}} : {}}
+          # Resource assignment
+          # notResources and listOfTags are optional; use .? to avoid "no such key" when absent.
+          resources: >-
+            ${schema.spec.?resources.orValue([])}
+          notResources: >-
+            ${schema.spec.?notResources.orValue([])}
+          listOfTags: >-
+            ${schema.spec.?listOfTags.orValue([])}
+          conditions: >-
+            ${schema.spec.conditions}
