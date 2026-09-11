@@ -1,0 +1,232 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# QuickSightDataSet RGD — wraps ACK quicksight.services.k8s.aws/DataSet.
+# Atomic RGD (ADR-015 §2): composes one ACK CR.
+# importMode governed with 3-level cascade: mandatory > instance > defaults > "SPICE".
+# Tags: ACK QuickSight spec.tags is []object {key,value} format (not map).
+# ACK field: spec.dataSetID (not spec.id) for the immutable dataset identifier.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: quicksightdataset.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: QuickSightDataSet
+    scope: Namespaced
+    spec:
+      # Standard governance fields (ADR-015 §3)
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Governed field: importMode (3-level cascade, built-in default SPICE)
+      importMode: string | default=""
+      # QuickSight-specific required fields
+      resourceId: string | required=true
+      physicalTableMap: object | required=true
+      # QuickSight-specific optional fields (absent from child CR when nil)
+      logicalTableMap: object
+      columnGroups: "[]object | default=[]"
+      columnLevelPermissionRules: "[]object | default=[]"
+      dataSetUsageConfiguration: object
+      fieldFolders: object
+      permissions: "[]object | default=[]"
+      rowLevelPermissionDataSet: object
+      folderARNs: "[]string | default=[]"
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.aws) && naming.data.resourceId != "")
+          ? "arn:aws:quicksight:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":dataset/" + naming.data.resourceId
+          : ""}
+      effectiveImportMode: >-
+        ${naming.data.effectiveImportMode}
+      conditions: >-
+        ${dataSet.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: ImportMode
+        type: string
+        jsonPath: .status.effectiveImportMode
+  resources:
+    # Single governance config lookup (ADR-010 D-4, Theme 28/KRO-221).
+    # kro infers rsrcCfg as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: QuickSightConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming + computed-values ConfigMap.
+    # Stores effectiveName (display name), resourceId (ACK dataSetID, used in ARN),
+    # and effectiveImportMode (cascade result) so status can reference them.
+    # schema.spec.* cannot be referenced from the top-level status block (frequent-rgd-errors §3).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-qs-dataset-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: quicksightdataset-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef))}
+          # resourceId stored so status.predictedArn can reference it (schema.spec.* unavailable there).
+          resourceId: ${schema.spec.resourceId}
+          # effectiveImportMode: 3-level cascade mandatory > instance > defaults > SPICE built-in.
+          effectiveImportMode: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?importMode.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.importMode
+              : (schema.spec.importMode != ""
+                  ? schema.spec.importMode
+                  : ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?importMode.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.importMode
+                      : "SPICE"))}
+
+    # ACK DataSet CR — primary cloud resource.
+    # Only created when effectiveName has no unresolved tokens (naming gate).
+    - id: dataSet
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+      template:
+        apiVersion: quicksight.services.k8s.aws/v1alpha1
+        kind: DataSet
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSet
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # awsAccountID: required, injected from effectiveConfig (never from spec)
+          awsAccountID: >-
+            ${rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : ""}
+          # dataSetID: ACK field name for the immutable dataset identifier
+          dataSetID: ${schema.spec.resourceId}
+          # name: display name — always effectiveName (never metadata.name or resourceId)
+          name: ${naming.data.effectiveName}
+          # importMode: governed 3-level cascade result
+          importMode: ${naming.data.effectiveImportMode}
+          # physicalTableMap: required connector-specific table definitions
+          physicalTableMap: ${schema.spec.physicalTableMap}
+          # logicalTableMap: optional transform layer; absent when nil
+          logicalTableMap: ${schema.?spec.?logicalTableMap.orValue(null)}
+          # columnGroups: optional; passed through
+          columnGroups: ${schema.spec.columnGroups}
+          # columnLevelPermissionRules: optional; passed through
+          columnLevelPermissionRules: ${schema.spec.columnLevelPermissionRules}
+          # dataSetUsageConfiguration: optional; absent when nil
+          dataSetUsageConfiguration: ${schema.?spec.?dataSetUsageConfiguration.orValue(null)}
+          # fieldFolders: optional; absent when nil
+          fieldFolders: ${schema.?spec.?fieldFolders.orValue(null)}
+          # permissions: optional; passed through
+          permissions: ${schema.spec.permissions}
+          # rowLevelPermissionDataSet: optional RLS config; absent when nil
+          rowLevelPermissionDataSet: ${schema.?spec.?rowLevelPermissionDataSet.orValue(null)}
+          # folderARNs: optional organizational assignment
+          folderARNs: ${schema.spec.folderARNs}
+          # Cloud resource tags — ACK QuickSight uses []object {key,value} format (not map).
+          # Merge order: defaults → spec → mandatory (mandatory wins on collision).
+          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
