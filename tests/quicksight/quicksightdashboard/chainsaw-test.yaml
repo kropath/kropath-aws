@@ -1,0 +1,1094 @@
+# Chainsaw test suite for QuickSightDashboard RGD.
+# Acceptance criteria: DB-AC-1 through DB-AC-20.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step ACK deletes.
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: quicksightdashboard
+spec:
+  namespace: quicksightdashboard
+  skipDelete: true
+  steps:
+
+    # DB-AC-1: sourceEntity.sourceTemplate passed through to ACK Dashboard.
+    - name: dbac1-source-entity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac1-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac1-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac1-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac1-cfg
+                resourceId: ac1-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac1-db
+                namespace: quicksightdashboard
+              spec:
+                dashboardID: ac1-dashboard-id
+        - script:
+            content: |
+              ENTITY=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac1-db -o json | jq '.spec.sourceEntity')
+              echo "$ENTITY" | jq -e '
+                .sourceTemplate.arn == "arn:aws:quicksight:us-east-1:111111111111:template/tmpl1" and
+                (.sourceTemplate.dataSetReferences | length == 1) and
+                .sourceTemplate.dataSetReferences[0].dataSetPlaceholder == "ds1"
+              ' || { echo "FAIL: sourceEntity not passed through: $ENTITY"; exit 1; }
+              echo "PASS: sourceEntity passed through"
+
+    # DB-AC-2: Tags merge — defaults + spec + mandatory, mandatory wins; list format {key,value}.
+    - name: dbac2-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac2-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  tags:
+                    env: prod
+                    owner: mandatory-owner
+                defaults:
+                  tags:
+                    env: dev
+                    team: platform
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac2-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{"env":"prod","owner":"mandatory-owner"},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{"env":"dev","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac2-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac2-cfg
+                resourceId: ac2-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac2-db
+                namespace: quicksightdashboard
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac2-db -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e '
+                (map(select(.key=="env")) | length == 1) and
+                (map(select(.key=="env"))[0].value == "prod") and
+                (map(select(.key=="owner")) | length == 1) and
+                (map(select(.key=="owner"))[0].value == "mandatory-owner") and
+                (map(select(.key=="team")) | length == 1) and
+                (map(select(.key=="team"))[0].value == "platform")
+              ' || { echo "FAIL: tags merge incorrect: $TAGS"; exit 1; }
+              echo "PASS: tags merged correctly with mandatory-wins"
+
+    # DB-AC-3: syncedLabels dual-write — K8s metadata.labels (prefixed) AND cloud spec.tags (plain).
+    - name: dbac3-syncedlabels-dualwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac3-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    team: infra
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac3-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{"team":"infra"},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac3-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac3-cfg
+                resourceId: ac3-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac3-db
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/team: infra
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac3-db -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="team")) | length == 1 and .[0].value == "infra"' \
+                || { echo "FAIL: syncedLabels not in cloud tags: $TAGS"; exit 1; }
+              echo "PASS: syncedLabels dual-write verified"
+
+    # DB-AC-4: syncedAnnotations dual-write.
+    - name: dbac4-syncedannotations-dualwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac4-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  syncedAnnotations:
+                    cost-center: "8800"
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac4-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-center":"8800"}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac4-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac4-cfg
+                resourceId: ac4-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac4-db
+                namespace: quicksightdashboard
+                annotations:
+                  aws.kropath.run/cost-center: "8800"
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac4-db -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="cost-center")) | length == 1 and .[0].value == "8800"' \
+                || { echo "FAIL: syncedAnnotations not in cloud tags: $TAGS"; exit 1; }
+              echo "PASS: syncedAnnotations dual-write verified"
+
+    # DB-AC-5: Default naming template {namespace}-{name}.
+    - name: dbac5-default-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac5-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac5-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac5-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac5-cfg
+                resourceId: ac5-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac5-db
+                namespace: quicksightdashboard
+              spec:
+                name: quicksightdashboard-ac5-db
+
+    # DB-AC-6: mandatory.namingTemplate overrides default.
+    - name: dbac6-mandatory-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac6-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{name}"
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac6-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"namingTemplate":"corp-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac6-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac6-cfg
+                resourceId: ac6-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac6-db
+                namespace: quicksightdashboard
+              spec:
+                name: corp-ac6-db
+
+    # DB-AC-7: spec.nameOverride bypasses all templates.
+    - name: dbac7-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac7-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac7-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac7-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac7-cfg
+                nameOverride: my-custom-dashboard
+                resourceId: ac7-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac7-db
+                namespace: quicksightdashboard
+              spec:
+                name: my-custom-dashboard
+
+    # DB-AC-8 (negative): Unresolved {tag.env} in naming template → namingStatus: invalid-unresolved-tokens, no ACK Dashboard.
+    - name: dbac8-negative-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac8-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "db-{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac8-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"namingTemplate":"db-{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac8-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac8-cfg
+                resourceId: ac8-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac8-db
+                namespace: quicksightdashboard
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              COUNT=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac8-db 2>/dev/null | grep -c ac8-db || true)
+              if [ "$COUNT" -gt 0 ]; then
+                echo "FAIL: ACK Dashboard created despite invalid naming token"
+                exit 1
+              fi
+              echo "PASS: ACK Dashboard correctly absent when naming is invalid"
+
+    # DB-AC-9: awsAccountID injected from effectiveConfig.aws.accountId.
+    - name: dbac9-account-id-injection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac9-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac9-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"999888777666","region":"eu-west-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac9-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac9-cfg
+                resourceId: ac9-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:eu-west-1:999888777666:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:eu-west-1:999888777666:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac9-db
+                namespace: quicksightdashboard
+              spec:
+                awsAccountID: "999888777666"
+
+    # DB-AC-10: versionDescription pass-through.
+    - name: dbac10-version-description
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac10-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac10-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac10-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac10-cfg
+                resourceId: ac10-dashboard-id
+                versionDescription: "v1.0 - initial release"
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac10-db
+                namespace: quicksightdashboard
+              spec:
+                versionDescription: "v1.0 - initial release"
+
+    # DB-AC-11: dashboardPublishOptions pass-through when provided.
+    - name: dbac11-publish-options
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac11-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac11-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac11-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac11-cfg
+                resourceId: ac11-dashboard-id
+                dashboardPublishOptions:
+                  adHocFilteringOption:
+                    availabilityStatus: DISABLED
+                  exportToCSVOption:
+                    availabilityStatus: ENABLED
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac11-db
+                namespace: quicksightdashboard
+        - script:
+            content: |
+              OPTS=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac11-db -o json | jq '.spec.dashboardPublishOptions')
+              echo "$OPTS" | jq -e '
+                .adHocFilteringOption.availabilityStatus == "DISABLED" and
+                .exportToCSVOption.availabilityStatus == "ENABLED"
+              ' || { echo "FAIL: dashboardPublishOptions not passed through: $OPTS"; exit 1; }
+              echo "PASS: dashboardPublishOptions passed through"
+
+    # DB-AC-12: dashboardPublishOptions absent when not provided.
+    - name: dbac12-publish-options-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac12-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac12-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac12-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac12-cfg
+                resourceId: ac12-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac12-db
+                namespace: quicksightdashboard
+        - script:
+            content: |
+              OPTS=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac12-db -o json | jq '.spec.dashboardPublishOptions')
+              if [ "$OPTS" != "null" ]; then
+                echo "FAIL: dashboardPublishOptions should be absent: $OPTS"
+                exit 1
+              fi
+              echo "PASS: dashboardPublishOptions correctly absent"
+
+    # DB-AC-13: parameters pass-through when provided.
+    - name: dbac13-parameters
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac13-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac13-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac13-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac13-cfg
+                resourceId: ac13-dashboard-id
+                parameters:
+                  stringParameters:
+                    - name: Region
+                      values:
+                        - us-east-1
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac13-db
+                namespace: quicksightdashboard
+        - script:
+            content: |
+              PARAMS=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac13-db -o json | jq '.spec.parameters')
+              echo "$PARAMS" | jq -e '.stringParameters[0].name == "Region"' \
+                || { echo "FAIL: parameters not passed through: $PARAMS"; exit 1; }
+              echo "PASS: parameters passed through"
+
+    # DB-AC-14: permissions pass-through.
+    - name: dbac14-permissions
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac14-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac14-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac14-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac14-cfg
+                resourceId: ac14-dashboard-id
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:111111111111:user/default/analyst
+                    actions:
+                      - quicksight:DescribeDashboard
+                      - quicksight:ListDashboardVersions
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac14-db
+                namespace: quicksightdashboard
+              spec:
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:111111111111:user/default/analyst
+
+    # DB-AC-15: linkEntities pass-through.
+    - name: dbac15-link-entities
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac15-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac15-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac15-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac15-cfg
+                resourceId: ac15-dashboard-id
+                linkEntities:
+                  - arn:aws:quicksight:us-east-1:111111111111:dataset/linked-ds-1
+                  - arn:aws:quicksight:us-east-1:111111111111:analysis/linked-analysis-1
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac15-db
+                namespace: quicksightdashboard
+              spec:
+                linkEntities:
+                  - arn:aws:quicksight:us-east-1:111111111111:dataset/linked-ds-1
+                  - arn:aws:quicksight:us-east-1:111111111111:analysis/linked-analysis-1
+
+    # DB-AC-16: folderARNs pass-through.
+    - name: dbac16-folder-arns
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac16-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac16-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac16-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac16-cfg
+                resourceId: ac16-dashboard-id
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder1
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac16-db
+                namespace: quicksightdashboard
+              spec:
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder1
+
+    # DB-AC-17: deletionPolicy: delete → annotation services.k8s.aws/deletion-policy: delete.
+    - name: dbac17-deletionpolicy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac17-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac17-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac17-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac17-cfg
+                deletionPolicy: delete
+                resourceId: ac17-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac17-db
+                namespace: quicksightdashboard
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # DB-AC-18: deletionPolicy: retain (default) → annotation services.k8s.aws/deletion-policy: retain.
+    - name: dbac18-deletionpolicy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac18-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac18-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac18-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac18-cfg
+                resourceId: ac18-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac18-db
+                namespace: quicksightdashboard
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # DB-AC-19: Standard K8s metadata — ownerReference, managed-by label.
+    - name: dbac19-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac19-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac19-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac19-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac19-cfg
+                resourceId: ac19-dashboard-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac19-db
+                namespace: quicksightdashboard
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac19-db
+        - script:
+            content: |
+              OWNERREFS=$(kubectl -n quicksightdashboard get dashboards.quicksight.services.k8s.aws ac19-db -o json | jq '.metadata.ownerReferences')
+              echo "$OWNERREFS" | jq -e '
+                length == 1 and
+                .[0].kind == "QuickSightDashboard" and
+                .[0].name == "ac19-db" and
+                .[0].controller == true
+              ' || { echo "FAIL: ownerReference wrong: $OWNERREFS"; exit 1; }
+              echo "PASS: ownerReference correct"
+
+    # DB-AC-20: predictedArn uses resourceId (not effectiveName).
+    - name: dbac20-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac20-cfg
+                namespace: quicksightdashboard
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightdashboard patch quicksightconfigs.aws.kropath.run ac20-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"123456789012","region":"ap-southeast-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDashboard
+              metadata:
+                name: ac20-db
+                namespace: quicksightdashboard
+              spec:
+                configRef: ac20-cfg
+                nameOverride: display-name-dashboard
+                resourceId: immutable-dashboard-id-456
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:ap-southeast-1:123456789012:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:ap-southeast-1:123456789012:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Dashboard
+              metadata:
+                name: ac20-db
+                namespace: quicksightdashboard
+              spec:
+                name: display-name-dashboard
+                dashboardID: immutable-dashboard-id-456
+        - script:
+            content: |
+              ARN=$(kubectl -n quicksightdashboard get quicksightdashboards.aws.kropath.run ac20-db -o jsonpath='{.status.predictedArn}')
+              EXPECTED="arn:aws:quicksight:ap-southeast-1:123456789012:dashboard/immutable-dashboard-id-456"
+              if [ "$ARN" != "$EXPECTED" ]; then
+                echo "FAIL: predictedArn='$ARN', expected='$EXPECTED'"
+                exit 1
+              fi
+              echo "PASS: predictedArn uses resourceId correctly: $ARN"
