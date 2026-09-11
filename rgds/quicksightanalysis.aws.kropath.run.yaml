@@ -41,7 +41,7 @@ spec:
       resourceId: string | required=true
       sourceEntity: object | required=true
       # QuickSight-specific optional fields
-      themeARN: string | default=""
+      themeARN: string
       parameters: object
       definition: object
       permissions: "[]object | default=[]"
@@ -56,7 +56,7 @@ spec:
           ? "arn:aws:quicksight:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":analysis/" + naming.data.resourceId
           : ""}
       conditions: >-
-        ${analysis.?status.?conditions.orValue([])}
+        ${ackAnalysisRef.size() > 0 ? ackAnalysisRef[0].?status.?conditions.orValue([]) : []}
     additionalPrinterColumns:
       - name: ResourceName
         type: string
@@ -139,11 +139,24 @@ spec:
           # resourceId stored so status.predictedArn can reference it (schema.spec.* unavailable there).
           resourceId: ${schema.spec.resourceId}
 
-    # ACK Analysis CR — primary cloud resource.
-    # Only created when effectiveName has no unresolved tokens (naming gate).
+    # Always-bound self-lookup for the Analysis ACK child. The Analysis is split into
+    # two includeWhen variants (with/without themeARN). Variant names mentioned in
+    # status expressions are silently frozen when excluded — the externalRef resolves
+    # to [] until the child exists and is never excluded (frequent-rgd-errors §"Variant-Split").
+    - id: ackAnalysisRef
+      externalRef:
+        apiVersion: quicksight.services.k8s.aws/v1alpha1
+        kind: Analysis
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # ACK Analysis CR — created when effectiveName is valid AND themeARN is provided.
     - id: analysis
       includeWhen:
-        - '${!naming.data.effectiveName.contains("{")}'
+        - '${!naming.data.effectiveName.contains("{") && has(schema.spec.themeARN) && schema.spec.themeARN != ""}'
       template:
         apiVersion: quicksight.services.k8s.aws/v1alpha1
         kind: Analysis
@@ -177,7 +190,7 @@ spec:
           name: ${naming.data.effectiveName}
           # sourceEntity: required — typically sourceTemplate with dataSetReferences
           sourceEntity: ${schema.spec.sourceEntity}
-          # themeARN: optional string; pass-through (empty string = no theme)
+          # themeARN: present only in this variant (user provided a non-empty ARN)
           themeARN: ${schema.spec.themeARN}
           # parameters: optional; absent when nil
           parameters: ${schema.?spec.?parameters.orValue(null)}
@@ -190,6 +203,57 @@ spec:
           # Cloud resource tags — ACK QuickSight uses []object {key,value} format (not map).
           # Merge order: defaults → spec → mandatory (mandatory wins on collision).
           # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK Analysis CR — created when effectiveName is valid AND no themeARN provided.
+    # themeARN field is omitted entirely so ACK never sends an empty ARN to AWS.
+    - id: analysisNoTheme
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{") && (!has(schema.spec.themeARN) || schema.spec.themeARN == "")}'
+      template:
+        apiVersion: quicksight.services.k8s.aws/v1alpha1
+        kind: Analysis
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          awsAccountID: >-
+            ${rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : ""}
+          analysisID: ${schema.spec.resourceId}
+          name: ${naming.data.effectiveName}
+          sourceEntity: ${schema.spec.sourceEntity}
+          parameters: ${schema.?spec.?parameters.orValue(null)}
+          definition: ${schema.?spec.?definition.orValue(null)}
+          permissions: ${schema.spec.permissions}
+          folderARNs: ${schema.spec.folderARNs}
           tags: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
               .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
