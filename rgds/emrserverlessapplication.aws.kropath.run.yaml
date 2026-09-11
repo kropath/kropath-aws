@@ -48,17 +48,31 @@ spec:
       type_: string | default=SPARK
       # Optional image URI override.
       imageURI: string | default=""
-      # Optional initial capacity map key (e.g. "Driver"). Passthrough — not governed.
-      # For complex initial capacity, users apply ACK Application directly.
-      # Optional network configuration — subnets and security groups.
-      networkSubnetIds: "[]string | default=[]"
-      networkSecurityGroupIds: "[]string | default=[]"
-      # Optional monitoring configuration.
-      monitoringS3BucketURI: string | default=""
-      monitoringCloudWatchLogGroupName: string | default=""
+      # Lifecycle configuration (aws-emr-02 AC-15 / AC-16). Declared as bare
+      # booleans — NOT `| default=false` — so has() can distinguish "unset" from
+      # an explicit false (frequent-rgd-errors.md §tri-state boolean flags).
+      autoStartEnabled: boolean
+      autoStopEnabled: boolean
+      # Pre-initialized capacity per worker type (AC-17). Map key = worker type
+      # ("Driver" / "Executor"); structure preserved and passed through to ACK.
+      initialCapacity: "map[string]object | default={}"
+      # Instance-level override for maximum disk capacity (AC-18).
+      maximumCapacityDisk: string | default=""
+      # Additional KMS encryption context for disk encryption (AC-14).
+      diskEncryptionContext: "map[string]string | default={}"
+      # Optional network configuration — subnets and security groups (AC-19 / AC-20).
+      networkSubnetIDs: "[]string | default=[]"
+      networkSecurityGroupIDs: "[]string | default=[]"
+      # Optional monitoring configuration (AC-21 / AC-22 / AC-23).
+      monitoringS3LogURI: string | default=""
+      monitoringS3EncryptionKeyARN: string | default=""
+      monitoringCloudWatchEnabled: boolean
+      monitoringCloudWatchLogGroup: string | default=""
+      monitoringCloudWatchLogTypes: "map[string]object | default={}"
       monitoringPrometheusRemoteWriteURL: string | default=""
-      # Optional scheduler configuration.
+      # Optional scheduler configuration (AC-37).
       schedulerMaxConcurrentRuns: integer | default=0
+      schedulerQueueTimeoutMinutes: integer | default=0
     status:
       resourceName: >-
         ${naming.data.effectiveName}
@@ -228,10 +242,16 @@ spec:
     # ACK EMR Serverless Application CR.
     # Only created when effectiveName is valid AND releaseLabel is non-empty
     # (releaseLabel is required by ACK Application).
+    # includeWhen derives BOTH guards directly from schema.spec and rsrcCfg tiers —
+    # NOT from naming.data.* / resolved.data.*, which would stall because ConfigMaps
+    # have no readiness status in kro v0.9.2 (frequent-rgd-errors.md §includeWhen Must
+    # Not Read Another Node in the Same Graph). Mirrors the EMRVirtualCluster pattern.
     - id: ackApplication
       includeWhen:
         - >-
-          ${!naming.data.effectiveName.contains("{") && resolved.data.releaseLabel != ""}
+          ${!((schema.spec.nameOverride != "" ? schema.spec.nameOverride : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "" ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate : "{namespace}-{name}"))).contains("{tag."))}
+        - >-
+          ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?releaseLabel.orValue("") != "") || (schema.spec.releaseLabel != "") || (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?releaseLabel.orValue("") != "")}
       template:
         apiVersion: emrserverless.services.k8s.aws/v1alpha1
         kind: Application
@@ -273,26 +293,46 @@ spec:
               ${resolved.data.maximumCapacityCPU != "" ? resolved.data.maximumCapacityCPU : "200vcpu"}
             memory: >-
               ${resolved.data.maximumCapacityMemory != "" ? resolved.data.maximumCapacityMemory : "200gb"}
+            disk: >-
+              ${schema.spec.maximumCapacityDisk != "" ? schema.spec.maximumCapacityDisk : "20000g"}
+          # autoStartConfiguration (AC-15 / AC-16). Tri-state: when the instance
+          # leaves autoStartEnabled unset, EMR's own default (true) applies.
+          autoStartConfiguration:
+            enabled: ${schema.spec.?autoStartEnabled.orValue(true)}
+          # initialCapacity (AC-17): map[workerType]object, structure preserved.
+          initialCapacity: ${schema.spec.initialCapacity}
+          # diskEncryptionConfiguration (AC-12 / AC-13 / AC-14): encryptionContext
+          # is passed through alongside the resolved KMS key ARN.
+          diskEncryptionConfiguration:
+            encryptionKeyARN: ${resolved.data.diskEncryptionKeyARN}
+            encryptionContext: ${schema.spec.diskEncryptionContext}
           # imageConfiguration: only set when imageURI is provided
           imageConfiguration:
             imageURI: ${schema.spec.imageURI}
-          # networkConfiguration: passthrough — not governed
+          # networkConfiguration (AC-19 / AC-20): passthrough — not governed.
           networkConfiguration:
-            subnetIDs: ${schema.spec.networkSubnetIds}
-            securityGroupIDs: ${schema.spec.networkSecurityGroupIds}
-          # monitoringConfiguration: passthrough — not governed
+            subnetIDs: ${schema.spec.networkSubnetIDs}
+            securityGroupIDs: ${schema.spec.networkSecurityGroupIDs}
+          # monitoringConfiguration (AC-21 / AC-22 / AC-23): passthrough — not governed.
           monitoringConfiguration:
             s3MonitoringConfiguration:
-              logURI: ${schema.spec.monitoringS3BucketURI}
+              logURI: ${schema.spec.monitoringS3LogURI}
+              encryptionKeyARN: ${schema.spec.monitoringS3EncryptionKeyARN}
             cloudWatchLoggingConfiguration:
-              enabled: ${schema.spec.monitoringCloudWatchLogGroupName != ""}
-              logGroupName: ${schema.spec.monitoringCloudWatchLogGroupName}
+              enabled: >-
+                ${schema.spec.?monitoringCloudWatchEnabled.orValue(schema.spec.monitoringCloudWatchLogGroup != "")}
+              logGroupName: ${schema.spec.monitoringCloudWatchLogGroup}
+              logTypes: ${schema.spec.monitoringCloudWatchLogTypes}
+            prometheusMonitoringConfiguration:
+              remoteWriteURL: ${schema.spec.monitoringPrometheusRemoteWriteURL}
             managedPersistenceMonitoringConfiguration:
               enabled: false
-          # schedulerConfiguration: only set when maxConcurrentRuns is non-zero
+          # schedulerConfiguration (AC-37): only set when maxConcurrentRuns is non-zero
           schedulerConfiguration:
             maxConcurrentRuns: >-
               ${schema.spec.schedulerMaxConcurrentRuns != 0 ? schema.spec.schedulerMaxConcurrentRuns : 1}
+            queueTimeoutMinutes: >-
+              ${schema.spec.schedulerQueueTimeoutMinutes != 0 ? schema.spec.schedulerQueueTimeoutMinutes : 15}
           # tags: allCloudMetadata — mergedTags + mergedSyncedLabels + mergedSyncedAnnotations
           # Merge order (last-writer-wins): defaults → spec → mandatory.
           tags: >-
