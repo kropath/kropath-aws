@@ -151,7 +151,7 @@ kubectl apply --server-side "${non_lambda_args[@]}"
 
 # Wait for all non-lambda RGDs to become Ready before starting Lambda waves.
 # Without this wait, Lambda wave 1's 120s clock starts while kro is still processing
-# the non-lambda batch (90+ RGDs), and Lambda times out before kro drains the queue.
+# the non-lambda batch (190+ RGDs), and Lambda times out before kro drains the queue.
 # This became a problem when the EKS family (7 RGDs) was added (KRO-532).
 #
 # Caveat: some ACK chart versions are published to GitHub Releases before the ECR OCI
@@ -162,8 +162,20 @@ kubectl apply --server-side "${non_lambda_args[@]}"
 # distinguish permanent compile-time failures from genuine graph errors: if ALL not-ready
 # RGDs have GraphAccepted=False, the queue IS drained and setup continues. If any
 # not-ready RGD does NOT have GraphAccepted=False, it is a real error that blocks setup.
+#
+# Three cases after a timeout:
+#   (A) GraphAccepted=False  — permanent compile-time rejection (ACK CRD missing); skip.
+#   (B) Ready=True but state != Active — transient: kro wrote conditions True but has not
+#       yet flushed the state field. Not a genuine error; setup continues. (Reproduced in
+#       CI run 34617683488: appscalingpolicy had all conditions True but state still blank
+#       at the instant the check ran, triggering a false positive exit 1.)
+#   (C) Neither of the above — genuine graph compilation error; exit 1.
+#
+# Timeout 600s: with 190+ non-lambda RGDs and CONCURRENT_RECONCILES=2, the 300s budget
+# was insufficient on a freshly-created kind cluster. ACM RGDs become Active at ~251s;
+# backup/bedrock RGDs require another 200+ seconds. 600s provides comfortable headroom.
 echo "==> Waiting for all non-lambda RGDs to become Ready (drains kro queue before Lambda waves)..."
-if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
+if ! kubectl wait rgd --all --for=condition=Ready --timeout=600s; then
   echo ""
   echo "======================================================================"
   not_ready=$(kubectl get rgd -o jsonpath='{range .items[?(@.status.state!="Active")]}{.metadata.name}{"\n"}{end}')
@@ -187,13 +199,20 @@ if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
   # Active between the not_ready snapshot and this loop. Re-checking current state prevents
   # falsely treating a "slow but valid" RGD as a genuine compilation failure.
   perm_failed_rgds=()
+  transient_rgds=()
   has_non_perm_failure=false
   while IFS= read -r rgd; do
     [ -z "${rgd}" ] && continue
     ga_status=$(kubectl get rgd "${rgd}" \
       -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].status}' 2>/dev/null || true)
+    ready_status=$(kubectl get rgd "${rgd}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
     if [ "${ga_status}" = "False" ]; then
       perm_failed_rgds+=("${rgd}")
+    elif [ "${ready_status}" = "True" ]; then
+      # Transient: kro has fully processed this RGD (all conditions True) but the
+      # state field write has not yet propagated. Not a blocking error (case B).
+      transient_rgds+=("${rgd}")
     else
       # Re-check: the RGD may have reached Active on a slow cluster since not_ready was
       # captured. Only count as a genuine failure if it is STILL not Active right now.
@@ -212,6 +231,15 @@ if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
       msg=$(kubectl get rgd "${rgd}" \
         -o jsonpath='{.status.conditions[?(@.type=="GraphAccepted")].message}' 2>/dev/null || true)
       echo "    - ${rgd}: ${msg}"
+    done
+    echo ""
+  fi
+
+  if [ "${#transient_rgds[@]}" -gt 0 ]; then
+    echo "  NOTE: The following RGDs have Ready=True but state not yet Active (transient state-lag)."
+    echo "  kro has fully processed them; the state field write is in-flight. Setup continues."
+    for rgd in "${transient_rgds[@]}"; do
+      echo "    - ${rgd}"
     done
     echo ""
   fi
