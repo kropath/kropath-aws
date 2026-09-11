@@ -175,6 +175,35 @@ spec:
                   - resourceTagKey: Team
                     resourceTagValue: platform
 
+    # ── AC-6: tag-level rule with single resourceTags entry ──────────────────
+    - name: ac6-tag-level-single-filter
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RecycleBinRule
+              metadata:
+                name: ac6-single-tag
+                namespace: recyclebinrule
+              spec:
+                resourceType: EBS_SNAPSHOT
+                retentionPeriodValue: 14
+                resourceTags:
+                  - resourceTagKey: Environment
+                    resourceTagValue: production
+        - assert:
+            resource:
+              apiVersion: recyclebin.services.k8s.aws/v1alpha1
+              kind: Rule
+              metadata:
+                name: ac6-single-tag
+                namespace: recyclebinrule
+              spec:
+                resourceType: EBS_SNAPSHOT
+                resourceTags:
+                  - resourceTagKey: Environment
+                    resourceTagValue: production
+
     # ── AC-3: retentionPeriodValue cascade — instance wins over defaults ───────
     - name: ac3-retention-instance-over-defaults
       try:
@@ -749,6 +778,7 @@ spec:
                 }'
 
     # ── AC-15: syncedLabels from instance appear as aws.kropath.run/ K8s labels ──
+    # ── AC-13: syncedLabels also appear in spec.tags (ADR-015 §6.1) ─────────────
     - name: ac15-synced-labels-on-ack-rule
       try:
         - apply:
@@ -773,6 +803,14 @@ spec:
                 labels:
                   app.kubernetes.io/instance: ac15-synced-labels
                   aws.kropath.run/app: myapp
+        # AC-13: syncedLabels must also appear in spec.tags as {key, value} pairs (ADR-015 §6.1)
+        - script:
+            content: |
+              set -e
+              TAGS=$(kubectl get rules.recyclebin.services.k8s.aws ac15-synced-labels \
+                -n recyclebinrule -o json | jq -r '[.spec.tags[] | {(.key): .value}] | add')
+              echo "$TAGS" | jq -e '."app" == "myapp"'
+              echo "PASS: syncedLabels appear in spec.tags as {key: app, value: myapp}"
 
     # ── AC-16: deletion-policy annotation from spec.deletionPolicy ────────────
     - name: ac16-deletion-policy-annotation
@@ -844,6 +882,54 @@ spec:
                 labels:
                   app.kubernetes.io/managed-by: kro
                   app.kubernetes.io/instance: ac18-instance-label
+
+    # ── AC-17 + AC-18: status fields and lockState propagation ───────────────
+    # AC-17: ruleIdentifier, ruleArn, ruleStatus populated from ACK Rule status
+    # AC-18: lockRule: true → status.lockState: "locked"
+    # Simulates AWS reconciliation by patching ACK Rule status with kubectl.
+    - name: ac17-ac18-status-fields-propagation
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RecycleBinRule
+              metadata:
+                name: ac17-status-fields
+                namespace: recyclebinrule
+              spec:
+                resourceType: EBS_SNAPSHOT
+                retentionPeriodValue: 7
+                lockRule: true
+                unlockDelayValue: 14
+        # Wait for kro to create the child ACK Rule before patching its status.
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: recyclebin.services.k8s.aws/v1alpha1
+              kind: Rule
+              metadata:
+                name: ac17-status-fields
+                namespace: recyclebinrule
+        - script:
+            content: |
+              set -eu
+              # Simulate AWS reconciliation: patch ACK Rule status with identifier, arn, status, lockState
+              kubectl patch rules.recyclebin.services.k8s.aws ac17-status-fields -n recyclebinrule \
+                --subresource=status --type=merge \
+                -p '{"status":{"identifier":"rhr-00abc123def456","status":"available","lockState":"locked","ackResourceMetadata":{"arn":"arn:aws:rbin:us-east-1:123456789012:rule/rhr-00abc123def456","ownerAccountID":"123456789012","region":"us-east-1"}}}'
+        - assert:
+            timeout: 30s
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: RecycleBinRule
+              metadata:
+                name: ac17-status-fields
+                namespace: recyclebinrule
+              status:
+                ruleIdentifier: "rhr-00abc123def456"
+                ruleStatus: "available"
+                lockState: "locked"
+                ruleArn: "arn:aws:rbin:us-east-1:123456789012:rule/rhr-00abc123def456"
 
     # ── AC-19: missing resourceType → validationError + no ACK Rule ──────────
     - name: ac19-missing-resource-type-validation-error
