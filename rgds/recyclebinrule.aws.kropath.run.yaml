@@ -1,0 +1,323 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-ebsrb-02 — RecycleBinRule kro RGD (KRO-1040).
+# Atomic RGD: wraps one ACK recyclebin.services.k8s.aws/Rule.
+# Naming exemption (KRO-236): Recycle Bin rules have no provider name field; identified
+# by system-generated identifier. No effectiveName, nameOverride, predictedArn.
+# Two ACK Rule variants (locked/unlocked) for conditional lockConfiguration inclusion.
+# Always-bound self-lookup (ackRbRuleRef) prevents unbound-variable freeze in status block.
+# Advisory ConfigMap validates resourceType enum and retentionPeriodValue range.
+# x-kubernetes-validations not preserved by kro v0.9.2 — advisory pattern used instead.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: recyclebinrule.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: RecycleBinRule
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Rule properties
+      # resourceType: sentinel default ""; advisory validates EBS_SNAPSHOT|EC2_IMAGE
+      resourceType: string | default=""
+      # retentionPeriodValue: sentinel default 0; advisory validates 1-3650
+      retentionPeriodValue: integer | default=0
+      retentionPeriodUnit: string | default=DAYS
+      # description: optional; kro omits empty-string fields → no spec.description in ACK Rule when ""
+      description: string | default=""
+
+      # Tag-level rule filters — omit for region-level rules; max 5 tag key+value pairs
+      resourceTags: "[]RecycleBinResourceTag | default=[]"
+
+      # Rule locking — lockRule=true creates lockConfiguration in ACK Rule
+      lockRule: boolean | default=false
+      unlockDelayValue: integer | default=30
+      unlockDelayUnit: string | default=DAYS
+
+    types:
+      RecycleBinResourceTag:
+        resourceTagKey: string | default=""
+        resourceTagValue: string | default=""
+
+    status:
+      # validationError: first non-empty error from the advisory validationErrors ConfigMap.
+      # Aggregated from a single ConfigMap to avoid variant-split status freeze.
+      # has() guards defend against kro v0.9.2 zero-value stripping of empty-string ConfigMap data keys.
+      validationError: >-
+        ${(has(validationErrors.data) && has(validationErrors.data.typeRequiredError) && validationErrors.data.typeRequiredError != "") ? validationErrors.data.typeRequiredError
+          : ((has(validationErrors.data) && has(validationErrors.data.typeEnumError) && validationErrors.data.typeEnumError != "") ? validationErrors.data.typeEnumError
+            : ((has(validationErrors.data) && has(validationErrors.data.retentionRequiredError) && validationErrors.data.retentionRequiredError != "") ? validationErrors.data.retentionRequiredError
+              : ((has(validationErrors.data) && has(validationErrors.data.retentionMaxError) && validationErrors.data.retentionMaxError != "") ? validationErrors.data.retentionMaxError : "")))}
+      # Naming exemption (KRO-236): system-assigned identifier; no resourceName or predictedArn.
+      ruleIdentifier: >-
+        ${ackRbRuleRef.size() > 0 ? ackRbRuleRef[0].?status.?identifier.orValue("") : ""}
+      ruleArn: >-
+        ${ackRbRuleRef.size() > 0 ? ackRbRuleRef[0].?status.?ackResourceMetadata.?arn.orValue("") : ""}
+      lockState: >-
+        ${ackRbRuleRef.size() > 0 ? ackRbRuleRef[0].?status.?lockState.orValue("") : ""}
+      ruleStatus: >-
+        ${ackRbRuleRef.size() > 0 ? ackRbRuleRef[0].?status.?status.orValue("") : ""}
+      conditions: >-
+        ${ackRbRuleRef.size() > 0 ? ackRbRuleRef[0].?status.?conditions.orValue([]) : []}
+
+    additionalPrinterColumns:
+      - name: ResourceType
+        type: string
+        jsonPath: .spec.resourceType
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
+      - name: RuleIdentifier
+        type: string
+        jsonPath: .status.ruleIdentifier
+
+  resources:
+    # Single governance config lookup (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # kro returns externalRef as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: RecycleBinConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Always-created advisory validation ConfigMap — computes all admission checks inline.
+    # Using a single non-gated ConfigMap avoids variant-split status freeze.
+    # typeRequiredError: resourceType must not be empty.
+    # typeEnumError: resourceType must be EBS_SNAPSHOT or EC2_IMAGE.
+    # retentionRequiredError: retentionPeriodValue must be >= 1 (0 = sentinel for "not set").
+    # retentionMaxError: retentionPeriodValue must be <= 3650.
+    - id: validationErrors
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RecycleBinRule
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          typeRequiredError: >-
+            ${schema.spec.resourceType == "" ? "spec.resourceType is required" : ""}
+          typeEnumError: >-
+            ${schema.spec.resourceType != "" && schema.spec.resourceType != "EBS_SNAPSHOT" && schema.spec.resourceType != "EC2_IMAGE" ? "spec.resourceType must be EBS_SNAPSHOT or EC2_IMAGE" : ""}
+          retentionRequiredError: >-
+            ${schema.spec.retentionPeriodValue == 0 ? "spec.retentionPeriodValue is required and must be >= 1" : ""}
+          retentionMaxError: >-
+            ${schema.spec.retentionPeriodValue > 3650 ? "spec.retentionPeriodValue must be <= 3650" : ""}
+
+    # Always-bound self-lookup: fetches the ACK Rule child to read status fields.
+    # Uses the app.kubernetes.io/instance label applied by both ackRbRuleLocked and ackRbRuleUnlocked.
+    # Returns an empty list before any Rule is created or when all variants are excluded.
+    # This pattern prevents unbound-variable freeze in the status block (frequent-rgd-errors.md §4).
+    - id: ackRbRuleRef
+      externalRef:
+        apiVersion: recyclebin.services.k8s.aws/v1alpha1
+        kind: Rule
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # ACK Rule — with lockConfiguration (lockRule resolves to true).
+    # Validation gate: resourceType must be valid enum and retentionPeriodValue must be in range.
+    # lockRule cascade: mandatory wins if true; else instance; else defaults.
+    - id: ackRbRuleLocked
+      includeWhen:
+        - >-
+          ${schema.spec.resourceType != ""
+            && (schema.spec.resourceType == "EBS_SNAPSHOT" || schema.spec.resourceType == "EC2_IMAGE")
+            && schema.spec.retentionPeriodValue > 0
+            && schema.spec.retentionPeriodValue <= 3650
+            && ((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lockRule.orValue(false) == true)
+                || (!(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lockRule.orValue(false) == true)
+                    && schema.spec.lockRule == true)
+                || (!(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lockRule.orValue(false) == true)
+                    && schema.spec.lockRule != true
+                    && rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?lockRule.orValue(false) == true))}
+      template:
+        apiVersion: recyclebin.services.k8s.aws/v1alpha1
+        kind: Rule
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)) ? rsrcCfg[0].status.effectiveConfig.defaults.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(schema.spec.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RecycleBinRule
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          resourceType: ${schema.spec.resourceType}
+          retentionPeriod:
+            retentionPeriodValue: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?retentionPeriodValue.orValue(0) != 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.retentionPeriodValue
+                : (schema.spec.retentionPeriodValue != 0
+                    ? schema.spec.retentionPeriodValue
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?retentionPeriodValue.orValue(0) != 0
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.retentionPeriodValue
+                        : 7))}
+            retentionPeriodUnit: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?retentionPeriodUnit.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.retentionPeriodUnit
+                : (schema.spec.retentionPeriodUnit != ""
+                    ? schema.spec.retentionPeriodUnit
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?retentionPeriodUnit.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.retentionPeriodUnit
+                        : "DAYS"))}
+          # description: kro omits empty-string fields → absent from ACK Rule when not set (spec §3)
+          description: ${schema.spec.description}
+          # resourceTags: echoes user input; kro omits empty arrays → absent for region-level rules
+          resourceTags: ${schema.spec.resourceTags}
+          # lockConfiguration: present in ackRbRuleLocked variant only (lockRule resolves to true)
+          lockConfiguration:
+            unlockDelay:
+              unlockDelayValue: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?unlockDelayValue.orValue(0) != 0
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.unlockDelayValue
+                  : (schema.spec.unlockDelayValue != 0
+                      ? schema.spec.unlockDelayValue
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?unlockDelayValue.orValue(0) != 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.unlockDelayValue
+                          : 30))}
+              unlockDelayUnit: >-
+                ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?unlockDelayUnit.orValue("") != ""
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.unlockDelayUnit
+                  : (schema.spec.unlockDelayUnit != ""
+                      ? schema.spec.unlockDelayUnit
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?unlockDelayUnit.orValue("") != ""
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.unlockDelayUnit
+                          : "DAYS"))}
+          # Cloud tags: mandatory.syncedLabels + mandatory.tags win over instance > defaults (§6.1)
+          # transformList produces [{key, value}] format required by ACK Rule spec.tags
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
+
+    # ACK Rule — without lockConfiguration (lockRule resolves to false).
+    # Same validation gate as ackRbRuleLocked.
+    # lockRule not true at any tier → lockConfiguration omitted entirely.
+    - id: ackRbRuleUnlocked
+      includeWhen:
+        - >-
+          ${schema.spec.resourceType != ""
+            && (schema.spec.resourceType == "EBS_SNAPSHOT" || schema.spec.resourceType == "EC2_IMAGE")
+            && schema.spec.retentionPeriodValue > 0
+            && schema.spec.retentionPeriodValue <= 3650
+            && !((rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lockRule.orValue(false) == true)
+                || (!(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lockRule.orValue(false) == true)
+                    && schema.spec.lockRule == true)
+                || (!(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?lockRule.orValue(false) == true)
+                    && schema.spec.lockRule != true
+                    && rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?lockRule.orValue(false) == true))}
+      template:
+        apiVersion: recyclebin.services.k8s.aws/v1alpha1
+        kind: Rule
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)) ? rsrcCfg[0].status.effectiveConfig.defaults.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(schema.spec.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RecycleBinRule
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          resourceType: ${schema.spec.resourceType}
+          retentionPeriod:
+            retentionPeriodValue: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?retentionPeriodValue.orValue(0) != 0
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.retentionPeriodValue
+                : (schema.spec.retentionPeriodValue != 0
+                    ? schema.spec.retentionPeriodValue
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?retentionPeriodValue.orValue(0) != 0
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.retentionPeriodValue
+                        : 7))}
+            retentionPeriodUnit: >-
+              ${rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?retentionPeriodUnit.orValue("") != ""
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.retentionPeriodUnit
+                : (schema.spec.retentionPeriodUnit != ""
+                    ? schema.spec.retentionPeriodUnit
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?retentionPeriodUnit.orValue("") != ""
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.retentionPeriodUnit
+                        : "DAYS"))}
+          # description: kro omits empty-string fields → absent from ACK Rule when not set
+          description: ${schema.spec.description}
+          # resourceTags: echoes user input; kro omits empty arrays → absent for region-level rules
+          resourceTags: ${schema.spec.resourceTags}
+          # lockConfiguration: absent in ackRbRuleUnlocked variant
+          # Cloud tags: mandatory wins over instance > defaults (ADR-015 §6.1)
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.tags)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})}
