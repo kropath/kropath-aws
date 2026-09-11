@@ -1,0 +1,843 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-codeartifact-02 Chainsaw tests — one scenario per acceptance criterion.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: codeartifactdomain
+spec:
+  skipDelete: true
+  namespace: codeartifactdomain
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: codeartifactdomain
+
+    # AC-1 / AC-7 / AC-18: No encryptionKey at any tier; default naming {namespace}-{name}.
+    # Verifies: ackDomainNoKey rendered (no encryptionKey in ACK Domain spec),
+    # resourceName=codeartifactdomain-ac1, namingStatus=valid, predictedArn populated.
+    - name: ac1-no-encryption-default-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac1-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac1-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac1-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac1-domain
+                namespace: codeartifactdomain
+              status:
+                resourceName: codeartifactdomain-ac1-domain
+                namingStatus: valid
+                predictedArn: "arn:aws:codeartifact:ap-southeast-2:123456789012:domain/codeartifactdomain-ac1-domain"
+        # AC-7: No encryptionKey field in ACK Domain (NoKey variant active).
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac1-domain
+                namespace: codeartifactdomain
+              spec:
+                name: codeartifactdomain-ac1-domain
+        - script:
+            content: |
+              # Verify encryptionKey field is absent from ACK Domain spec
+              VAL=$(kubectl get domains.codeartifact.services.k8s.aws ac1-domain -n codeartifactdomain -o jsonpath='{.spec.encryptionKey}' 2>/dev/null)
+              if [ -n "$VAL" ]; then
+                echo "FAIL: encryptionKey should be absent but got: $VAL"
+                exit 1
+              fi
+              echo "PASS: encryptionKey field absent"
+
+    # AC-2: spec.encryptionKey set → ackDomainWithKey rendered with that key.
+    - name: ac2-spec-encryption-key
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac2-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac2-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac2-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac2-cfg
+                encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/ac2-key-id"
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac2-domain
+                namespace: codeartifactdomain
+              spec:
+                name: codeartifactdomain-ac2-domain
+                encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/ac2-key-id"
+
+    # AC-3: mandatory.encryptionKey overrides spec.encryptionKey → WithKey uses mandatory key.
+    - name: ac3-mandatory-encryption-key-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac3-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  encryptionKey: "arn:aws:kms:ap-southeast-2:111111111111:key/mandatory-key"
+                  namingTemplate: ""
+                defaults:
+                  encryptionKey: ""
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac3-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"arn:aws:kms:ap-southeast-2:111111111111:key/mandatory-key","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac3-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac3-cfg
+                encryptionKey: "arn:aws:kms:ap-southeast-2:999999999999:key/instance-key"
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac3-domain
+                namespace: codeartifactdomain
+              spec:
+                encryptionKey: "arn:aws:kms:ap-southeast-2:111111111111:key/mandatory-key"
+
+    # AC-4: KropathConfig org-wide mandatory.codeartifact.encryptionKey wins when the
+    # CodeArtifactConfig mandatory tier AND the instance spec.encryptionKey are both empty.
+    # Distinct from AC-3 (which sources the mandatory value from CodeArtifactConfig itself):
+    # here the value originates from the org-wide KropathConfig and is merged into
+    # CodeArtifactConfig.status.effectiveConfig.mandatory by the kropath-core cascade.
+    # The test cluster runs kro only (no kropath-core controller), so the merged
+    # effectiveConfig is patched in directly — the same convention used by
+    # tests/codeartifact/codeartifactconfig/chainsaw-test.yaml ac4-effective-config-merge.
+    - name: ac4-kropathconfig-encryption-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KropathConfig
+              metadata:
+                name: ac4-org-policy
+                namespace: codeartifactdomain
+              spec:
+                mandatory:
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  namingTemplate: ""
+                  codeartifact:
+                    encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/org-key"
+                defaults:
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                  namingTemplate: ""
+                aws:
+                  accountId: "123456789012"
+                  region: "ap-southeast-2"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac4-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  encryptionKey: ""
+                  namingTemplate: ""
+                defaults:
+                  encryptionKey: ""
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac4-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"arn:aws:kms:ap-southeast-2:123456789012:key/org-key","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac4-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac4-cfg
+                encryptionKey: ""
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac4-domain
+                namespace: codeartifactdomain
+              spec:
+                encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/org-key"
+
+    # AC-5: encryptionKeyRef resolves KMSKey ARN → WithKey uses resolved ARN.
+    - name: ac5-encryption-key-ref
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac5-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  encryptionKey: ""
+                  namingTemplate: ""
+                defaults:
+                  encryptionKey: ""
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac5-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        # Create a KMSKey CR stub in the same namespace.
+        # Label aws.kropath.run/resource-name: my-domain-key required for selector-based kmsKey externalRef lookup.
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: my-domain-key
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: my-domain-key
+              spec:
+                configRef: ac5-cfg
+                deletionPolicy: retain
+        # Wait for kro to create the ACK Key child, then patch its status.ackResourceMetadata.arn.
+        # We patch the ACK Key child (not the KMSKey directly) so kro's re-reconciliation of KMSKey
+        # reads key.status.ackResourceMetadata.arn and writes it into KMSKey.status.keyArn — patching
+        # the KMSKey status directly would be overwritten by kro's next reconcile loop.
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Key
+              metadata:
+                name: my-domain-key
+                namespace: codeartifactdomain
+        - script:
+            content: |
+              kubectl patch keys.kms.services.k8s.aws my-domain-key -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"ackResourceMetadata":{"arn":"arn:aws:kms:ap-southeast-2:123456789012:key/resolved-key-arn","ownerAccountID":"123456789012","region":"ap-southeast-2"}}}'
+        # Wait for kro to re-reconcile KMSKey and propagate ackResourceMetadata.arn → status.keyArn.
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: my-domain-key
+                namespace: codeartifactdomain
+              status:
+                keyArn: "arn:aws:kms:ap-southeast-2:123456789012:key/resolved-key-arn"
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac5-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac5-cfg
+                encryptionKeyRef: my-domain-key
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac5-domain
+                namespace: codeartifactdomain
+              spec:
+                encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/resolved-key-arn"
+
+    # AC-6: Both encryptionKey AND encryptionKeyRef set → advisory validationError ConfigMap rendered.
+    - name: ac6-both-encryption-keys-advisory
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac6-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                defaults:
+                  encryptionKey: ""
+                  namingTemplate: "{namespace}-{name}"
+                mandatory:
+                  encryptionKey: ""
+                  namingTemplate: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac6-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac6-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac6-cfg
+                encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/key1"
+                encryptionKeyRef: my-domain-key
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ac6-domain-validation-error
+                namespace: codeartifactdomain
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac6-domain
+                namespace: codeartifactdomain
+              status:
+                (validationError != ""): true
+
+    # AC-8: mandatory.namingTemplate overrides defaults → effectiveName uses mandatory template.
+    - name: ac8-mandatory-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac8-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac8-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac8-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac8-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac8-domain
+                namespace: codeartifactdomain
+              status:
+                resourceName: corp-codeartifactdomain-ac8-domain
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac8-domain
+                namespace: codeartifactdomain
+              spec:
+                name: corp-codeartifactdomain-ac8-domain
+
+    # AC-9: spec.nameOverride wins over any namingTemplate → ACK Domain spec.name = nameOverride.
+    - name: ac9-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac9-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac9-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac9-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac9-cfg
+                nameOverride: my-custom-domain
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac9-domain
+                namespace: codeartifactdomain
+              status:
+                resourceName: my-custom-domain
+                namingStatus: valid
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac9-domain
+                namespace: codeartifactdomain
+              spec:
+                name: my-custom-domain
+
+    # AC-10: {tag.env} token absent from mergedTags → namingStatus=invalid-unresolved-tokens.
+    - name: ac10-unresolved-tag-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac10-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac10-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac10-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac10-cfg
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac10-domain
+                namespace: codeartifactdomain
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # AC-11: Tags cascade: mandatory wins over spec wins over defaults (no conflict = merged).
+    - name: ac11-tags-cascade
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac11-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+                  tags:
+                    cost-centre: dev-tools
+                    tier: mandatory-wins
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+                  tags:
+                    cost-centre: should-be-overridden
+                    env: staging
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac11-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{"cost-centre":"dev-tools","tier":"mandatory-wins"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{"cost-centre":"should-be-overridden","env":"staging"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac11-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac11-cfg
+                tags:
+                  app: my-app
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac11-domain
+                namespace: codeartifactdomain
+              spec:
+                name: codeartifactdomain-ac11-domain
+        - script:
+            content: |
+              # Verify tags: mandatory wins on conflict, spec and defaults contribute unique keys
+              TAGS=$(kubectl get domains.codeartifact.services.k8s.aws ac11-domain -n codeartifactdomain -o json | jq -r '[.spec.tags[] | {(.key): .value}] | add')
+              echo "Tags: $TAGS"
+              echo "$TAGS" | jq -e '."cost-centre" == "dev-tools"' || { echo "FAIL: cost-centre should be dev-tools (mandatory wins)"; exit 1; }
+              echo "$TAGS" | jq -e '."tier" == "mandatory-wins"' || { echo "FAIL: tier missing"; exit 1; }
+              echo "$TAGS" | jq -e '."env" == "staging"' || { echo "FAIL: env missing (from defaults)"; exit 1; }
+              echo "$TAGS" | jq -e '."app" == "my-app"' || { echo "FAIL: app missing (from spec)"; exit 1; }
+              echo "PASS: all expected tags present with correct values"
+
+    # AC-12: syncedLabels from mandatory mapped to ACK Domain labels with aws.kropath.run/ prefix.
+    - name: ac12-synced-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac12-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+                  syncedLabels:
+                    data-class: internal
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac12-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{"data-class":"internal"},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac12-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac12-cfg
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac12-domain
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/data-class: internal
+                  app.kubernetes.io/managed-by: kro
+
+    # AC-13: ACK Domain has standard kro labels app.kubernetes.io/managed-by and app.kubernetes.io/instance.
+    # Covered by AC-12 assert above; explicitly assert here for clarity.
+    - name: ac13-standard-labels
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac13-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac13-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac13-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac13-cfg
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac13-domain
+                namespace: codeartifactdomain
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac13-domain
+
+    # AC-14: deletionPolicy=delete → ACK Domain annotation services.k8s.aws/deletion-policy=delete.
+    - name: ac14-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac14-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac14-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac14-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac14-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac14-domain
+                namespace: codeartifactdomain
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-15: deletionPolicy=retain (default) → ACK Domain annotation=retain.
+    - name: ac15-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac15-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  encryptionKey: ""
+                mandatory:
+                  namingTemplate: ""
+                  encryptionKey: ""
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac15-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac15-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac15-cfg
+                # deletionPolicy defaults to retain — no explicit field
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac15-domain
+                namespace: codeartifactdomain
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-16: encryptionKey immutability — kro schema immutability advisory (ACK enforces at API level).
+    # Test: apply with key, verify the encryptionKey is set. Immutability enforced by ACK, not tested here.
+    # AC-17: encryptionKeyRef immutability — same rationale.
+    # Both are covered by the WithKey + KEyRef scenarios above. Advisory note in status.
+
+    # AC-11 (defaults encryptionKey): defaults.encryptionKey used when spec and mandatory empty.
+    - name: ac11b-defaults-encryption-key
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactConfig
+              metadata:
+                name: ac11b-cfg
+                namespace: codeartifactdomain
+                labels:
+                  aws.kropath.run/resource-name: ac11b-cfg
+              spec:
+                mandatory:
+                  encryptionKey: ""
+                  namingTemplate: ""
+                defaults:
+                  encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/defaults-key"
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch codeartifactconfig ac11b-cfg -n codeartifactdomain \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionKey":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionKey":"arn:aws:kms:ap-southeast-2:123456789012:key/defaults-key","namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: CodeArtifactDomain
+              metadata:
+                name: ac11b-domain
+                namespace: codeartifactdomain
+              spec:
+                configRef: ac11b-cfg
+                # No encryptionKey or encryptionKeyRef in spec — falls through to defaults
+        - assert:
+            resource:
+              apiVersion: codeartifact.services.k8s.aws/v1alpha1
+              kind: Domain
+              metadata:
+                name: ac11b-domain
+                namespace: codeartifactdomain
+              spec:
+                encryptionKey: "arn:aws:kms:ap-southeast-2:123456789012:key/defaults-key"
