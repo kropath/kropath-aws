@@ -1,0 +1,968 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Canonical pattern (docs/frequent-rgd-errors.md "CANONICAL: Unique-Name-Per-Step +
+# skipDelete"): each step creates uniquely-named QuickSightConfig + QuickSightDataSource
+# resources and deletes nothing between steps. Test-level skipDelete: true prevents
+# chainsaw's end-of-test cascade delete; the ephemeral kind cluster is discarded after
+# the suite. Note: the test cluster runs kro but no ACK controllers, so ACK DataSource
+# CRs are never reconciled with AWS — we assert on spec fields only (not status.arn).
+# Status assertions use status.predictedArn (computed) instead of status.arn (requires
+# live AWS reconciliation).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: quicksightdatasource
+spec:
+  skipDelete: true
+  namespace: quicksightdatasource
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # DS-AC-1: KropathConfig mandatory tags + QuickSightConfig mandatory tags + instance
+    #   tags all merge and are converted to []object {key,value} on the ACK DataSource.
+    - name: ac1-tags-merge-list-format
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac1-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac1-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{"env":"prod","team":"data"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{"cost-center":"ds-001"},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac1-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac1-cfg
+                resourceId: ac1-ds-id
+                type: REDSHIFT
+                parameters:
+                  redshiftParameters:
+                    database: mydb
+                    host: cluster.us-east-1.redshift.amazonaws.com
+                    port: 5439
+                tags:
+                  app: reporting
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac1-ds
+                namespace: quicksightdatasource
+              spec:
+                id: ac1-ds-id
+                awsAccountID: "123456789012"
+        - script:
+            content: |
+              kubectl get datasource ac1-ds -n quicksightdatasource -o json \
+                | jq -e '
+                  (.spec.tags | map(select(.key == "env" and .value == "prod")) | length) == 1 and
+                  (.spec.tags | map(select(.key == "team" and .value == "data")) | length) == 1 and
+                  (.spec.tags | map(select(.key == "cost-center" and .value == "ds-001")) | length) == 1 and
+                  (.spec.tags | map(select(.key == "app" and .value == "reporting")) | length) == 1
+                '
+
+    # DS-AC-2: syncedLabels written to both K8s metadata.labels (prefixed
+    #   aws.kropath.run/) AND cloud spec.tags (plain key, no prefix).
+    - name: ac2-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac2-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac2-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{"team":"analytics"},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac2-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac2-cfg
+                resourceId: ac2-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac2-ds
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/team: analytics
+        - script:
+            content: |
+              kubectl get datasource ac2-ds -n quicksightdatasource -o json \
+                | jq -e '.spec.tags | map(select(.key == "team" and .value == "analytics")) | length == 1'
+
+    # DS-AC-3: syncedAnnotations written to K8s metadata.annotations (prefixed
+    #   aws.kropath.run/).
+    - name: ac3-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac3-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac3-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-team":"data-eng"}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac3-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac3-cfg
+                resourceId: ac3-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac3-ds
+                namespace: quicksightdatasource
+                annotations:
+                  aws.kropath.run/cost-team: data-eng
+
+    # DS-AC-4: Default naming template {namespace}-{name} — effectiveName is
+    #   "quicksightdatasource-ac4-ds"; status.resourceName reflects it.
+    - name: ac4-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac4-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac4-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac4-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac4-cfg
+                resourceId: ac4-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac4-ds
+                namespace: quicksightdatasource
+              spec:
+                name: quicksightdatasource-ac4-ds
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac4-ds
+                namespace: quicksightdatasource
+              status:
+                resourceName: quicksightdatasource-ac4-ds
+                namingStatus: valid
+
+    # DS-AC-5: Mandatory naming template wins over default {namespace}-{name}.
+    - name: ac5-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac5-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{name}"
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac5-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"corp-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac5-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac5-cfg
+                resourceId: ac5-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac5-ds
+                namespace: quicksightdatasource
+              spec:
+                name: corp-ac5-ds
+
+    # DS-AC-6: spec.nameOverride bypasses template and effectiveConfig.
+    - name: ac6-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac6-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac6-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"corp-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac6-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac6-cfg
+                nameOverride: my-custom-datasource
+                resourceId: ac6-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac6-ds
+                namespace: quicksightdatasource
+              spec:
+                name: my-custom-datasource
+
+    # DS-AC-7 (NEGATIVE): Unresolvable {tag.env} token in naming template → no ACK
+    #   DataSource created; status.namingStatus = "invalid-unresolved-tokens".
+    - name: ac7-negative-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac7-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "{tag.env}-datasource"
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac7-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"{tag.env}-datasource","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac7-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac7-cfg
+                resourceId: ac7-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac7-ds
+                namespace: quicksightdatasource
+              status:
+                namingStatus: invalid-unresolved-tokens
+        # Assert no ACK DataSource was created
+        - script:
+            content: |
+              if kubectl get datasource ac7-ds -n quicksightdatasource 2>/dev/null; then
+                echo "FAIL: DataSource should not exist when naming has unresolved tokens"
+                exit 1
+              fi
+              echo "OK: DataSource absent as expected"
+
+    # DS-AC-8: effectiveConfig.aws.accountId is injected as spec.awsAccountID on the
+    #   ACK DataSource (never from instance spec — that field is absent from the RGD schema).
+    - name: ac8-account-id-injection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac8-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac8-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"987654321098","region":"us-west-2"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac8-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac8-cfg
+                resourceId: ac8-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac8-ds
+                namespace: quicksightdatasource
+              spec:
+                awsAccountID: "987654321098"
+
+    # DS-AC-9: REDSHIFT data source with redshiftParameters — spec.type and
+    #   spec.parameters.redshiftParameters pass through to ACK DataSource.
+    - name: ac9-redshift-datasource
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac9-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac9-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac9-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac9-cfg
+                resourceId: sales-redshift-ds
+                type: REDSHIFT
+                parameters:
+                  redshiftParameters:
+                    clusterID: my-cluster
+                    database: sales_db
+                    host: my-cluster.abc123.us-east-1.redshift.amazonaws.com
+                    port: 5439
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac9-ds
+                namespace: quicksightdatasource
+              spec:
+                id: sales-redshift-ds
+                type: REDSHIFT
+
+    # DS-AC-10: ATHENA data source with athenaParameters — workGroup passes through.
+    - name: ac10-athena-datasource
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac10-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac10-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac10-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac10-cfg
+                resourceId: athena-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac10-ds
+                namespace: quicksightdatasource
+              spec:
+                id: athena-ds-id
+                type: ATHENA
+
+    # DS-AC-11: credentials.secretARN passes through to ACK DataSource spec.credentials.
+    - name: ac11-credentials-secret-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac11-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac11-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac11-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac11-cfg
+                resourceId: ac11-ds-id
+                type: REDSHIFT
+                parameters:
+                  redshiftParameters:
+                    database: mydb
+                    host: cluster.us-east-1.redshift.amazonaws.com
+                    port: 5439
+                credentials:
+                  secretArn: arn:aws:secretsmanager:us-east-1:123456789012:secret:redshift-creds
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac11-ds
+                namespace: quicksightdatasource
+              spec:
+                credentials:
+                  secretArn: arn:aws:secretsmanager:us-east-1:123456789012:secret:redshift-creds
+
+    # DS-AC-12: vpcConnectionProperties passes through to ACK DataSource spec.
+    - name: ac12-vpc-connection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac12-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac12-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac12-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac12-cfg
+                resourceId: ac12-ds-id
+                type: REDSHIFT
+                parameters:
+                  redshiftParameters:
+                    database: mydb
+                    host: cluster.us-east-1.redshift.amazonaws.com
+                    port: 5439
+                vpcConnectionProperties:
+                  vpcConnectionARN: arn:aws:quicksight:us-east-1:123456789012:vpcConnection/my-vpc
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac12-ds
+                namespace: quicksightdatasource
+              spec:
+                vpcConnectionProperties:
+                  vpcConnectionARN: arn:aws:quicksight:us-east-1:123456789012:vpcConnection/my-vpc
+
+    # DS-AC-13: sslProperties.disableSSL passes through to ACK DataSource spec.
+    - name: ac13-ssl-properties
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac13-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac13-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac13-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac13-cfg
+                resourceId: ac13-ds-id
+                type: REDSHIFT
+                parameters:
+                  redshiftParameters:
+                    database: mydb
+                    host: cluster.us-east-1.redshift.amazonaws.com
+                    port: 5439
+                sslProperties:
+                  disableSSL: false
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac13-ds
+                namespace: quicksightdatasource
+              spec:
+                sslProperties:
+                  disableSSL: false
+
+    # DS-AC-14: When credentials/sslProperties/vpcConnectionProperties are not set,
+    #   those fields are ABSENT from the ACK DataSource spec (not empty objects).
+    - name: ac14-optional-fields-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac14-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac14-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac14-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac14-cfg
+                resourceId: ac14-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac14-ds
+                namespace: quicksightdatasource
+              spec:
+                id: ac14-ds-id
+        - script:
+            content: |
+              kubectl get datasource ac14-ds -n quicksightdatasource -o json \
+                | jq -e '
+                  (.spec | has("credentials") | not) and
+                  (.spec | has("sslProperties") | not) and
+                  (.spec | has("vpcConnectionProperties") | not)
+                '
+
+    # DS-AC-15: permissions list passes through to ACK DataSource spec (not governed).
+    - name: ac15-permissions-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac15-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac15-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac15-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac15-cfg
+                resourceId: ac15-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:123456789012:user/default/analyst
+                    actions:
+                      - quicksight:DescribeDataSource
+                      - quicksight:DescribeDataSourcePermissions
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac15-ds
+                namespace: quicksightdatasource
+              spec:
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:123456789012:user/default/analyst
+
+    # DS-AC-16: Standard K8s metadata — managed-by, instance labels; deletion-policy
+    #   annotation; ownerReference pointing to the QuickSightDataSource instance.
+    - name: ac16-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac16-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac16-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac16-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac16-cfg
+                resourceId: ac16-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac16-ds
+                namespace: quicksightdatasource
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac16-ds
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+        - script:
+            content: |
+              kubectl get datasource ac16-ds -n quicksightdatasource -o json \
+                | jq -e '
+                  .metadata.ownerReferences |
+                  map(select(.kind == "QuickSightDataSource" and .name == "ac16-ds")) |
+                  length == 1
+                '
+
+    # DS-AC-17: deletionPolicy: delete — sets annotation services.k8s.aws/deletion-policy=delete.
+    - name: ac17-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac17-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac17-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac17-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac17-cfg
+                deletionPolicy: delete
+                resourceId: ac17-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac17-ds
+                namespace: quicksightdatasource
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # DS-AC-18: deletionPolicy: retain (default) — annotation retains default value.
+    - name: ac18-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac18-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac18-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac18-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac18-cfg
+                deletionPolicy: retain
+                resourceId: ac18-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac18-ds
+                namespace: quicksightdatasource
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # DS-AC-19: folderARNs list passes through to ACK DataSource spec.
+    - name: ac19-folder-arns
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac19-cfg
+                namespace: quicksightdatasource
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec:
+                mandatory: {}
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch quicksightconfig ac19-cfg -n quicksightdatasource \
+                --type=merge --subresource=status \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"importMode":"","namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              metadata:
+                name: ac19-ds
+                namespace: quicksightdatasource
+              spec:
+                configRef: ac19-cfg
+                resourceId: ac19-ds-id
+                type: ATHENA
+                parameters:
+                  athenaParameters:
+                    workGroup: primary
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:123456789012:folder/data-team
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: DataSource
+              metadata:
+                name: ac19-ds
+                namespace: quicksightdatasource
+              spec:
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:123456789012:folder/data-team
