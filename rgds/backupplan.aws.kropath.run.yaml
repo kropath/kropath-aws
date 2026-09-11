@@ -1,0 +1,161 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: backupplan.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: BackupPlan
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Plan identity — displayName maps to ACK spec.name; derived from metadata.name when empty.
+      displayName: string | default=""
+      # Backup rules — at least one required. Array of objects; each must have ruleName + scheduleExpression.
+      rules: "[]object"
+      # Malware scan settings (plan-level)
+      scanSettings: "[]object"
+    status:
+      planId: >-
+        ${plan.?status.?id.orValue("")}
+      planARN: >-
+        ${plan.?status.?ackResourceMetadata.?arn.orValue("")}
+      versionId: >-
+        ${plan.?status.?versionID.orValue("")}
+      creationDate: >-
+        ${plan.?status.?creationDate.orValue("")}
+      lastExecutionDate: >-
+        ${plan.?status.?lastExecutionDate.orValue("")}
+      conditions: >-
+        ${plan.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: PlanId
+        type: string
+        jsonPath: .status.planId
+      - name: PlanARN
+        type: string
+        jsonPath: .status.planARN
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: BackupConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ACK BackupPlan CR — primary cloud resource.
+    # Rules are transformed via .map() to apply governance per-rule:
+    #   - enableContinuousBackup: mandatory → per-rule instance → defaults
+    #   - lifecycle.deleteAfterDays: mandatory → per-rule instance → defaults
+    #   - lifecycle.moveToColdStorageAfterDays: mandatory → per-rule instance → defaults
+    # scanSettings are injected when mandatory.enableMalwareScan=true and no scanSettings present.
+    - id: plan
+      template:
+        apiVersion: backup.services.k8s.aws/v1alpha1
+        kind: BackupPlan
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: BackupPlan
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # displayName → ACK spec.name; derived from metadata.name when empty
+          name: >-
+            ${schema.spec.displayName != "" ? schema.spec.displayName : schema.metadata.name}
+          # Cloud tags: defaults + instance + mandatory
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
+          # Rules: transform each rule to apply per-rule governance overrides.
+          # targetBackupVaultRef string → ACK targetBackupVaultRef.from.name when set;
+          # targetBackupVaultName used directly otherwise.
+          rules: >-
+            ${schema.spec.rules.map(r, {
+              "ruleName": r.?ruleName.orValue(""),
+              "scheduleExpression": r.?scheduleExpression.orValue(""),
+              "scheduleExpressionTimezone": r.?scheduleExpressionTimezone.orValue(""),
+              "startWindowMinutes": r.?startWindowMinutes.orValue(int(0)),
+              "completionWindowMinutes": r.?completionWindowMinutes.orValue(int(0)),
+              "targetBackupVaultName": r.?targetBackupVaultRef.orValue("") != "" ? r.targetBackupVaultRef : r.?targetBackupVaultName.orValue(""),
+              "enableContinuousBackup": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?enableContinuousBackup.orValue(false))
+                ? true
+                : (r.?enableContinuousBackup.orValue(false)
+                    ? true
+                    : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?enableContinuousBackup.orValue(false))),
+              "lifecycle": {
+                "deleteAfterDays": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultLifecycleDeleteAfterDays.orValue(int(0)) > 0)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultLifecycleDeleteAfterDays
+                  : (r.?lifecycle.?deleteAfterDays.orValue(int(0)) > 0
+                      ? r.lifecycle.deleteAfterDays
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?defaultLifecycleDeleteAfterDays.orValue(int(0)) > 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.defaultLifecycleDeleteAfterDays
+                          : int(0))),
+                "moveToColdStorageAfterDays": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?defaultLifecycleMoveToColdStorageAfterDays.orValue(int(0)) > 0)
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.defaultLifecycleMoveToColdStorageAfterDays
+                  : (r.?lifecycle.?moveToColdStorageAfterDays.orValue(int(0)) > 0
+                      ? r.lifecycle.moveToColdStorageAfterDays
+                      : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.defaults.?defaultLifecycleMoveToColdStorageAfterDays.orValue(int(0)) > 0
+                          ? rsrcCfg[0].status.effectiveConfig.defaults.defaultLifecycleMoveToColdStorageAfterDays
+                          : int(0)))
+              },
+              "recoveryPointTags": r.?recoveryPointTags.orValue({})
+            })}
+          # Scan settings: injected from mandatory governance when enableMalwareScan=true;
+          # otherwise pass instance scanSettings through.
+          scanSettings: >-
+            ${(rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?enableMalwareScan.orValue(false))
+                && schema.spec.scanSettings.size() == 0
+              ? [{"malwareScanner": "default", "scannerRoleARN": rsrcCfg[0].status.effectiveConfig.mandatory.?scannerRoleARN.orValue("")}]
+              : schema.spec.scanSettings.map(s, {
+                  "malwareScanner": s.?malwareScanner.orValue("default"),
+                  "scannerRoleARN": (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.mandatory.?scannerRoleARN.orValue("") != "")
+                    ? rsrcCfg[0].status.effectiveConfig.mandatory.scannerRoleARN
+                    : (s.?scannerRoleARN.orValue("") != ""
+                        ? s.scannerRoleARN
+                        : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?scannerRoleARN.orValue("") : ""))
+                })}
