@@ -2028,3 +2028,49 @@ field** in kro v0.9.2.
   `rgds/` and rewrite each hit.
 
 ---
+
+## 11. `waiting for readiness (data pending)` on a ConfigMap Node Is Almost Always Missing kro RBAC
+
+*Discovered in KRO-831 (EMR). Corrects a wrong conclusion recorded in
+`docs/troubleshooting-logs/2026-09-09-emr-virtualcluster-includeWhen-naming-dependency.md`.*
+
+* **What Fails:** An ACK child is never created. The instance reports:
+    ```
+    resource reconciliation failed: waiting for unresolved resource: ... node "ackApplication":
+    dependent node "resolved" not ready: node "resolved": no observed state:
+    waiting for readiness (data pending)
+    ```
+  The message names a **ConfigMap** node, so it reads as "ConfigMaps have no status and never
+  become ready — my graph is deadlocked on the ConfigMap."
+* **Why the message misleads:** `data pending` is a **transient** state kro emits early in
+  reconciliation, not a terminal one. When the kro ServiceAccount lacks permission on the child's
+  API group, the child is never created, reconciliation never advances, and that transient message
+  is the last thing written — so it looks like the stall's cause rather than a symptom recorded
+  alongside it. The real error surfaces a few seconds later:
+    ```
+    applications.emrserverless.services.k8s.aws "x" is forbidden: User
+    "system:serviceaccount:kro-system:kro" cannot get resource "applications" in API group ...
+    ```
+* **Confirm it in one command:**
+    ```bash
+    kubectl describe <kind> <name> -n <ns> | grep -i forbidden
+    ```
+* **What Works Instead:** add the API group to `tests/fixtures/rbac/kro-controller.yaml`
+  (`rules[1].apiGroups`). Adding an ACK service always takes **two** files — the CRD stub *and*
+  the RBAC entry.
+* **What NOT to do — referencing a ConfigMap node is fine.** Do not "fix" this by duplicating the
+  ConfigMap's expression inline into every consumer. Reading another node's `data.*` works in
+  `includeWhen` **and** in a `template:` body:
+    * 85 of the 194 RGDs in `rgds/` read `naming.data.*` from `includeWhen`;
+      `tests/eks/eksnodegroup/` is one and creates all 12 of its ACK children.
+    * `emrserverlessapplication` and `emrjobrun` both set
+      `spec.name: ${naming.data.effectiveName}` in the ACK child template and pass all their ACs.
+  Inlining costs real maintenance: the ~40-line `effectiveName` expression then exists twice in one
+  file, and the `{tag.X}` fallback bug in KRO-831 had to be fixed at two sites per RGD because of
+  exactly that duplication.
+* **Caveat worth keeping:** `rgds/cognitouserpool.aws.kropath.run.yaml` inlines its guards with a
+  comment about `data pending` **during teardown**. That is a different (deletion-ordering) claim
+  from the creation-time one refuted here and has not been re-tested; leave it alone until someone
+  verifies it.
+
+---

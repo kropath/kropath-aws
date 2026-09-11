@@ -1,0 +1,191 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-os-05 — OpenSearchVPCEndpoint kro RGD (KRO-887).
+# Atomic RGD: wraps one ACK opensearchservice.services.k8s.aws/VPCEndpoint.
+# No naming convention (KRO-236): VPC endpoints use system-assigned vpcEndpointID (^aos-[a-zA-Z0-9]*$).
+# No cloud resource tags: ACK VPCEndpoint has no spec.tags field; tags tracked in K8s metadata only.
+# domainARN and domainRef are mutually exclusive; at least one must be set.
+# vpcSubnetIDs is required and must not be empty.
+# x-kubernetes-validations not preserved by kro v0.9.2 — advisory ConfigMap pattern used.
+# ackVPCEndpointRef: always-bound self-lookup prevents unbound-variable freeze in status block.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: opensearchvpcendpoint.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: OpenSearchVPCEndpoint
+    scope: Namespaced
+    spec:
+      # Standard kropath fields
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+
+      # Domain reference — mutually exclusive; at least one required.
+      # Advisory ConfigMap enforces these constraints (x-kubernetes-validations not preserved
+      # by kro v0.9.2 — see frequent-rgd-errors.md §2).
+      domainARN: string | default=""
+      domainRef: string | default=""
+
+      # VPC configuration.
+      # vpcSubnetIDs is required and must not be empty; advisory ConfigMap enforces this.
+      # vpcSecurityGroupIDs empty = default VPC security group (ACK controller respects omitempty).
+      vpcSubnetIDs: "[]string | default=[]"
+      vpcSecurityGroupIDs: "[]string | default=[]"
+
+    status:
+      # validationError: first non-empty error from the advisory validationErrors ConfigMap.
+      # Single ConfigMap expression avoids the variant-split status freeze
+      # (frequent-rgd-errors.md §"Variant-Split Resources Freeze").
+      # has() guards defend against kro v0.9.2 zero-value stripping of empty-string data keys.
+      validationError: >-
+        ${(has(validationErrors.data) && has(validationErrors.data.mutualExclusionError) && validationErrors.data.mutualExclusionError != "") ? validationErrors.data.mutualExclusionError
+          : ((has(validationErrors.data) && has(validationErrors.data.neitherSetError) && validationErrors.data.neitherSetError != "") ? validationErrors.data.neitherSetError
+            : ((has(validationErrors.data) && has(validationErrors.data.subnetRequiredError) && validationErrors.data.subnetRequiredError != "") ? validationErrors.data.subnetRequiredError : ""))}
+      # conditions from the always-bound self-lookup (ackVPCEndpointRef).
+      # Direct reference to ackVPCEndpoint (includeWhen-gated) would freeze when excluded
+      # (frequent-rgd-errors.md §4).
+      conditions: >-
+        ${ackVPCEndpointRef.size() > 0 ? ackVPCEndpointRef[0].?status.?conditions.orValue([]) : []}
+
+    additionalPrinterColumns:
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    # kro returns externalRef as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: OpenSearchConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Domain CR lookup — resolves status.predictedArn when spec.domainRef is set (Theme 28).
+    # Uses selector.matchLabels with aws.kropath.run/resource-name label.
+    # Returns an empty list when domainRef is "" (no domain carries an empty resource-name label),
+    # or when the referenced domain CR does not yet exist.
+    - id: domainCR
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: OpenSearchDomain
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?domainRef.orValue("")}
+
+    # Always-created advisory validation ConfigMap — computes all admission checks inline.
+    # Using a single non-gated ConfigMap avoids the variant-split status freeze that occurs
+    # when two or more includeWhen-gated resources are mentioned in one status expression.
+    # mutualExclusionError: both domainARN and domainRef are non-empty.
+    # neitherSetError: both domainARN and domainRef are empty.
+    # subnetRequiredError: vpcSubnetIDs is empty.
+    - id: validationErrors
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          mutualExclusionError: >-
+            ${schema.spec.domainARN != "" && schema.spec.domainRef != "" ? "domainARN and domainRef are mutually exclusive" : ""}
+          neitherSetError: >-
+            ${schema.spec.domainARN == "" && schema.spec.domainRef == "" ? "one of domainARN or domainRef is required" : ""}
+          subnetRequiredError: >-
+            ${schema.spec.vpcSubnetIDs.size() == 0 ? "vpcSubnetIDs is required and must not be empty" : ""}
+
+    # Always-bound self-lookup: fetches the ACK VPCEndpoint child to read status.conditions.
+    # Using the app.kubernetes.io/instance label that ackVPCEndpoint receives.
+    # Returns an empty list before the VPCEndpoint is created or when ackVPCEndpoint is excluded.
+    # This pattern prevents unbound-variable freeze in the status block (frequent-rgd-errors.md §4).
+    - id: ackVPCEndpointRef
+      externalRef:
+        apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+        kind: VPCEndpoint
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # ACK VPCEndpoint CR — primary cloud resource.
+    # Excluded when any validation fails (mutual exclusion, neither-set, or empty subnets).
+    - id: ackVPCEndpoint
+      includeWhen:
+        - >-
+          ${!(schema.spec.domainARN != "" && schema.spec.domainRef != "")
+            && (schema.spec.domainARN != "" || schema.spec.domainRef != "")
+            && schema.spec.vpcSubnetIDs.size() > 0}
+      template:
+        apiVersion: opensearchservice.services.k8s.aws/v1alpha1
+        kind: VPCEndpoint
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.tags)) ? rsrcCfg[0].status.effectiveConfig.defaults.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge(schema.spec.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.tags)) ? rsrcCfg[0].status.effectiveConfig.mandatory.tags.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: OpenSearchVPCEndpoint
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # domainARN — direct if spec.domainARN is set; resolved from OpenSearchDomain CR
+          # status.predictedArn when spec.domainRef is set (Theme 28).
+          # domainCR.size() > 0 guard handles the case where the referenced domain does not yet exist.
+          domainARN: >-
+            ${schema.spec.domainARN != "" ? schema.spec.domainARN
+              : (domainCR.size() > 0 ? domainCR[0].status.predictedArn : "")}
+          # vpcOptions — required on ACK VPCEndpoint (CRD cache: vpcOptions is required).
+          # securityGroupIDs: empty list = default VPC security group (ACK omitempty handling).
+          vpcOptions:
+            subnetIDs: ${schema.spec.vpcSubnetIDs}
+            securityGroupIDs: ${schema.spec.vpcSecurityGroupIDs}
+          # Note: ACK VPCEndpoint has no spec.tags field.
+          # All tag/label/annotation governance is applied to K8s metadata labels above.
