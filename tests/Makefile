@@ -27,7 +27,7 @@ CLUSTER_NAME ?= kropath-aws-test
 	test-sagemaker test-ses test-sns test-sqs test-ssm test-stepfunctions test-waf \
 	test-networkfirewall test-mwaa test-ram \
 	test-managedprometheus test-emr test-quicksight test-ecrpublic \
-	test-recyclebin
+	test-recyclebin test-s3-advanced
 
 setup:
 	./setup.sh $(CLUSTER_NAME)
@@ -81,6 +81,9 @@ test-kms:
 
 test-s3:
 	chainsaw test s3/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
+
+test-s3-advanced:
+	chainsaw test s3-advanced/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
 
 test-sqs:
 	chainsaw test sqs/ --config $(CHAINSAW_CONFIG) --parallel 4 --report-format JUNIT-TEST --report-path test-results/
