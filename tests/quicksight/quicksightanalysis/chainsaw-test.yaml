@@ -1,0 +1,1116 @@
+# Chainsaw test suite for QuickSightAnalysis RGD.
+# Acceptance criteria: AN-AC-1 through AN-AC-18.
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step ACK deletes.
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: quicksightanalysis
+spec:
+  namespace: quicksightanalysis
+  skipDelete: true
+  steps:
+
+    # AN-AC-1: sourceEntity.sourceTemplate passed through to ACK Analysis.
+    - name: anac1-source-entity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac1-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac1-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac1-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac1-cfg
+                resourceId: ac1-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac1-an
+                namespace: quicksightanalysis
+              spec:
+                analysisID: ac1-analysis-id
+        - script:
+            content: |
+              ENTITY=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac1-an -o json | jq '.spec.sourceEntity')
+              echo "$ENTITY" | jq -e '
+                .sourceTemplate.arn == "arn:aws:quicksight:us-east-1:111111111111:template/tmpl1" and
+                (.sourceTemplate.dataSetReferences | length == 1) and
+                .sourceTemplate.dataSetReferences[0].dataSetPlaceholder == "ds1"
+              ' || { echo "FAIL: sourceEntity not passed through: $ENTITY"; exit 1; }
+              echo "PASS: sourceEntity passed through"
+
+    # AN-AC-2: Tags merge — defaults + spec + mandatory, mandatory wins.
+    - name: anac2-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac2-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory:
+                  tags:
+                    env: prod
+                    owner: mandatory-owner
+                defaults:
+                  tags:
+                    env: dev
+                    team: platform
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac2-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{"env":"prod","owner":"mandatory-owner"},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{"env":"dev","team":"platform"},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac2-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac2-cfg
+                resourceId: ac2-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac2-an
+                namespace: quicksightanalysis
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac2-an -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e '
+                (map(select(.key=="env")) | length == 1) and
+                (map(select(.key=="env"))[0].value == "prod") and
+                (map(select(.key=="owner")) | length == 1) and
+                (map(select(.key=="owner"))[0].value == "mandatory-owner") and
+                (map(select(.key=="team")) | length == 1) and
+                (map(select(.key=="team"))[0].value == "platform")
+              ' || { echo "FAIL: tags merge incorrect: $TAGS"; exit 1; }
+              echo "PASS: tags merged correctly with mandatory-wins"
+
+    # AN-AC-3: syncedLabels dual-write — K8s labels (prefixed) AND cloud tags (plain).
+    - name: anac3-syncedlabels-dualwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac3-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                defaults:
+                  syncedLabels:
+                    team: infra
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac3-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{"team":"infra"},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac3-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac3-cfg
+                resourceId: ac3-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac3-an
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/team: infra
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac3-an -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="team")) | length == 1 and .[0].value == "infra"' \
+                || { echo "FAIL: syncedLabels not in cloud tags: $TAGS"; exit 1; }
+              echo "PASS: syncedLabels dual-write verified"
+
+    # AN-AC-4: syncedAnnotations dual-write.
+    - name: anac4-syncedannotations-dualwrite
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac4-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                defaults:
+                  syncedAnnotations:
+                    cost-center: "9900"
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac4-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{"cost-center":"9900"}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac4-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac4-cfg
+                resourceId: ac4-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac4-an
+                namespace: quicksightanalysis
+                annotations:
+                  aws.kropath.run/cost-center: "9900"
+        - script:
+            content: |
+              TAGS=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac4-an -o json | jq -r '.spec.tags')
+              echo "$TAGS" | jq -e 'map(select(.key=="cost-center")) | length == 1 and .[0].value == "9900"' \
+                || { echo "FAIL: syncedAnnotations not in cloud tags: $TAGS"; exit 1; }
+              echo "PASS: syncedAnnotations dual-write verified"
+
+    # AN-AC-5: Default naming template {namespace}-{name}.
+    - name: anac5-default-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac5-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac5-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac5-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac5-cfg
+                resourceId: ac5-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac5-an
+                namespace: quicksightanalysis
+              spec:
+                name: quicksightanalysis-ac5-an
+
+    # AN-AC-6: mandatory.namingTemplate overrides default.
+    - name: anac6-mandatory-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac6-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{name}"
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac6-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"namingTemplate":"corp-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac6-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac6-cfg
+                resourceId: ac6-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac6-an
+                namespace: quicksightanalysis
+              spec:
+                name: corp-ac6-an
+
+    # AN-AC-7: spec.nameOverride bypasses all templates.
+    - name: anac7-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac7-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac7-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac7-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac7-cfg
+                nameOverride: my-custom-analysis
+                resourceId: ac7-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac7-an
+                namespace: quicksightanalysis
+              spec:
+                name: my-custom-analysis
+
+    # AN-AC-8 (negative): Unresolved token in naming template → namingStatus: invalid, no ACK Analysis.
+    - name: anac8-negative-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac8-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "an-{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac8-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"namingTemplate":"an-{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac8-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac8-cfg
+                resourceId: ac8-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac8-an
+                namespace: quicksightanalysis
+              status:
+                namingStatus: invalid-unresolved-tokens
+        - script:
+            content: |
+              COUNT=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac8-an 2>/dev/null | grep -c ac8-an || true)
+              if [ "$COUNT" -gt 0 ]; then
+                echo "FAIL: ACK Analysis created despite invalid naming token"
+                exit 1
+              fi
+              echo "PASS: ACK Analysis correctly absent when naming is invalid"
+
+    # AN-AC-9: awsAccountID injected from effectiveConfig.aws.accountId.
+    - name: anac9-account-id-injection
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac9-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac9-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"999888777666","region":"eu-west-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac9-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac9-cfg
+                resourceId: ac9-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:eu-west-1:999888777666:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:eu-west-1:999888777666:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac9-an
+                namespace: quicksightanalysis
+              spec:
+                awsAccountID: "999888777666"
+
+    # AN-AC-11: themeARN pass-through when provided.
+    - name: anac11-theme-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac10-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac10-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac10-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac10-cfg
+                resourceId: ac10-analysis-id
+                themeARN: arn:aws:quicksight:us-east-1:111111111111:theme/my-theme
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac10-an
+                namespace: quicksightanalysis
+              spec:
+                themeARN: arn:aws:quicksight:us-east-1:111111111111:theme/my-theme
+
+    # AN-AC-13: parameters pass-through when provided.
+    - name: anac13-parameters
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac11-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac11-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac11-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac11-cfg
+                resourceId: ac11-analysis-id
+                parameters:
+                  stringParameters:
+                    - name: Region
+                      values:
+                        - us-east-1
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac11-an
+                namespace: quicksightanalysis
+        - script:
+            content: |
+              PARAMS=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac11-an -o json | jq '.spec.parameters')
+              echo "$PARAMS" | jq -e '.stringParameters[0].name == "Region"' \
+                || { echo "FAIL: parameters not passed through: $PARAMS"; exit 1; }
+              echo "PASS: parameters passed through"
+
+    # AN-AC-14: parameters absent when not provided.
+    - name: anac14-parameters-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac12-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac12-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac12-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac12-cfg
+                resourceId: ac12-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac12-an
+                namespace: quicksightanalysis
+        - script:
+            content: |
+              PARAMS=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac12-an -o json | jq '.spec.parameters')
+              if [ "$PARAMS" != "null" ]; then
+                echo "FAIL: parameters should be absent: $PARAMS"
+                exit 1
+              fi
+              echo "PASS: parameters correctly absent"
+
+    # AN-AC-15: definition pass-through when provided.
+    - name: anac15-definition
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac13-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac13-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac13-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac13-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac13-cfg
+                resourceId: ac13-analysis-id
+                definition:
+                  dataSetIdentifierDeclarations:
+                    - identifier: MyDataSet
+                      dataSetArn: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac13-an
+                namespace: quicksightanalysis
+        - script:
+            content: |
+              DEF=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac13-an -o json | jq '.spec.definition')
+              echo "$DEF" | jq -e '.dataSetIdentifierDeclarations[0].identifier == "MyDataSet"' \
+                || { echo "FAIL: definition not passed through: $DEF"; exit 1; }
+              echo "PASS: definition passed through"
+
+    # AN-AC-16: permissions pass-through.
+    - name: anac16-permissions
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac14-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac14-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac14-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac14-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac14-cfg
+                resourceId: ac14-analysis-id
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:111111111111:user/default/analyst
+                    actions:
+                      - quicksight:DescribeAnalysis
+                      - quicksight:ListAnalyses
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac14-an
+                namespace: quicksightanalysis
+              spec:
+                permissions:
+                  - principal: arn:aws:quicksight:us-east-1:111111111111:user/default/analyst
+
+    # AN-AC-17: folderARNs pass-through.
+    - name: anac17-folder-arns
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac15-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac15-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac15-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac15-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac15-cfg
+                resourceId: ac15-analysis-id
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder1
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac15-an
+                namespace: quicksightanalysis
+              spec:
+                folderARNs:
+                  - arn:aws:quicksight:us-east-1:111111111111:folder/folder1
+
+    # AN-AC-18: deletionPolicy: delete → annotation services.k8s.aws/deletion-policy: delete.
+    - name: anac18-deletionpolicy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac16-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac16-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac16-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac16-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac16-cfg
+                deletionPolicy: delete
+                resourceId: ac16-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac16-an
+                namespace: quicksightanalysis
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AN-AC-19: Standard K8s metadata — ownerReference, managed-by label.
+    - name: anac19-k8s-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac17-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac17-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac17-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac17-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac17-cfg
+                resourceId: ac17-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac17-an
+                namespace: quicksightanalysis
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: ac17-an
+        - script:
+            content: |
+              OWNERREFS=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac17-an -o json | jq '.metadata.ownerReferences')
+              echo "$OWNERREFS" | jq -e '
+                length == 1 and
+                .[0].kind == "QuickSightAnalysis" and
+                .[0].name == "ac17-an" and
+                .[0].controller == true
+              ' || { echo "FAIL: ownerReference wrong: $OWNERREFS"; exit 1; }
+              echo "PASS: ownerReference correct"
+
+    # AN-AC-20: predictedArn uses resourceId (not effectiveName).
+    - name: anac20-predicted-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac18-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac18-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac18-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"123456789012","region":"ap-southeast-2"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac18-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac18-cfg
+                nameOverride: display-name-analysis
+                resourceId: immutable-analysis-id-789
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:ap-southeast-2:123456789012:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:ap-southeast-2:123456789012:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac18-an
+                namespace: quicksightanalysis
+              spec:
+                name: display-name-analysis
+                analysisID: immutable-analysis-id-789
+        - script:
+            content: |
+              ARN=$(kubectl -n quicksightanalysis get quicksightanalyses.aws.kropath.run ac18-an -o jsonpath='{.status.predictedArn}')
+              EXPECTED="arn:aws:quicksight:ap-southeast-2:123456789012:analysis/immutable-analysis-id-789"
+              if [ "$ARN" != "$EXPECTED" ]; then
+                echo "FAIL: predictedArn='$ARN', expected='$EXPECTED'"
+                exit 1
+              fi
+              echo "PASS: predictedArn uses resourceId correctly: $ARN"
+
+    # AN-AC-12: themeARN absent from ACK Analysis when not provided (regression test for B-1 fix).
+    # Verifies the analysisNoTheme variant omits themeARN entirely, not passes "".
+    - name: anac12-theme-arn-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac19-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac19-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac19-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac19-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac19-cfg
+                resourceId: ac19-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl1
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-1
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac19-an
+                namespace: quicksightanalysis
+              spec:
+                analysisID: ac19-analysis-id
+        - script:
+            content: |
+              SPEC=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac19-an -o json | jq '.spec')
+              HAS_THEME=$(echo "$SPEC" | jq 'has("themeARN")')
+              if [ "$HAS_THEME" = "true" ]; then
+                THEME_VAL=$(echo "$SPEC" | jq -r '.themeARN')
+                echo "FAIL: spec.themeARN is present (value='$THEME_VAL'); expected absent when not set"
+                exit 1
+              fi
+              echo "PASS: spec.themeARN absent from ACK Analysis when not provided"
+
+    # AN-AC-10: two dataSetReferences entries — both must appear in ACK Analysis.
+    - name: anac10-two-dataset-refs
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightConfig
+              metadata:
+                name: ac20-cfg
+                namespace: quicksightanalysis
+                labels:
+                  aws.kropath.run/resource-name: ac20-cfg
+              spec: {}
+        - script:
+            content: |
+              kubectl -n quicksightanalysis patch quicksightconfigs.aws.kropath.run ac20-cfg \
+                --subresource=status --type=merge -p '{
+                  "status":{"effectiveConfig":{
+                    "mandatory":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "defaults":{"tags":{},"syncedLabels":{},"syncedAnnotations":{}},
+                    "aws":{"accountId":"111111111111","region":"us-east-1"}
+                  }}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightAnalysis
+              metadata:
+                name: ac20-an
+                namespace: quicksightanalysis
+              spec:
+                configRef: ac20-cfg
+                resourceId: ac20-analysis-id
+                sourceEntity:
+                  sourceTemplate:
+                    arn: arn:aws:quicksight:us-east-1:111111111111:template/tmpl-multi
+                    dataSetReferences:
+                      - dataSetPlaceholder: ds1
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-alpha
+                      - dataSetPlaceholder: ds2
+                        dataSetARN: arn:aws:quicksight:us-east-1:111111111111:dataset/ds-id-beta
+        - assert:
+            resource:
+              apiVersion: quicksight.services.k8s.aws/v1alpha1
+              kind: Analysis
+              metadata:
+                name: ac20-an
+                namespace: quicksightanalysis
+              spec:
+                analysisID: ac20-analysis-id
+        - script:
+            content: |
+              DS_REFS=$(kubectl -n quicksightanalysis get analyses.quicksight.services.k8s.aws ac20-an -o json \
+                | jq '.spec.sourceEntity.sourceTemplate.dataSetReferences')
+              REF_COUNT=$(echo "$DS_REFS" | jq 'length')
+              if [ "$REF_COUNT" != "2" ]; then
+                echo "FAIL: expected 2 dataSetReferences, got $REF_COUNT: $DS_REFS"
+                exit 1
+              fi
+              HAS_DS1=$(echo "$DS_REFS" | jq '[.[].dataSetPlaceholder] | contains(["ds1"])')
+              HAS_DS2=$(echo "$DS_REFS" | jq '[.[].dataSetPlaceholder] | contains(["ds2"])')
+              if [ "$HAS_DS1" != "true" ] || [ "$HAS_DS2" != "true" ]; then
+                echo "FAIL: missing dataSetPlaceholders — has ds1=$HAS_DS1, ds2=$HAS_DS2"
+                echo "$DS_REFS"
+                exit 1
+              fi
+              echo "PASS: both dataSetReferences (ds1, ds2) present in ACK Analysis"
