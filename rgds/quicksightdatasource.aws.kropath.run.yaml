@@ -47,6 +47,10 @@ spec:
       sslProperties: object
       vpcConnectionProperties: object
       folderARNs: "[]string | default=[]"
+      # hasOptionalFields: when true, credentials/sslProperties/vpcConnectionProperties are
+      # included in the ACK DataSource spec. Must be set explicitly (no default — has() works,
+      # per frequent-rgd-errors §10.1 boolean exception). Absence → fields omitted from ACK spec.
+      hasOptionalFields: boolean
     status:
       resourceName: >-
         ${naming.data.effectiveName}
@@ -57,9 +61,13 @@ spec:
           ? "arn:aws:quicksight:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":datasource/" + naming.data.resourceId
           : ""}
       connectionStatus: >-
-        ${dataSource.?status.?status.orValue("")}
+        ${dataSourceBasic.?status.?status.orValue("")}
+      connectionStatusWithOptionals: >-
+        ${dataSourceFull.?status.?status.orValue("")}
       conditions: >-
-        ${dataSource.?status.?conditions.orValue([])}
+        ${dataSourceBasic.?status.?conditions.orValue([])}
+      conditionsWithOptionals: >-
+        ${dataSourceFull.?status.?conditions.orValue([])}
     additionalPrinterColumns:
       - name: ResourceName
         type: string
@@ -189,12 +197,13 @@ spec:
           # schema.spec.* is not accessible from the top-level status block (frequent-rgd-errors §3).
           resourceId: ${schema.spec.resourceId}
 
-    # ACK DataSource CR — primary cloud resource.
-    # Only created when effectiveName has no unresolved tokens (naming gate).
-    # spec.id (resourceId) is immutable after creation per ACK CRD x-kubernetes-validations.
-    - id: dataSource
+    # ACK DataSource CR — two variants split on hasOptionalFields sentinel.
+    # kro cannot omit a field via null (frequent-rgd-errors §10.2), so variant split is required.
+    # hasOptionalFields: bool (no default) — has() is honest per §10.1 boolean exception.
+    - id: dataSourceBasic
       includeWhen:
         - '${!naming.data.effectiveName.contains("{")}'
+        - '${!(has(schema.spec.hasOptionalFields) && schema.spec.hasOptionalFields)}'
       template:
         apiVersion: quicksight.services.k8s.aws/v1alpha1
         kind: DataSource
@@ -219,30 +228,68 @@ spec:
               controller: true
               blockOwnerDeletion: true
         spec:
-          # awsAccountID: required, injected from effectiveConfig (never from spec — spec field absent)
           awsAccountID: >-
             ${rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : ""}
-          # id: immutable unique resource identifier; maps to spec.resourceId (NOT effectiveName)
           id: ${schema.spec.resourceId}
-          # name: display name — always effectiveName (never metadata.name or resourceId)
           name: ${naming.data.effectiveName}
-          # type: data source type (REDSHIFT, ATHENA, S3, MYSQL, etc.); immutable per ACK CRD
           type: ${schema.spec.type}
-          # parameters: connector-specific connection settings (variant type — one sub-key set)
           parameters: ${schema.spec.parameters}
-          # credentials: absent from CR when nil (frequent-rgd-errors §3)
-          credentials: ${schema.?spec.?credentials.orValue(null)}
-          # sslProperties: absent from CR when nil
-          sslProperties: ${schema.?spec.?sslProperties.orValue(null)}
-          # vpcConnectionProperties: absent from CR when nil
-          vpcConnectionProperties: ${schema.?spec.?vpcConnectionProperties.orValue(null)}
-          # permissions: passed through; not governed (instance-level only)
           permissions: ${schema.spec.permissions}
-          # folderARNs: passed through for organizational assignment on creation
           folderARNs: ${schema.spec.folderARNs}
-          # Cloud resource tags — ACK QuickSight uses []object {key,value} format (not map).
-          # Merge order: defaults → spec → mandatory (mandatory wins on collision).
-          # syncedLabels and syncedAnnotations also written to cloud tags (ADR-015 §6.1 dual-write).
+          tags: >-
+            ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # dataSourceFull: active when hasOptionalFields=true. Includes credentials/sslProperties/
+    # vpcConnectionProperties as passed by user. Empty {} fields are accepted by ACK (optional).
+    - id: dataSourceFull
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{")}'
+        - '${has(schema.spec.hasOptionalFields) && schema.spec.hasOptionalFields}'
+      template:
+        apiVersion: quicksight.services.k8s.aws/v1alpha1
+        kind: DataSource
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: QuickSightDataSource
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          awsAccountID: >-
+            ${rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : ""}
+          id: ${schema.spec.resourceId}
+          name: ${naming.data.effectiveName}
+          type: ${schema.spec.type}
+          parameters: ${schema.spec.parameters}
+          credentials: ${schema.?spec.?credentials.orValue(null)}
+          sslProperties: ${schema.?spec.?sslProperties.orValue(null)}
+          vpcConnectionProperties: ${schema.?spec.?vpcConnectionProperties.orValue(null)}
+          permissions: ${schema.spec.permissions}
+          folderARNs: ${schema.spec.folderARNs}
           tags: >-
             ${(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
               .merge(rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
