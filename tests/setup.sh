@@ -191,9 +191,13 @@ if ! kubectl wait rgd --all --for=condition=Ready --timeout=600s; then
     true
   fi
 
-  # Classify failures: permanent GraphAccepted=False (ACK CRDs missing from ECR) vs
-  # transient Ready=True state-lag (case B above) vs genuine graph compilation errors.
-  # Permanent failures and transient state-lags do NOT indicate kro queue work remaining.
+  # Classify failures: permanent GraphAccepted=False (ACK CRDs missing from ECR) vs genuine
+  # graph compilation errors. Permanent failures do NOT consume kro queue capacity.
+  #
+  # Race-condition guard (KRO-1000): not_ready is captured atomically at timeout, but the
+  # classification loop runs sequentially afterwards. On a slow cluster an RGD can reach
+  # Active between the not_ready snapshot and this loop. Re-checking current state prevents
+  # falsely treating a "slow but valid" RGD as a genuine compilation failure.
   perm_failed_rgds=()
   transient_rgds=()
   has_non_perm_failure=false
@@ -210,7 +214,12 @@ if ! kubectl wait rgd --all --for=condition=Ready --timeout=600s; then
       # state field write has not yet propagated. Not a blocking error (case B).
       transient_rgds+=("${rgd}")
     else
-      has_non_perm_failure=true
+      # Re-check: the RGD may have reached Active on a slow cluster since not_ready was
+      # captured. Only count as a genuine failure if it is STILL not Active right now.
+      current_state=$(kubectl get rgd "${rgd}" -o jsonpath='{.status.state}' 2>/dev/null || true)
+      if [ "${current_state}" != "Active" ]; then
+        has_non_perm_failure=true
+      fi
     fi
   done <<< "${not_ready}"
 
@@ -369,7 +378,12 @@ if ! kubectl wait rgd --all --for=condition=Ready --timeout=300s; then
     if [ "${ga_status}" = "False" ]; then
       perm_failed_rgds+=("${rgd}")
     else
-      has_non_perm_failure=true
+      # Re-check: the RGD may have reached Active on a slow cluster since not_ready was
+      # captured. Only count as a genuine failure if it is STILL not Active right now.
+      current_state=$(kubectl get rgd "${rgd}" -o jsonpath='{.status.state}' 2>/dev/null || true)
+      if [ "${current_state}" != "Active" ]; then
+        has_non_perm_failure=true
+      fi
     fi
   done <<< "${not_ready}"
 
