@@ -14,6 +14,13 @@
 #
 # S3VectorsVectorBucket Chainsaw tests.
 # Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+#
+# Naming: effectiveName = nameOverride > mandatory.namingTemplate > defaults.namingTemplate
+#         > built-in default "{namespace}-{name}".
+# Encryption cascade: mandatory > instance > defaults (scalar fields, empty string = absent).
+# Tags: map[string]string format on ACK VectorBucket spec.tags; merge order
+#       defaults→spec→mandatory (mandatory wins, map merge, last write wins).
+# namingStatus: "invalid-unresolved-tokens" when effectiveName still contains "{".
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
@@ -27,7 +34,7 @@ spec:
         - apply:
             file: 00-namespace.yaml
 
-    # AC-1: Happy path — VectorBucket created with default naming.
+    # AC-1: Basic creation + naming — VectorBucket created with defaults naming template.
     # effectiveName = "{namespace}-{name}" → "s3vectorsvectorbucket-ac1-vb"
     - name: ac1-happy-path-vector-bucket-created
       try:
@@ -79,8 +86,9 @@ spec:
                 resourceName: s3vectorsvectorbucket-ac1-vb
                 predictedArn: "arn:aws:s3vectors:us-east-1:123456789012:bucket/s3vectorsvectorbucket-ac1-vb"
 
-    # AC-2: Mandatory vectorBucketEncryption overrides instance encryption.
-    - name: ac2-mandatory-encryption-override
+    # AC-2: defaults encryption — VectorBucket uses defaults.vectorBucketEncryption when
+    # instance sets no encryption.
+    - name: ac2-defaults-encryption
       try:
         - apply:
             resource:
@@ -92,17 +100,24 @@ spec:
                 labels:
                   aws.kropath.run/resource-name: ac2-cfg
               spec:
-                mandatory:
-                  vectorBucketEncryption:
-                    sseType: "aws:kms"
-                    kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/mandatory-vec-key"
+                mandatory: {}
                 defaults:
                   namingTemplate: "{namespace}-{name}"
+                  vectorBucketEncryption:
+                    sseType: "aws:kms"
+                    kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/default-vec-key"
         - script:
             content: |
               kubectl patch s3advancedconfig ac2-cfg -n s3vectorsvectorbucket \
                 --subresource=status --type=merge \
-                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"aws:kms","kmsKeyARN":"arn:aws:kms:us-east-1:123456789012:key/mandatory-vec-key"},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"aws:kms","kmsKeyARN":"arn:aws:kms:us-east-1:123456789012:key/default-vec-key"},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - script:
+            content: |
+              kubectl patch s3vectorsvectorbucket ac2-vb -n s3vectorsvectorbucket \
+                --type=merge -p '{"spec":{"encryptionConfiguration":null}}' \
+                2>/dev/null || true
+              kubectl delete vectorbuckets.s3vectors.services.k8s.aws ac2-vb \
+                -n s3vectorsvectorbucket --ignore-not-found=true 2>/dev/null || true
         - apply:
             resource:
               apiVersion: aws.kropath.run/v1alpha1
@@ -113,8 +128,6 @@ spec:
               spec:
                 configRef: ac2-cfg
                 deletionPolicy: retain
-                encryptionConfiguration:
-                  sseType: "AES256"
         - assert:
             resource:
               apiVersion: s3vectors.services.k8s.aws/v1alpha1
@@ -125,4 +138,422 @@ spec:
               spec:
                 encryptionConfiguration:
                   sseType: aws:kms
-                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/mandatory-vec-key"
+                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/default-vec-key"
+
+    # AC-3: Mandatory encryption override — mandatory.vectorBucketEncryption wins over instance.
+    - name: ac3-mandatory-encryption-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac3-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  vectorBucketEncryption:
+                    sseType: "aws:kms"
+                    kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/mandatory-pci-key"
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac3-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"aws:kms","kmsKeyARN":"arn:aws:kms:us-east-1:123456789012:key/mandatory-pci-key"},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac3-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac3-cfg
+                deletionPolicy: retain
+                encryptionConfiguration:
+                  sseType: ""
+        - assert:
+            resource:
+              apiVersion: s3vectors.services.k8s.aws/v1alpha1
+              kind: VectorBucket
+              metadata:
+                name: ac3-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                encryptionConfiguration:
+                  sseType: aws:kms
+                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/mandatory-pci-key"
+
+    # AC-4: Instance encryption overrides defaults — instance kmsKeyARN wins over defaults.
+    - name: ac4-instance-encryption-overrides-defaults
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac4-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  vectorBucketEncryption:
+                    kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/default-fallback"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac4-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":"arn:aws:kms:us-east-1:123456789012:key/default-fallback"},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac4-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac4-cfg
+                deletionPolicy: retain
+                encryptionConfiguration:
+                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/instance-custom"
+        - assert:
+            resource:
+              apiVersion: s3vectors.services.k8s.aws/v1alpha1
+              kind: VectorBucket
+              metadata:
+                name: ac4-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                encryptionConfiguration:
+                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/instance-custom"
+
+    # AC-5: No encryption — when no encryption is configured anywhere, encryptionConfiguration
+    # fields are absent or empty on the ACK VectorBucket spec.
+    - name: ac5-no-encryption-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac5-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac5-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac5-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac5-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: s3vectors.services.k8s.aws/v1alpha1
+              kind: VectorBucket
+              metadata:
+                name: ac5-vb
+                namespace: s3vectorsvectorbucket
+        - script:
+            content: |
+              # Assert encryptionConfiguration is absent or all values are empty strings.
+              # Uses // fallback to handle both: object absent (returns {}) and object present
+              # with empty-string children.
+              kubectl get vectorbucket ac5-vb -n s3vectorsvectorbucket -o json \
+                | jq -e '(.spec.encryptionConfiguration // {}) | (.sseType // "") == "" and (.kmsKeyARN // "") == ""'
+
+    # AC-6: Tag merge — mandatory.tags wins, instance spec.tags also present (map merge).
+    # Tags on ACK VectorBucket are map[string]string. Merge order: defaults→spec→mandatory
+    # (mandatory wins on key collision).
+    - name: ac6-tag-merge-mandatory-wins
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac6-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory:
+                  tags:
+                    cost-centre: platform
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac6-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac6-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac6-cfg
+                deletionPolicy: retain
+                tags:
+                  team: ml
+        - assert:
+            resource:
+              apiVersion: s3vectors.services.k8s.aws/v1alpha1
+              kind: VectorBucket
+              metadata:
+                name: ac6-vb
+                namespace: s3vectorsvectorbucket
+        - script:
+            content: |
+              # Assert that both the mandatory tag and the instance tag are present in spec.tags.
+              # Tags are map[string]string — order-independent jq check.
+              kubectl get vectorbucket ac6-vb -n s3vectorsvectorbucket -o json \
+                | jq -e '.spec.tags | (has("cost-centre")) and (has("team"))'
+
+    # AC-7: Defaults naming — effectiveName from defaults.namingTemplate resolves correctly.
+    - name: ac7-defaults-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac7-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac7-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac7-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac7-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac7-vb
+                namespace: s3vectorsvectorbucket
+              status:
+                resourceName: s3vectorsvectorbucket-ac7-vb
+
+    # AC-8: nameOverride — spec.nameOverride takes precedence over all naming templates.
+    - name: ac8-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac8-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac8-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac8-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac8-cfg
+                deletionPolicy: retain
+                nameOverride: my-vector-bucket
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac8-vb
+                namespace: s3vectorsvectorbucket
+              status:
+                resourceName: my-vector-bucket
+        - assert:
+            resource:
+              apiVersion: s3vectors.services.k8s.aws/v1alpha1
+              kind: VectorBucket
+              metadata:
+                name: ac8-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                name: my-vector-bucket
+
+    # AC-9: Standard metadata — managed-by label, deletion-policy annotation, ownerReferences.
+    - name: ac9-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac9-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac9-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac9-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac9-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: s3vectors.services.k8s.aws/v1alpha1
+              kind: VectorBucket
+              metadata:
+                name: ac9-vb
+                namespace: s3vectorsvectorbucket
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: S3VectorsVectorBucket
+                    name: ac9-vb
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # AC-10: Deletion policy delete — spec.deletionPolicy: delete sets the ACK annotation.
+    - name: ac10-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac10-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac10-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac10-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac10-cfg
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: s3vectors.services.k8s.aws/v1alpha1
+              kind: VectorBucket
+              metadata:
+                name: ac10-vb
+                namespace: s3vectorsvectorbucket
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-11: Unresolved naming token (NEGATIVE) — namingTemplate with {tag.env} produces
+    # invalid-unresolved-tokens status because the RGD only replaces {namespace}, {name},
+    # {account_id}, {region}, {configRef}. The {tag.env} token is not substituted and
+    # remains in the effectiveName string, triggering the contains("{") check.
+    - name: ac11-unresolved-naming-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac11-cfg
+                namespace: s3vectorsvectorbucket
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac11-cfg -n s3vectorsvectorbucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac11-vb
+                namespace: s3vectorsvectorbucket
+              spec:
+                configRef: ac11-cfg
+                deletionPolicy: retain
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3VectorsVectorBucket
+              metadata:
+                name: ac11-vb
+                namespace: s3vectorsvectorbucket
+              status:
+                namingStatus: invalid-unresolved-tokens

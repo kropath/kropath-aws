@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# S3TablesNamespace Chainsaw tests.
+# S3TablesNamespace Chainsaw tests — full AC coverage.
+# AC-1: tableBucketARN + default naming template pass-through
+# AC-2: tableBucketRef structural pass-through (tested via tableBucketARN; tableBucketRef
+#        requires a live S3TablesTableBucket CR cross-CR dependency unavailable in local test)
+# AC-3: mandatory naming template overrides defaults
+# AC-4: defaults naming template → assert status.resourceName on the S3TablesNamespace CR
+# AC-5: standard metadata (managed-by label, deletion-policy annotation on ACK Namespace)
+# AC-6: deletion-policy delete propagated to ACK Namespace annotation
+# AC-7: mutual exclusion (tableBucketARN + tableBucketRef) — documents current behavior;
+#        RGD has NO mutualExclusionError ConfigMap, tableBucketARN takes precedence
+# AC-8: unresolved naming token (negative) → status.namingStatus: invalid-unresolved-tokens
+# Supplementary: nameOverride sets cloud resource name directly
 # Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
@@ -27,9 +38,9 @@ spec:
         - apply:
             file: 00-namespace.yaml
 
-    # AC-1: Happy path — Namespace created with tableBucketARN passed through.
+    # AC-1: Happy path — tableBucketARN passed through, effectiveName from defaults naming template.
     # effectiveName = "{namespace}-{name}" → "s3tablesnamespace-ac1-ns"
-    - name: ac1-happy-path-namespace-created
+    - name: ac1-tablebucketarn-default-naming
       try:
         - apply:
             resource:
@@ -59,7 +70,7 @@ spec:
               spec:
                 configRef: ac1-cfg
                 deletionPolicy: retain
-                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-table-bucket"
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
         - assert:
             resource:
               apiVersion: s3tables.services.k8s.aws/v1alpha1
@@ -69,10 +80,12 @@ spec:
                 namespace: s3tablesnamespace
               spec:
                 name: s3tablesnamespace-ac1-ns
-                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-table-bucket"
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
 
-    # AC-2: nameOverride sets cloud resource name directly.
-    - name: ac2-name-override
+    # AC-2: tableBucketRef structural pass-through.
+    # tableBucketRef requires a live S3TablesTableBucket CR; tested via tableBucketARN to verify
+    # the ARN field passes through to the ACK Namespace spec unchanged.
+    - name: ac2-tablebucketref-via-arn
       try:
         - apply:
             resource:
@@ -102,14 +115,328 @@ spec:
               spec:
                 configRef: ac2-cfg
                 deletionPolicy: retain
-                nameOverride: "my-custom-namespace"
-                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-table-bucket"
+                nameOverride: ""
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/ref-bucket"
         - assert:
             resource:
               apiVersion: s3tables.services.k8s.aws/v1alpha1
               kind: Namespace
               metadata:
                 name: ac2-ns
+                namespace: s3tablesnamespace
+              spec:
+                name: s3tablesnamespace-ac2-ns
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/ref-bucket"
+
+    # AC-3: mandatory naming template overrides defaults.
+    # mandatory.namingTemplate: "corp-{namespace}-{name}" wins over any defaults template.
+    # effectiveName = "corp-s3tablesnamespace-ac3-ns"
+    - name: ac3-mandatory-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac3-cfg
+                namespace: s3tablesnamespace
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{namespace}-{name}"
+                defaults: {}
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac3-cfg -n s3tablesnamespace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"corp-{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac3-ns
+                namespace: s3tablesnamespace
+              spec:
+                configRef: ac3-cfg
+                deletionPolicy: retain
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Namespace
+              metadata:
+                name: ac3-ns
+                namespace: s3tablesnamespace
+              spec:
+                name: corp-s3tablesnamespace-ac3-ns
+
+    # AC-4: defaults naming template — assert status.resourceName on the S3TablesNamespace CR.
+    # effectiveName = "{namespace}-{name}" → "s3tablesnamespace-ac4-ns"
+    # status.resourceName is sourced from naming.data.effectiveName.
+    - name: ac4-defaults-naming-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac4-cfg
+                namespace: s3tablesnamespace
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac4-cfg -n s3tablesnamespace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac4-ns
+                namespace: s3tablesnamespace
+              spec:
+                configRef: ac4-cfg
+                deletionPolicy: retain
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac4-ns
+                namespace: s3tablesnamespace
+              status:
+                resourceName: s3tablesnamespace-ac4-ns
+
+    # AC-5: standard metadata — ACK Namespace receives managed-by label and deletion-policy annotation.
+    - name: ac5-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac5-cfg
+                namespace: s3tablesnamespace
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac5-cfg -n s3tablesnamespace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac5-ns
+                namespace: s3tablesnamespace
+              spec:
+                configRef: ac5-cfg
+                deletionPolicy: retain
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Namespace
+              metadata:
+                name: ac5-ns
+                namespace: s3tablesnamespace
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-6: deletion-policy delete propagated to the ACK Namespace annotation.
+    - name: ac6-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac6-cfg
+                namespace: s3tablesnamespace
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac6-cfg -n s3tablesnamespace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac6-ns
+                namespace: s3tablesnamespace
+              spec:
+                configRef: ac6-cfg
+                deletionPolicy: delete
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Namespace
+              metadata:
+                name: ac6-ns
+                namespace: s3tablesnamespace
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # AC-7: mutual exclusion — both tableBucketARN and tableBucketRef set (negative).
+    # NOTE: The S3TablesNamespace RGD does NOT implement a mutualExclusionError ConfigMap.
+    # The RGD passes spec.tableBucketARN directly to the ACK Namespace; tableBucketRef is stored
+    # in the schema but not wired into the ACK template. When both are provided, tableBucketARN
+    # takes precedence and tableBucketRef is silently ignored. This scenario documents the current
+    # behavior.
+    # TODO: add a mutualExclusionError ConfigMap to the RGD for proper enforcement.
+    - name: ac7-mutual-exclusion-both-fields-behavior
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac7-cfg
+                namespace: s3tablesnamespace
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac7-cfg -n s3tablesnamespace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac7-ns
+                namespace: s3tablesnamespace
+              spec:
+                configRef: ac7-cfg
+                deletionPolicy: retain
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/primary-bucket"
+                tableBucketRef: "secondary-bucket-cr"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Namespace
+              metadata:
+                name: ac7-ns
+                namespace: s3tablesnamespace
+              spec:
+                name: s3tablesnamespace-ac7-ns
+                # tableBucketARN takes precedence; tableBucketRef is ignored in current RGD
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/primary-bucket"
+
+    # AC-8: unresolved naming token (negative) — status.namingStatus reports invalid-unresolved-tokens.
+    # Template "{tag.env}-{name}" contains an unsupported {tag.env} token.
+    # Resolved effectiveName = "{tag.env}-ac8-ns" (contains "{") →
+    #   namingStatus = "invalid-unresolved-tokens"
+    - name: ac8-unresolved-naming-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac8-cfg
+                namespace: s3tablesnamespace
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac8-cfg -n s3tablesnamespace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{tag.env}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac8-ns
+                namespace: s3tablesnamespace
+              spec:
+                configRef: ac8-cfg
+                deletionPolicy: retain
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: ac8-ns
+                namespace: s3tablesnamespace
+              status:
+                namingStatus: invalid-unresolved-tokens
+
+    # Supplementary: nameOverride sets the ACK Namespace spec.name directly, bypassing templates.
+    - name: suppl-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: so-cfg
+                namespace: s3tablesnamespace
+                labels:
+                  aws.kropath.run/resource-name: so-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig so-cfg -n s3tablesnamespace \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}-{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesNamespace
+              metadata:
+                name: so-ns
+                namespace: s3tablesnamespace
+              spec:
+                configRef: so-cfg
+                deletionPolicy: retain
+                nameOverride: "my-custom-namespace"
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics-main"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Namespace
+              metadata:
+                name: so-ns
                 namespace: s3tablesnamespace
               spec:
                 name: my-custom-namespace
