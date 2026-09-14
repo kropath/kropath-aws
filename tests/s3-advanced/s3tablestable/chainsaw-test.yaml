@@ -1,0 +1,643 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# S3TablesTable Chainsaw tests — full AC coverage.
+# Naming uses underscore separator: default template "{namespace}_{name}" with
+# .replace("-","_").lowerAscii() — dashes in namespace/name become underscores.
+# S3Tables uses map[string]string for tags. ACK kind: Table (s3tables.services.k8s.aws/v1alpha1).
+#
+# AC-1:  basic creation with underscore naming + format ICEBERG
+# AC-2:  hyphen replacement: multi-hyphen name → all dashes become underscores
+# AC-3:  per-table encryption pass-through (no governance cascade)
+# AC-4:  mandatory governance encryption overrides instance spec (mandatory wins)
+# AC-5:  no instance encryption → encryptionConfiguration.sseAlgorithm absent/empty
+# AC-5n: iceberg schema pass-through — NOT APPLICABLE: spec.metadata is not exposed in the
+#        S3TablesTable RGD schema; skipped
+# AC-6:  storageClassConfiguration.storageClass pass-through
+# AC-7:  tag merge: mandatory.tags + instance spec.tags both present (mandatory wins on conflict)
+# AC-8:  cross-refs via tableBucketARN and namespace direct pass-through
+# AC-9:  standard metadata (managed-by label, deletion-policy annotation on ACK Table)
+# AC-10: nameOverride sets cloud resource name directly
+# AC-11: format defaults to ICEBERG when not set (validation ConfigMap not implemented in RGD)
+# AC-12: unresolved naming token (negative) → status.namingStatus: invalid-unresolved-tokens
+# Canonical pattern: unique resource name per step, skipDelete: true, no inter-step deletes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: s3tablestable
+spec:
+  skipDelete: true
+  namespace: s3tablestable
+  steps:
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-namespace.yaml
+
+    # AC-1: Happy path — Table created with underscore naming.
+    # namespace="s3tablestable", name="ac1-table"
+    # effectiveName = "{namespace}_{name}" → "s3tablestable_ac1-table" → .replace("-","_")
+    #   → "s3tablestable_ac1_table"
+    - name: ac1-basic-creation-underscore-naming
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac1-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac1-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac1-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac1-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac1-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac1-table
+                namespace: s3tablestable
+              spec:
+                name: s3tablestable_ac1_table
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+
+    # AC-2: Hyphen replacement — multi-hyphen name, all dashes become underscores.
+    # name="ac2-click-events", template "{namespace}_{name}"
+    # → "s3tablestable_ac2-click-events" → .replace("-","_") → "s3tablestable_ac2_click_events"
+    - name: ac2-hyphen-replacement
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac2-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac2-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac2-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac2-click-events
+                namespace: s3tablestable
+              spec:
+                configRef: ac2-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac2-click-events
+                namespace: s3tablestable
+              spec:
+                name: s3tablestable_ac2_click_events
+
+    # AC-3: Per-table encryption pass-through (no governance cascade).
+    # No mandatory or defaults encryption set; instance spec.encryptionConfiguration is used.
+    - name: ac3-per-table-encryption-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac3-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac3-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac3-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac3-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac3-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+                encryptionConfiguration:
+                  sseAlgorithm: "aws:kms"
+                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/custom-key"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac3-table
+                namespace: s3tablestable
+              spec:
+                encryptionConfiguration:
+                  sseAlgorithm: aws:kms
+                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/custom-key"
+
+    # AC-4: Mandatory governance encryption overrides instance spec.
+    # mandatory.tableBucketEncryption wins over spec.encryptionConfiguration.
+    - name: ac4-mandatory-encryption-governance
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac4-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac4-cfg
+              spec:
+                mandatory:
+                  tableBucketEncryption:
+                    sseAlgorithm: "aws:kms"
+                    kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/mandatory-key"
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac4-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"aws:kms","kmsKeyARN":"arn:aws:kms:us-east-1:123456789012:key/mandatory-key"},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac4-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac4-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+                encryptionConfiguration:
+                  sseAlgorithm: "AES256"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac4-table
+                namespace: s3tablestable
+              spec:
+                encryptionConfiguration:
+                  sseAlgorithm: aws:kms
+                  kmsKeyARN: "arn:aws:kms:us-east-1:123456789012:key/mandatory-key"
+
+    # AC-5: No instance encryption → encryptionConfiguration.sseAlgorithm absent/empty.
+    # No mandatory, spec, or defaults encryption configured; all CEL branches evaluate to "".
+    # kro omits empty-string fields, so sseAlgorithm will be absent from the ACK Table spec.
+    - name: ac5-no-encryption-absent
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac5-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac5-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac5-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac5-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac5-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+                # no encryptionConfiguration — all fields default to ""
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac5-table
+                namespace: s3tablestable
+        - script:
+            content: |
+              kubectl get tables.s3tables.services.k8s.aws ac5-table -n s3tablestable -o json | \
+                jq -e '(.spec.encryptionConfiguration.sseAlgorithm // "") == ""'
+
+    # AC-5n: iceberg schema pass-through — NOT APPLICABLE.
+    # The S3TablesTable RGD schema does not expose spec.metadata; iceberg schema fields
+    # cannot be set on the S3TablesTable CR. Skipped pending RGD schema extension.
+
+    # AC-6: storageClassConfiguration.storageClass pass-through.
+    - name: ac6-storage-class-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac6-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac6-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac6-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac6-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac6-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+                storageClassConfiguration:
+                  storageClass: STANDARD_IA
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac6-table
+                namespace: s3tablestable
+              spec:
+                storageClassConfiguration:
+                  storageClass: STANDARD_IA
+
+    # AC-7: Tag merge — mandatory.tags and instance spec.tags both present; mandatory wins on conflict.
+    # merge order: defaults.tags → spec.tags → mandatory.tags (last write wins)
+    # mandatory.tags: {cost-centre: platform}, instance spec.tags: {table: events}
+    # Result: {cost-centre: platform, table: events} — both keys present.
+    # Use jq script to verify (list order from map merge is non-deterministic; positional
+    # assert would be fragile — see docs/frequent-rgd-errors.md §6).
+    - name: ac7-tag-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac7-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac7-cfg
+              spec:
+                mandatory:
+                  tags:
+                    cost-centre: platform
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac7-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{"cost-centre":"platform"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac7-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac7-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+                tags:
+                  table: events
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac7-table
+                namespace: s3tablestable
+        - script:
+            content: |
+              kubectl get tables.s3tables.services.k8s.aws ac7-table -n s3tablestable -o json | \
+                jq -e '.spec.tags["cost-centre"] == "platform" and .spec.tags["table"] == "events"'
+
+    # AC-8: Cross-refs via direct ARN pass-through.
+    # tableBucketRef and namespaceRef require cross-CR dependency resolution; tested via
+    # direct tableBucketARN and namespace fields to verify they pass through to the ACK Table.
+    - name: ac8-cross-refs-via-arn
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac8-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac8-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac8-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac8-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac8-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/data-lake"
+                namespace: events
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac8-table
+                namespace: s3tablestable
+              spec:
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/data-lake"
+                namespace: events
+
+    # AC-9: Standard metadata — ACK Table receives managed-by label and deletion-policy annotation.
+    - name: ac9-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac9-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac9-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac9-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac9-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac9-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac9-table
+                namespace: s3tablestable
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # AC-10: nameOverride sets the ACK Table spec.name directly, bypassing naming templates.
+    # nameOverride: "custom_table_name" → passes through replace/lowerAscii unchanged.
+    - name: ac10-name-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac10-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac10-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac10-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac10-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac10-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+                nameOverride: "custom_table_name"
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac10-table
+                namespace: s3tablestable
+              spec:
+                name: custom_table_name
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac10-table
+                namespace: s3tablestable
+              status:
+                resourceName: custom_table_name
+
+    # AC-11: format defaults to ICEBERG when not explicitly set.
+    # NOTE: The S3TablesTable RGD declares `format: string | default=ICEBERG`. A "missing format"
+    # scenario cannot trigger a validation error — the default is always applied. No
+    # validationError ConfigMap is implemented in the RGD for this field.
+    # This scenario verifies the default behavior: omitting format yields ICEBERG in the ACK Table.
+    - name: ac11-format-default-iceberg
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac11-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac11-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{namespace}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac11-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{namespace}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac11-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac11-cfg
+                deletionPolicy: retain
+                # format not set — RGD default ICEBERG will be applied
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+        - assert:
+            resource:
+              apiVersion: s3tables.services.k8s.aws/v1alpha1
+              kind: Table
+              metadata:
+                name: ac11-table
+                namespace: s3tablestable
+              spec:
+                format: ICEBERG
+
+    # AC-12: Unresolved naming token (negative) — status.namingStatus: invalid-unresolved-tokens.
+    # Template "{tag.env}_{name}" contains an unsupported {tag.env} token.
+    # name="ac12-table" → "{tag.env}_{name}" → replace("{name}","ac12-table")
+    #   → "{tag.env}_ac12-table" → .replace("-","_") → "{tag.env}_ac12_table"
+    #   → contains("{") = true → namingStatus = "invalid-unresolved-tokens"
+    - name: ac12-unresolved-naming-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3AdvancedConfig
+              metadata:
+                name: ac12-cfg
+                namespace: s3tablestable
+                labels:
+                  aws.kropath.run/resource-name: ac12-cfg
+              spec:
+                mandatory: {}
+                defaults:
+                  namingTemplate: "{tag.env}_{name}"
+        - script:
+            content: |
+              kubectl patch s3advancedconfig ac12-cfg -n s3tablestable \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"tableBucketEncryption":{"sseAlgorithm":"","kmsKeyARN":""},"vectorBucketEncryption":{"sseType":"","kmsKeyARN":""},"vectorIndexEncryption":{"sseType":"","kmsKeyARN":""},"filesEncryption":{"kmsKeyID":""},"accessPointPublicAccessBlock":{"blockPublicACLs":false,"blockPublicPolicy":false,"ignorePublicACLs":false,"restrictPublicBuckets":false},"accessPointVpcOnly":false,"namingTemplate":"{tag.env}_{name}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac12-table
+                namespace: s3tablestable
+              spec:
+                configRef: ac12-cfg
+                deletionPolicy: retain
+                format: ICEBERG
+                tableBucketARN: "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+                namespace: raw
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              metadata:
+                name: ac12-table
+                namespace: s3tablestable
+              status:
+                namingStatus: invalid-unresolved-tokens
