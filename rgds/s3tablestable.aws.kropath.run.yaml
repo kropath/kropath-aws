@@ -1,0 +1,163 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: s3tablestable.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: S3TablesTable
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      format: string | default=ICEBERG
+      tableBucketARN: string | default=""
+      tableBucketRef: string | default=""
+      namespace: string | default=""
+      namespaceRef: string | default=""
+      encryptionConfiguration:
+        sseAlgorithm: string | default=""
+        kmsKeyARN: string | default=""
+        kmsKeyRef: string | default=""
+      storageClassConfiguration:
+        storageClass: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      predictedArn: >-
+        ${rsrcCfg.size() > 0
+          ? "arn:aws:s3tables:" + rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") + ":" + rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") + ":bucket/" + naming.data.effectiveName
+          : ""}
+      arn: >-
+        ${table.?status.?ackResourceMetadata.?arn.orValue("")}
+      conditions: >-
+        ${table.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+  resources:
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: S3AdvancedConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap — Table name pattern is ^[0-9a-z_]*$ so we replace dashes with underscores.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}_{name}")))
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("") : "")
+              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")
+              .replace("{configRef}", schema.spec.configRef)
+              .replace("-", "_")
+              .lowerAscii())}
+
+    - id: table
+      template:
+        apiVersion: s3tables.services.k8s.aws/v1alpha1
+        kind: Table
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}).transformMapEntry(k, v, {"kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: S3TablesTable
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          format: ${schema.spec.format}
+          tableBucketARN: ${schema.spec.tableBucketARN}
+          namespace: ${schema.spec.namespace}
+          encryptionConfiguration:
+            sseAlgorithm: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?tableBucketEncryption.orValue(null) != null && rsrcCfg[0].status.effectiveConfig.mandatory.tableBucketEncryption.?sseAlgorithm.orValue("") != "")
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.tableBucketEncryption.sseAlgorithm
+                : (schema.spec.encryptionConfiguration.sseAlgorithm != ""
+                    ? schema.spec.encryptionConfiguration.sseAlgorithm
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?tableBucketEncryption.orValue(null) != null
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.tableBucketEncryption.?sseAlgorithm.orValue("")
+                        : ""))}
+            kmsKeyARN: >-
+              ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?tableBucketEncryption.orValue(null) != null && rsrcCfg[0].status.effectiveConfig.mandatory.tableBucketEncryption.?kmsKeyARN.orValue("") != "")
+                ? rsrcCfg[0].status.effectiveConfig.mandatory.tableBucketEncryption.kmsKeyARN
+                : (schema.spec.encryptionConfiguration.kmsKeyARN != ""
+                    ? schema.spec.encryptionConfiguration.kmsKeyARN
+                    : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?tableBucketEncryption.orValue(null) != null
+                        ? rsrcCfg[0].status.effectiveConfig.defaults.tableBucketEncryption.?kmsKeyARN.orValue("")
+                        : ""))}
+          storageClassConfiguration:
+            storageClass: ${schema.spec.storageClassConfiguration.storageClass}
+          tags: >-
+            ${((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {})}
