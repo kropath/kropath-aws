@@ -104,7 +104,60 @@ that use `kubectl get ... -o jsonpath | jq -e 'has(...) | not'` to assert the ab
 zero-valued fields in the rendered ACK Bucket. Declarative `assert:` blocks use partial-match
 semantics and cannot verify field absence — `script:` with jq is required for negative assertions.
 
+## S3 API Error — Observed on Integration Cluster (AC-1)
+
+A real S3 API error confirming S3 rejects the zero-valued lifecycle payload was observed on the
+`kind-kropath-aws-integration-test` cluster:
+
+**ACK Bucket:** `central-logging` in namespace `platform-shared-test`
+**AWS resource:** `arn:aws:s3:::central-logging-ap-southeast-2` (account `283209026888`, region `ap-southeast-2`)
+**Error timestamp:** `2026-09-16T14:25:53Z` (4 seconds after bucket creation)
+**S3 API response:**
+```
+api error MalformedXML: The XML you provided was not well-formed or did not validate against our published schema
+```
+
+This was observed by reading the ACK Bucket conditions:
+```bash
+kubectl get buckets.s3.services.k8s.aws central-logging -n platform-shared-test \
+  --context kind-kropath-aws-integration-test \
+  -o jsonpath='{.status.conditions}' | jq .
+```
+Output:
+```json
+[
+  {
+    "message": "api error MalformedXML: The XML you provided was not well-formed or did not validate against our published schema",
+    "status": "True",
+    "type": "ACK.Terminal"
+  },
+  {
+    "lastTransitionTime": "2026-09-16T14:25:53Z",
+    "message": "Resource not synced",
+    "reason": "resource is in terminal condition",
+    "status": "False",
+    "type": "ACK.ResourceSynced"
+  }
+]
+```
+
+The `MalformedXML` error confirms S3 does NOT accept or normalise the zero-valued payload —
+it rejects it outright. The conditional branch in the issue plan ("If S3 accepts and normalises
+the payload, downgrade to drift check") is closed: the error is terminal, not a warning.
+
+**Note on direct CLI verification:** AWS CLI credentials were expired during this session
+(`ExpiredToken` returned by `aws sts get-caller-identity`). The integration cluster evidence
+above was collected from an existing ACK-managed Bucket that was created when the pre-fix RGD
+was active. A dedicated `aws s3api put-bucket-lifecycle-configuration` repro call was not
+possible in this session; the integration cluster evidence is the recorded AC-1 confirmation.
+
 ## Verification
 
 `cd tests && make test-s3` → all steps PASS, including OK P2-01, OK P2-02, OK P2-03 for the
-new negative assertions. RGD reached `Active` on first apply with the v3 fix.
+lifecycle negative assertions. RGD reached `Active` on first apply with the v3 fix.
+
+Additional negative assertions added in review response (2026-09-17):
+- P2-04b: zero `maxAgeSeconds` correctly absent from corsRules
+- P2-06b: zero `filter` correctly absent from queueConfigurations (SQS)
+- P2-07b: zero `filter` correctly absent from topicConfigurations (SNS)
+- P2-08b: zero `filter` correctly absent from intelligentTiering
