@@ -1999,33 +1999,45 @@ with booleans you can avoid it by not declaring the default; here there is nothi
   Direct (non-optional) access is safe precisely *because* the defaults are guaranteed to be
   materialized.
 
-### 10.2 A CEL `null` is rendered literally — it does not drop the key
+### 10.2 A CEL `null` is rendered literally — behaviour depends on the CRD field type
 
-The instinctive fix — `${cond ? schema.spec.foo : null}` to "omit" the field — does not work. kro
-writes the null into the child object and the API server rejects it:
+The instinctive fix — `${cond ? schema.spec.foo : null}` to "omit" the field — does not always
+work. kro writes the null into the child object. Whether the API server accepts or rejects it
+depends on the CRD field's nullability:
 
+**CRDs that reject null (strict non-nullable):** The null is written and the API server rejects it:
 ```
 resource reconciliation failed: apply results contain errors:
 RuleGroup.networkfirewall.services.k8s.aws "x" is invalid: spec.ruleGroup:
 Invalid value: "null": spec.ruleGroup in body must be of type object: "null"
 ```
 
-ACK CRDs type these fields as non-nullable objects, so **there is no CEL expression that omits a
-field** in kro v0.9.2.
+For these CRDs, when the field must be absent, split the resource into `includeWhen` variants,
+one with the field and one without (same mechanism used for `encryptionConfiguration`). Note a
+variant split multiplies with existing splits, so weigh it against passing an empty value.
 
-* **What Works Instead:** either pass the (defaulted, empty) object straight through when an empty
-  value is acceptable —
-    ```
-    ruleGroup: ${schema.spec.ruleGroup}
-    ```
-  — or, when the field genuinely must be absent, split the resource into `includeWhen` variants,
-  one with the field and one without. That is the same mechanism the RGDs already use to omit
-  `encryptionConfiguration`. Note that a variant split multiplies with any existing split
-  (ruleGroup/rules × encryption = 4 variants), so weigh it against passing an empty value.
-* **Watch for the dead-ternary smell:** `${has(schema.spec.<object>) ? schema.spec.<object> : null}`
-  is *always* dead code by §10.1 — the null branch is unreachable **and** invalid. It works only by
-  accident, and detonates the moment the type's fields all become required. Grep for `: null}` in
-  `rgds/` and rewrite each hit.
+**CRDs that accept null (optional object/array fields):** Some ACK CRDs accept null for optional
+fields. kro renders `lifecycle: null` in the manifest; the Kubernetes API server accepts it (treating
+it as "unset"); ACK then receives a nil Go pointer and skips the corresponding API call entirely.
+
+This pattern WORKS for the ACK S3 Bucket CRD's optional list fields (`lifecycle`, `cors`,
+`notification`, `intelligentTiering`, `website`). Use:
+```
+lifecycle: >-
+  ${schema.spec.lifecycle.size() > 0
+    ? dyn({"rules": schema.spec.lifecycle.sortBy(x, x.id).transformList(i, rule, ...)})
+    : null}
+```
+This omits the `PutBucketLifecycleConfiguration` call when no rules are configured.
+
+**How to tell which type you have:** Check the ACK CRD's OpenAPI schema for the field:
+- `nullable: true` → null is explicitly accepted
+- `nullable: false` (or absent) → empirically test; NetworkFirewall rejects null, S3 Bucket accepts it
+
+* **Still-dead-ternary smell:** `${has(schema.spec.<object>) ? schema.spec.<object> : null}`
+  where `has(schema.spec.<object>)` is always true (kro materializes defaults) is dead code by
+  §10.1. But `${schema.spec.lifecycle.size() > 0 ? dyn({...}) : null}` is NOT dead code — it
+  branches on the content of the list, not on the presence of the field.
 
 ---
 
