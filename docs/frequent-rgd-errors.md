@@ -2016,27 +2016,44 @@ For these CRDs, when the field must be absent, split the resource into `includeW
 one with the field and one without (same mechanism used for `encryptionConfiguration`). Note a
 variant split multiplies with existing splits, so weigh it against passing an empty value.
 
-**CRDs that accept null (optional object/array fields):** Some ACK CRDs accept null for optional
-fields. kro renders `lifecycle: null` in the manifest; the Kubernetes API server accepts it (treating
-it as "unset"); ACK then receives a nil Go pointer and skips the corresponding API call entirely.
+**CRDs that reject null:** The ACK S3 Bucket CRD rejects `null` for all optional complex fields
+(`lifecycle`, `cors`, `notification`, `intelligentTiering`, `website`). The API server error is:
+```
+Bucket.s3.services.k8s.aws "x" is invalid:
+  spec.lifecycle: Invalid value: "null": spec.lifecycle in body must be of type object: "null"
+  spec.intelligentTiering: Invalid value: "null": spec.intelligentTiering in body must be of type array: "null"
+```
+Verified on `kind-kropath-aws-integration-test` cluster (KRO-1102, 2026-09-17).
 
-This pattern WORKS for the ACK S3 Bucket CRD's optional list fields (`lifecycle`, `cors`,
-`notification`, `intelligentTiering`, `website`). Use:
+**The correct fix for ACK S3 Bucket optional fields:** use `dyn({})` for object-typed fields and
+`dyn([])` for array-typed fields when the "empty" condition is true. ACK's sync functions are
+guarded so that an empty object or empty array is handled gracefully:
+
+- `lifecycle: dyn({})` → `Lifecycle.Rules == nil` → ACK calls `DeleteBucketLifecycleConfiguration` (no-op for new bucket)
+- `cors: dyn({})` → `CORS.CORSRules == nil` → ACK calls `DeleteBucketCors` (no-op for new bucket)
+- `notification: dyn({})` → ACK calls `PutBucketNotificationConfiguration` with nil config arrays → S3 clears all notifications (safe)
+- `intelligentTiering: dyn([])` → ACK iterates empty list → zero API calls
+- `website: dyn({})` → `Website.IndexDocument == nil` → ACK calls `DeleteBucketWebsite` (no-op for new bucket); source: `syncWebsite` in ACK s3-controller `hook.go`
+
 ```
 lifecycle: >-
   ${schema.spec.lifecycle.size() > 0
     ? dyn({"rules": schema.spec.lifecycle.sortBy(x, x.id).transformList(i, rule, ...)})
-    : null}
+    : dyn({})}
+intelligentTiering: >-
+  ${schema.spec.intelligentTiering.size() > 0
+    ? dyn(schema.spec.intelligentTiering.sortBy(x, x.id).transformList(i, itc, ...))
+    : dyn([])}
 ```
-This omits the `PutBucketLifecycleConfiguration` call when no rules are configured.
 
 **How to tell which type you have:** Check the ACK CRD's OpenAPI schema for the field:
 - `nullable: true` → null is explicitly accepted
-- `nullable: false` (or absent) → empirically test; NetworkFirewall rejects null, S3 Bucket accepts it
+- `nullable: false` (or absent) → null is likely rejected; use `dyn({})` or `dyn([])` instead and
+  verify ACK's sync function handles the empty case (check `hook.go` for nil guards)
 
-* **Still-dead-ternary smell:** `${has(schema.spec.<object>) ? schema.spec.<object> : null}`
+* **Still-dead-ternary smell:** `${has(schema.spec.<object>) ? schema.spec.<object> : dyn({})}`
   where `has(schema.spec.<object>)` is always true (kro materializes defaults) is dead code by
-  §10.1. But `${schema.spec.lifecycle.size() > 0 ? dyn({...}) : null}` is NOT dead code — it
+  §10.1. But `${schema.spec.lifecycle.size() > 0 ? dyn({...}) : dyn({})}` is NOT dead code — it
   branches on the content of the list, not on the presence of the field.
 
 ---
