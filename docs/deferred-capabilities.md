@@ -103,3 +103,33 @@ that _is_ correctly typed). The `logPublishingOptions` field is not exposed in t
 **To unblock:** When kro supports `map[string]<namedObjectType>` schema fields, add
 `logPublishingOptions` to the `OpenSearchDomain` schema with appropriate nested-object typing
 and wire it to `ackDomain.spec.logPublishingOptions`.
+
+---
+
+## Tenant-namespace onboarding — `ack-role-account-map` entry (KRO-1140)
+
+### Emitting the CARM role-map entry from the same onboarding artifact
+
+**Spec requirement:** `onboarding/tenant-namespace` (KRO-1140) was asked to emit the
+`ack-role-account-map` ConfigMap entry for `accountId` alongside the Namespace and
+`<Family>Config` manifests, so the C-4 role-ARN mismatch (ADR-015 §5.8.4 precondition 4 — the
+resolved IAM role's account segment silently overriding kropath's own `accountId`) becomes
+unconstructible the same way the namespace annotation is.
+
+**Blocking constraint:** not an upstream CRD/kro limitation — a structural GitOps-ownership
+one. `ack-role-account-map` is a single ConfigMap holding every onboarded account's role ARN.
+A static manifest can only express whole-object ownership (there is no "patch in one key of an
+existing ConfigMap" manifest kind), so a per-tenant chart rendering the full object would
+require every tenant's render to carry the complete, current set of every other tenant's
+entries to avoid clobbering them on apply — defeating the "one declared input block per
+tenant" design. The ConfigMap also lives in the ACK system namespace, owned by cluster/platform
+operators, a different GitOps ownership boundary than the tenant's own namespace manifests.
+
+**Current behaviour:** the chart's rendered `NOTES.txt` states the exact `accountId: <role
+ARN>` entry to confirm or add and calls out precondition 4 explicitly. A human still has to
+supply and merge the role ARN by hand. Full detail and rationale:
+`onboarding/tenant-namespace/README.md` § "Why `ack-role-account-map` is not rendered here".
+
+**To unblock:** either a platform-owned reconciler for `ack-role-account-map` (out of scope —
+ADR-003 keeps kropath-controller a pure config store with no such write surface), or rely on
+the KRO-1141 install-conformance checker to catch a mismatched entry after the fact.
