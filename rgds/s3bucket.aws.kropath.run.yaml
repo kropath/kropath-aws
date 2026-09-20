@@ -132,7 +132,9 @@ spec:
       resourceName: >-
         ${naming.data.effectiveName}
       namingStatus: >-
-        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+        ${naming.data.effectiveName.contains("{")
+          ? "invalid-unresolved-tokens"
+          : (naming.data.crossPartitionRegion == "true" ? "invalid-cross-partition-region" : "valid")}
       predictedArn: >-
         ${"arn:aws:s3:::" + naming.data.effectiveName}
   resources:
@@ -227,7 +229,9 @@ spec:
               .replace("{namespace}", schema.metadata.namespace)
               .replace("{name}", schema.metadata.name)
               .replace("{account_id}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
-              .replace("{region}", rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{region}", schema.spec.region != ""
+                ? schema.spec.region
+                : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}"))
               .replace("{configRef}", schema.spec.configRef)
             ).lowerAscii()}
           # Resolved logging target prefix with token substitution. Does NOT apply lowerAscii
@@ -289,6 +293,39 @@ spec:
               : (schema.spec.objectLockRetentionDays != 0
                   ? schema.spec.objectLockRetentionDays
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults)) ? rsrcCfg[0].status.effectiveConfig.defaults.?objectLockRetentionDays.orValue(0) : 0))}
+          # Per-resource region override (KRO-1143, spec §5.3 — the three-site wiring rule): the
+          # one variable that drives services.k8s.aws/region on the child CR and
+          # createBucketConfiguration.locationConstraint below (the {region} naming token uses its
+          # own copy of this same override-priority expression, with the "{region}" sentinel
+          # fallback that namingStatus needs — see effectiveName above). Falls back to "" (never a
+          # sentinel) here: when neither spec.region nor rsrcCfg resolves a value, effectiveName
+          # may still resolve cleanly (e.g. a namingTemplate with no {region} token, or rsrcCfg
+          # entirely absent so the template falls back to schema.metadata.name), and this field
+          # must not leak a literal "{region}" into an annotation or locationConstraint in that case.
+          effectiveRegion: >-
+            ${schema.spec.region != ""
+              ? schema.spec.region
+              : (rsrcCfg.size() > 0 ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") : "")}
+          # "true" when an explicit spec.region override resolves — by the same longest-prefix
+          # rule as controller-side DerivePartition, spec §4.3 — to a different AWS partition than
+          # the namespace's own effectiveConfig.aws.partition. A cross-partition override cannot
+          # succeed at ACK, so naming is rejected (spec §5.3, namingStatus below). Informational
+          # only: the resource-inclusion gates below re-derive this independently from
+          # schema.spec/rsrcCfg rather than reading this field, because an includeWhen must never
+          # depend on another node in the same graph (deletion hang — see frequent-rgd-errors.md
+          # "includeWhen Must Not Read Another Node in the Same Graph").
+          crossPartitionRegion: >-
+            ${string(schema.spec.region != ""
+              && rsrcCfg.size() > 0
+              && has(rsrcCfg[0].status.effectiveConfig.aws)
+              && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+              && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                  : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                  : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                  : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                  : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                  : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                  : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
 
     # Bucket variant: HTTPS policy AND logging both active, object lock inactive. KRO-920: never emit
     # empty objects — variants cover combination matrix so no field is conditionally emptied.
@@ -307,7 +344,18 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             && naming.data.effectiveObjectLockMode == ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -321,6 +369,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -335,11 +384,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -550,7 +597,18 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             && naming.data.effectiveObjectLockMode == ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -564,6 +622,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -578,11 +637,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -784,7 +841,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") == ""
             && naming.data.effectiveObjectLockMode == ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -798,6 +866,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -812,11 +881,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -1021,7 +1088,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") != ""
             && naming.data.effectiveObjectLockMode == ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -1035,6 +1113,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -1049,11 +1128,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -1262,7 +1339,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") == ""
             && naming.data.effectiveObjectLockMode == ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -1276,6 +1364,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -1290,11 +1379,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -1488,7 +1575,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") != ""
             && naming.data.effectiveObjectLockMode == ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -1502,6 +1600,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -1516,11 +1615,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -1720,7 +1817,18 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             && naming.data.effectiveObjectLockMode != ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -1734,6 +1842,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -1748,11 +1857,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -1960,7 +2067,18 @@ spec:
                   ? true
                   : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?loggingEnabled.orValue(false))))
             && naming.data.effectiveObjectLockMode != ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -1974,6 +2092,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -1988,11 +2107,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -2191,7 +2308,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") == ""
             && naming.data.effectiveObjectLockMode != ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -2205,6 +2333,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -2219,11 +2348,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -2425,7 +2552,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") != ""
             && naming.data.effectiveObjectLockMode != ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -2439,6 +2577,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -2453,11 +2592,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -2663,7 +2800,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") == ""
             && naming.data.effectiveObjectLockMode != ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -2677,6 +2825,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -2691,11 +2840,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:
@@ -2886,7 +3033,18 @@ spec:
             &&
             schema.spec.?bucketPolicyRef.orValue("") != ""
             && naming.data.effectiveObjectLockMode != ""
-            && !naming.data.effectiveName.contains("{")}
+            && !naming.data.effectiveName.contains("{")
+            && !(schema.spec.region != ""
+                  && rsrcCfg.size() > 0
+                  && has(rsrcCfg[0].status.effectiveConfig.aws)
+                  && rsrcCfg[0].status.effectiveConfig.aws.?partition.orValue("") != ""
+                  && (schema.spec.region.startsWith("us-gov-") ? "aws-us-gov"
+                      : schema.spec.region.startsWith("cn-") ? "aws-cn"
+                      : schema.spec.region.startsWith("us-isob-") ? "aws-iso-b"
+                      : (schema.spec.region.startsWith("us-isof-") || schema.spec.region.startsWith("eu-isof-")) ? "aws-iso-f"
+                      : schema.spec.region.startsWith("eu-isoe-") ? "aws-iso-e"
+                      : schema.spec.region.startsWith("us-iso-") ? "aws-iso"
+                      : "aws") != rsrcCfg[0].status.effectiveConfig.aws.partition)}
       template:
         apiVersion: s3.services.k8s.aws/v1alpha1
         kind: Bucket
@@ -2900,6 +3058,7 @@ spec:
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
           annotations: >-
             ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge(naming.data.effectiveRegion != "" ? {"services.k8s.aws/region": naming.data.effectiveRegion} : {})
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
               .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
               .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
@@ -2914,11 +3073,9 @@ spec:
           name: ${naming.data.effectiveName}
           createBucketConfiguration:
             locationConstraint: >-
-              ${schema.spec.region != "" && schema.spec.region != "us-east-1"
-                ? schema.spec.region
-                : (rsrcCfg.size() > 0 && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "" && rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("") != "us-east-1"
-                    ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("")
-                    : "")}
+              ${naming.data.effectiveRegion != "" && naming.data.effectiveRegion != "us-east-1"
+                ? naming.data.effectiveRegion
+                : ""}
           encryption:
             rules:
               - applyServerSideEncryptionByDefault:

@@ -3190,3 +3190,145 @@ spec:
                 name: kro1093-resolved-bucket
               spec:
                 name: s3bucket-kro1093-resolved-bucket-999888777666
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # KRO-1143: per-resource region override — the three-site wiring rule
+    # (spec: docs/specs/controller-account-region-placement.md §5.3). One
+    # namingTemplate with a {region} token so the override is observable in
+    # effectiveName; namespace default region ap-southeast-2, partition aws.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro1143-seed-region-override-config
+      try:
+        - script:
+            content: |
+              cat <<'MANIFEST' | kubectl apply -f -
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Config
+              metadata:
+                name: kro1143-region-override-cfg
+                namespace: s3bucket
+                labels:
+                  aws.kropath.run/resource-name: kro1143-region-override-cfg
+              spec: {}
+              MANIFEST
+              kubectl patch s3config kro1143-region-override-cfg -n s3bucket \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"encryptionAlgorithm":"","kmsKeyArn":"","blockPublicAccess":false,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"encryptionAlgorithm":"aws:kms","kmsKeyArn":"","blockPublicAccess":true,"versioning":"","loggingEnabled":false,"logDeliveryBucket":"","enforceHttpsOnly":false,"objectLockMode":"","objectLockRetentionDays":0,"namingTemplate":"{namespace}-{name}-{region}","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"ap-southeast-2","partition":"aws"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15 (KRO-1143) — chainsaw: happy-path/s3bucket-region-override-three-sites
+    # spec.region=eu-west-1 in a namespace whose default region is ap-southeast-2.
+    # {region} in effectiveName, services.k8s.aws/region on the child CR, and
+    # createBucketConfiguration.locationConstraint must all read eu-west-1 from
+    # the one effectiveRegion variable.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro1143-region-override-three-sites
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro1143-receipts-eu
+              spec:
+                configRef: kro1143-region-override-cfg
+                region: eu-west-1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro1143-receipts-eu
+              status:
+                namingStatus: valid
+                resourceName: s3bucket-kro1143-receipts-eu-eu-west-1
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: kro1143-receipts-eu
+                annotations:
+                  services.k8s.aws/region: eu-west-1
+              spec:
+                name: s3bucket-kro1143-receipts-eu-eu-west-1
+                createBucketConfiguration:
+                  locationConstraint: eu-west-1
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16 (KRO-1143) — chainsaw: happy-path/s3bucket-us-east-1-no-location-constraint
+    # spec.region=us-east-1: {region} still resolves to us-east-1 (naming token,
+    # annotation) but createBucketConfiguration.locationConstraint must be unset
+    # — S3 CreateBucket rejects an explicit LocationConstraint for us-east-1.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro1143-us-east-1-no-location-constraint
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro1143-receipts-us
+              spec:
+                configRef: kro1143-region-override-cfg
+                region: us-east-1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro1143-receipts-us
+              status:
+                namingStatus: valid
+                resourceName: s3bucket-kro1143-receipts-us-us-east-1
+        - assert:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: kro1143-receipts-us
+                annotations:
+                  services.k8s.aws/region: us-east-1
+              spec:
+                name: s3bucket-kro1143-receipts-us-us-east-1
+        - script:
+            content: |
+              LOC=$(kubectl get buckets.s3.services.k8s.aws kro1143-receipts-us -n s3bucket \
+                -o jsonpath='{.spec.createBucketConfiguration.locationConstraint}' 2>/dev/null || echo "")
+              if [ -n "$LOC" ] && [ "$LOC" != "<no value>" ]; then
+                echo "FAIL: locationConstraint should be empty for us-east-1 override, got: $LOC"
+                exit 1
+              fi
+              echo "OK: no locationConstraint for us-east-1 override (got='$LOC')"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17 (KRO-1143) — chainsaw: negative/s3bucket-cross-partition-override-rejected
+    # spec.region=cn-north-1 (partition aws-cn) in a namespace whose partition is
+    # aws: naming must fail with invalid-cross-partition-region and no child
+    # Bucket is created.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: kro1143-cross-partition-override-rejected
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro1143-receipts-cn
+              spec:
+                configRef: kro1143-region-override-cfg
+                region: cn-north-1
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: S3Bucket
+              metadata:
+                name: kro1143-receipts-cn
+              status:
+                namingStatus: invalid-cross-partition-region
+        - error:
+            resource:
+              apiVersion: s3.services.k8s.aws/v1alpha1
+              kind: Bucket
+              metadata:
+                name: kro1143-receipts-cn
