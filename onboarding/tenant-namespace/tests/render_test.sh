@@ -61,6 +61,15 @@ for pair in "s3:S3Config" "sqs:SQSConfig" "rds:RDSConfig"; do
   fi
 done
 
+kpc_name=$(echo "$out" | yq 'select(.kind == "KropathConfig") | .metadata.name')
+kpc_ns=$(echo "$out" | yq 'select(.kind == "KropathConfig") | .metadata.namespace')
+kpc_spec=$(echo "$out" | yq -o=json 'select(.kind == "KropathConfig") | .spec')
+if [ "$kpc_name" = "baseline" ] && [ "$kpc_ns" = "payments-dev" ] && [ "$kpc_spec" = "{}" ]; then
+  pass "KropathConfig/baseline rendered correctly"
+else
+  fail "KropathConfig/baseline rendering wrong (name=$kpc_name ns=$kpc_ns spec=$kpc_spec)"
+fi
+
 # --- Negative: malformed accountId must fail schema validation -----------------------------
 
 if render --set accountId=not-twelve-digits >/dev/null 2>&1; then

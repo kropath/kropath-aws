@@ -2,10 +2,11 @@
 
 Renders the plain manifests a new resource namespace needs before any kro resource instance
 can reconcile in it: the `Namespace` itself (carrying the placement annotations kropath and
-ACK both read) plus one empty-spec local-tier `<Family>Config` per family the tenant declares
-(ADR-015 §5.8.5, KRO-1140). It never applies anything — output is meant to be committed to
-your Argo/Flux repo, or referenced as a Helm source from an Argo CD `Application` pointed at
-this chart with a per-tenant values file.
+ACK both read), one empty-spec local-tier `<Family>Config` per family the tenant declares
+(ADR-015 §5.8.5, KRO-1140), and the namespace's empty-spec local-tier `KropathConfig/baseline`
+singleton (ADR-015 §3.1, §5.7) for namespace-wide blanket governance overrides. It never applies
+anything — output is meant to be committed to your Argo/Flux repo, or referenced as a Helm
+source from an Argo CD `Application` pointed at this chart with a per-tenant values file.
 
 ## Why this exists
 
@@ -37,6 +38,19 @@ helm template payments-dev . -f values-payments-dev.yaml > rendered/payments-dev
 
 `values.schema.json` rejects a malformed `accountId` (must be exactly 12 digits) and an empty
 `families` list at render time — no cluster needed to catch either mistake.
+
+## The rendered `KropathConfig/baseline`
+
+Every render includes one empty-spec `KropathConfig/baseline` in the tenant namespace — the
+local tier of the singleton (ADR-015 §3.1, §5.7). An empty spec is valid and inherits everything
+from the global tier in `globalConfigNamespace`; its absence would have been equally valid
+(§3.1 — "silently skipped, not an error"). It is rendered anyway so a team that later needs a
+namespace-wide blanket override (e.g. a team-specific mandatory tag, levels 2/8 of the
+ten-level cascade in ADR-015 §5.3) has exactly one existing object to edit — `spec.mandatory.*`
+/ `spec.defaults.*`, top-level (`tags`, `syncedLabels`, `syncedAnnotations`, `namingTemplate`) or
+under a `<family>` section such as `spec.mandatory.s3` — rather than hand-deriving the schema.
+Every field must be set in exactly one tier (§3.2); `KropathConfig` carries no provider
+connection fields (§3.3) and is never selected by `configRef` (§3.4).
 
 See `tests/values-sample.yaml` for a filled-in example and `family-kind-map.yaml` for the
 accepted `families` slugs (generated from `crds/*config.yaml` — see
