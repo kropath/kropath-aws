@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: lint lint-crds lint-rgd-cel lint-onboarding test-onboarding
+.PHONY: lint lint-crds lint-rgd-cel lint-no-hardcoded-partition lint-onboarding test-onboarding
 
-lint: lint-crds lint-rgd-cel lint-onboarding
+lint: lint-crds lint-rgd-cel lint-no-hardcoded-partition lint-onboarding
 
 lint-crds:
 	bash hack/check-crd-classification.sh
 
 lint-rgd-cel:
 	bash hack/check-rgd-cel-balance.sh
+
+lint-no-hardcoded-partition:
+	bash hack/check-no-hardcoded-partition.sh
 
 lint-onboarding:
 	bash hack/check-family-kind-map.sh
