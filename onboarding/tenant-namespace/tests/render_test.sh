@@ -29,6 +29,10 @@ render() {
   helm template test . -f tests/values-sample.yaml "$@"
 }
 
+render_global() {
+  helm template test . -f tests/values-sample-global.yaml "$@"
+}
+
 # --- Happy path: sample values render the Namespace + 3 <Family>Config objects -------------
 
 out=$(render)
@@ -70,6 +74,51 @@ else
   fail "KropathConfig/baseline rendering wrong (name=$kpc_name ns=$kpc_ns spec=$kpc_spec)"
 fi
 
+# --- Happy path: "global" (governance-only) namespace renders NO placement annotations, -----
+# --- but still renders KropathConfig/baseline and every declared <Family>Config (ADR-019 D-5,
+# --- KRO-1175) ------------------------------------------------------------------------------
+
+gout=$(render_global)
+
+if echo "$gout" | yq -e 'select(.kind == "Namespace") | .metadata.name == "platform-governance"' >/dev/null 2>&1; then
+  pass "global-role Namespace platform-governance rendered"
+else
+  fail "global-role Namespace platform-governance not rendered"
+fi
+
+gann=$(echo "$gout" | yq -o=json 'select(.kind == "Namespace") | .metadata.annotations // {}')
+if [ "$gann" = "{}" ] || [ "$gann" = "null" ]; then
+  pass "global-role Namespace renders no placement annotations"
+else
+  fail "global-role Namespace should render no annotations, got: $gann"
+fi
+
+for pair in "s3:S3Config" "sqs:SQSConfig" "rds:RDSConfig"; do
+  slug="${pair%%:*}"
+  kind="${pair##*:}"
+  match=$(echo "$gout" | yq "select(.kind == \"$kind\") | .metadata.name")
+  ns=$(echo "$gout" | yq "select(.kind == \"$kind\") | .metadata.namespace")
+  if [ "$match" = "general-policy" ] && [ "$ns" = "platform-governance" ]; then
+    pass "global-role $kind rendered correctly for family $slug"
+  else
+    fail "global-role $kind rendering wrong (name=$match ns=$ns)"
+  fi
+done
+
+gkpc_name=$(echo "$gout" | yq 'select(.kind == "KropathConfig") | .metadata.name')
+gkpc_ns=$(echo "$gout" | yq 'select(.kind == "KropathConfig") | .metadata.namespace')
+if [ "$gkpc_name" = "baseline" ] && [ "$gkpc_ns" = "platform-governance" ]; then
+  pass "global-role KropathConfig/baseline rendered correctly"
+else
+  fail "global-role KropathConfig/baseline rendering wrong (name=$gkpc_name ns=$gkpc_ns)"
+fi
+
+# --- Happy path: configRef override renders a differently-named profile --------------------
+
+cout=$(render --set configRef=team-custom-policy)
+cname=$(echo "$cout" | yq 'select(.kind == "S3Config") | .metadata.name')
+[ "$cname" = "team-custom-policy" ] && pass "configRef override renders custom profile name" || fail "configRef override wrong: $cname"
+
 # --- Negative: malformed accountId must fail schema validation -----------------------------
 
 if render --set accountId=not-twelve-digits >/dev/null 2>&1; then
@@ -92,6 +141,32 @@ if render --set namespace= >/dev/null 2>&1; then
   fail "empty namespace did not fail render"
 else
   pass "empty namespace correctly fails render"
+fi
+
+# --- Negative: invalid namespaceRole must fail --------------------------------------------
+
+if render --set namespaceRole=bogus >/dev/null 2>&1; then
+  fail "invalid namespaceRole did not fail render"
+else
+  pass "invalid namespaceRole correctly fails render"
+fi
+
+# --- Negative: namespaceRole=local with accountId/region/globalConfigNamespace unset must ---
+# --- fail schema validation (ADR-019 D-5, KRO-1175) -----------------------------------------
+
+if render_global --set namespaceRole=local >/dev/null 2>&1; then
+  fail "local role without accountId/region/globalConfigNamespace did not fail render"
+else
+  pass "local role without accountId/region/globalConfigNamespace correctly fails render"
+fi
+
+# --- Negative: namespaceRole=global must still render if accountId/region/globalConfigNamespace
+# --- are absent entirely (they are optional, not merely ignored) ---------------------------
+
+if render_global >/dev/null 2>&1; then
+  pass "global role with no placement fields still renders"
+else
+  fail "global role with no placement fields unexpectedly failed to render"
 fi
 
 echo "---"
