@@ -119,6 +119,50 @@ cout=$(render --set configRef=team-custom-policy)
 cname=$(echo "$cout" | yq 'select(.kind == "S3Config") | .metadata.name')
 [ "$cname" = "team-custom-policy" ] && pass "configRef override renders custom profile name" || fail "configRef override wrong: $cname"
 
+# --- Happy path: a family with enabled=false is declared but not rendered (KRO-1175 review) -
+
+dout=$(render --set families.rds.enabled=false)
+if echo "$dout" | yq -e 'select(.kind == "RDSConfig")' >/dev/null 2>&1; then
+  fail "RDSConfig rendered despite families.rds.enabled=false"
+else
+  pass "families.<slug>.enabled=false correctly skips rendering that <Family>Config"
+fi
+# the other two declared families are unaffected
+if echo "$dout" | yq -e 'select(.kind == "S3Config")' >/dev/null 2>&1; then
+  pass "other declared families still render when one is disabled"
+else
+  fail "S3Config missing when only rds was disabled"
+fi
+
+# --- Happy path: per-family mandatory/defaults overrides render explicitly (KRO-1175 review) -
+
+mout=$(render --set families.s3.mandatory.tags.team=payments --set families.s3.defaults.tags.env=prod)
+s3_mandatory_team=$(echo "$mout" | yq 'select(.kind == "S3Config") | .spec.mandatory.tags.team')
+s3_defaults_env=$(echo "$mout" | yq 'select(.kind == "S3Config") | .spec.defaults.tags.env')
+if [ "$s3_mandatory_team" = "payments" ] && [ "$s3_defaults_env" = "prod" ]; then
+  pass "families.<slug>.mandatory/defaults render into <Family>Config spec"
+else
+  fail "families.<slug>.mandatory/defaults rendering wrong (mandatory.tags.team=$s3_mandatory_team defaults.tags.env=$s3_defaults_env)"
+fi
+# a family with no overrides still renders spec: {} (backward compatible with KRO-1140 default)
+sqs_spec=$(echo "$mout" | yq -o=json 'select(.kind == "SQSConfig") | .spec')
+[ "$sqs_spec" = "{}" ] && pass "family with no mandatory/defaults still renders spec: {}" || fail "family with no overrides rendered non-empty spec: $sqs_spec"
+
+# --- Happy path: a bare 'slug:' (null) family entry behaves like {} — enabled, empty spec ---
+
+nout=$(render --set 'families.efs=null')
+if echo "$nout" | yq -e 'select(.kind == "EFSConfig") | .metadata.name == "general-policy"' >/dev/null 2>&1; then
+  pass "bare null family entry renders like an enabled, empty-override family"
+else
+  fail "bare null family entry did not render EFSConfig"
+fi
+
+# --- Happy path: kropathConfig.mandatory/defaults render into KropathConfig/baseline spec ---
+
+kout=$(render --set kropathConfig.mandatory.tags.team=payments)
+kpc_mandatory_team=$(echo "$kout" | yq 'select(.kind == "KropathConfig") | .spec.mandatory.tags.team')
+[ "$kpc_mandatory_team" = "payments" ] && pass "kropathConfig.mandatory renders into KropathConfig/baseline spec" || fail "kropathConfig.mandatory rendering wrong: $kpc_mandatory_team"
+
 # --- Negative: malformed accountId must fail schema validation -----------------------------
 
 if render --set accountId=not-twelve-digits >/dev/null 2>&1; then
@@ -129,10 +173,34 @@ fi
 
 # --- Negative: unknown family slug must fail with a clear message --------------------------
 
-if err=$(render --set 'families={s3,not-a-real-family}' 2>&1 >/dev/null); then
+if err=$(render --set 'families.not-a-real-family.enabled=true' 2>&1 >/dev/null); then
   fail "unknown family slug did not fail render"
 else
   echo "$err" | grep -q "unknown family" && pass "unknown family slug correctly fails render" || fail "unknown family slug failed with unexpected error: $err"
+fi
+
+# --- Negative: unknown family slug fails even when declared with enabled=false -------------
+
+if err=$(render --set 'families.not-a-real-family.enabled=false' 2>&1 >/dev/null); then
+  fail "unknown family slug with enabled=false did not fail render"
+else
+  echo "$err" | grep -q "unknown family" && pass "unknown family slug with enabled=false still correctly fails render" || fail "unknown family slug with enabled=false failed with unexpected error: $err"
+fi
+
+# --- Negative: families.<slug>.enabled must be a boolean ------------------------------------
+
+if render --set families.s3.enabled=notabool >/dev/null 2>&1; then
+  fail "non-boolean families.<slug>.enabled did not fail render"
+else
+  pass "non-boolean families.<slug>.enabled correctly fails render"
+fi
+
+# --- Negative: unknown key under families.<slug> must fail (additionalProperties: false) ---
+
+if render --set families.s3.bogusKey=true >/dev/null 2>&1; then
+  fail "unknown families.<slug> key did not fail render"
+else
+  pass "unknown families.<slug> key correctly fails render"
 fi
 
 # --- Negative: missing required namespace must fail ----------------------------------------
