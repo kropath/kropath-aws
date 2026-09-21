@@ -1,11 +1,65 @@
 # tenant-namespace-onboarding
 
-Renders the plain manifests a new resource namespace needs before any kro resource instance
-can reconcile in it: the `Namespace` itself (carrying the placement annotations kropath and
-ACK both read) plus one empty-spec local-tier `<Family>Config` per family the tenant declares
-(ADR-015 §5.8.5, KRO-1140). It never applies anything — output is meant to be committed to
-your Argo/Flux repo, or referenced as a Helm source from an Argo CD `Application` pointed at
-this chart with a per-tenant values file.
+Renders the plain manifests a namespace needs before any kro resource instance can reconcile in
+it: the `Namespace` itself, one `<Family>Config` per family the team declares and enables
+(ADR-015 §5.8.5, KRO-1140), and the namespace's `KropathConfig/baseline` singleton (ADR-015
+§3.1, §5.7) for namespace-wide blanket governance overrides. It never applies anything —
+output is meant to be committed to your Argo/Flux repo, or referenced as a Helm source from an
+Argo CD `Application` pointed at this chart with a per-tenant values file.
+
+This chart serves both onboarding flows from **ADR-019 D-5**, selected by `namespaceRole`:
+
+| `namespaceRole` | Who uses it | Namespace annotations rendered | `KropathConfig`/`<Family>Config` rendered? |
+| --- | --- | --- | --- |
+| `local` | Developer teams onboarding a resource namespace whose family-owned cloud resources participate in the placement gate (ADR-015 §5.6). | All three: `aws.kropath.run/global-config-namespace`, `services.k8s.aws/owner-account-id`, `services.k8s.aws/default-region`. | Yes |
+| `global` | Platform teams onboarding a governance-only namespace that other namespaces' `globalConfigNamespace` points at (ADR-019 D-5) — it has no resource instances of its own. | None of the three. | Yes |
+
+Both roles render `KropathConfig/baseline` and one `<Family>Config` per declared, enabled
+family, named after the `configRef` profile (default `general-policy`, override with `--set
+configRef=<team-profile-name>` or in your values file) — only the `Namespace`'s annotations
+differ between the two roles.
+
+## Declaring families and per-family/namespace overrides
+
+`.Values.families` is a map keyed by family slug (see `family-kind-map.yaml` for accepted
+slugs — every family `kropath-aws` supports), mirroring the ack-chart per-controller values
+pattern (`kropath-aws-integration-tests` `argocd-manifests/ack/base/upstream/values.yaml`):
+
+```yaml
+families:
+  s3:
+    enabled: true          # optional, defaults to true
+    mandatory:              # optional, merged verbatim into S3Config's spec.mandatory
+      tags:
+        team: payments
+    defaults:                # optional, merged verbatim into S3Config's spec.defaults
+      tags:
+        env: prod
+  sqs:
+    enabled: true            # no overrides — renders spec: {} same as before this existed
+  rds:
+    enabled: false           # declared (e.g. for documentation / a planned future onboarding)
+                              # but not rendered
+```
+
+A bare `s3:` (no value) is equivalent to `s3: {}` — enabled, no overrides. `mandatory`/
+`defaults` accept any combination of the target `<Family>Config`'s spec fields; this chart does
+not validate their contents beyond `type: object` — the CRD's own `x-kubernetes-validations`
+(mutual-exclusion between tiers, etc.) is the source of truth at apply time.
+
+The namespace's `KropathConfig/baseline` singleton takes the same optional overrides at the top
+level:
+
+```yaml
+kropathConfig:
+  mandatory:
+    tags:
+      team: payments
+  defaults: {}
+```
+
+Both `families.<slug>` and `kropathConfig` default to `{}` (empty spec) when omitted — this is
+purely additive to the KRO-1140 baseline behavior.
 
 ## Why this exists
 
@@ -26,6 +80,8 @@ Three defects collapse into one artifact (full detail: `kropath-core` KRO-1139):
 
 ## Usage
 
+### Local (resource namespace)
+
 ```bash
 cp tests/values-sample.yaml values-payments-dev.yaml
 # edit values-payments-dev.yaml: namespace, globalConfigNamespace, accountId, region, families
@@ -35,14 +91,44 @@ helm template payments-dev . -f values-payments-dev.yaml > rendered/payments-dev
 # helm source at this chart + values-payments-dev.yaml directly.
 ```
 
-`values.schema.json` rejects a malformed `accountId` (must be exactly 12 digits) and an empty
-`families` list at render time — no cluster needed to catch either mistake.
+### Global (governance-only namespace)
+
+```bash
+cp tests/values-sample-global.yaml values-platform-governance.yaml
+# edit values-platform-governance.yaml: namespace, families
+# (namespaceRole stays "global"; globalConfigNamespace/accountId/region are not used)
+
+helm template platform-governance . -f values-platform-governance.yaml > rendered/platform-governance.yaml
+```
+
+`values.schema.json` rejects an invalid `namespaceRole`, a malformed `accountId` and empty
+`globalConfigNamespace`/`region` when `namespaceRole` is `local` (they are unused and
+unvalidated when `global`), an empty `families` map, an unknown key under a `families.<slug>`
+entry, and a non-boolean `enabled` — no cluster needed to catch any of these at render time.
+
+## The rendered `KropathConfig/baseline`
+
+Every render includes one `KropathConfig/baseline` in the tenant namespace — the local tier of
+the singleton (ADR-015 §3.1, §5.7). Its spec is `{}` unless `.Values.kropathConfig.mandatory`/
+`.defaults` are set (see "Declaring families and per-family/namespace overrides" above); an
+empty spec is valid and inherits everything from the global tier in `globalConfigNamespace`,
+and its absence would have been equally valid too (§3.1 — "silently skipped, not an error"). It
+is rendered anyway so a team that later needs a namespace-wide blanket override (e.g. a
+team-specific mandatory tag, levels 2/8 of the ten-level cascade in ADR-015 §5.3) has exactly
+one existing object to edit — top-level (`tags`, `syncedLabels`, `syncedAnnotations`,
+`namingTemplate`) or under a `<family>` section such as `mandatory.s3` — rather than
+hand-deriving the schema. Every field must be set in exactly one tier (§3.2); `KropathConfig`
+carries no provider
+connection fields (§3.3) and is never selected by `configRef` (§3.4).
 
 See `tests/values-sample.yaml` for a filled-in example and `family-kind-map.yaml` for the
 accepted `families` slugs (generated from `crds/*config.yaml` — see
 `../../hack/gen-family-kind-map.sh`).
 
 ## Why `ack-role-account-map` is not rendered here
+
+This section applies only to `namespaceRole: local` — a `global` namespace has no `accountId`
+and is not placed anywhere, so there is no role-ARN mapping to reason about for it.
 
 The spec (KRO-1140) asked this chart to also emit the `ack-role-account-map` ConfigMap entry
 for `accountId`, on the reasoning that generating it from the same input makes the C-4

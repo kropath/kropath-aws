@@ -29,6 +29,10 @@ render() {
   helm template test . -f tests/values-sample.yaml "$@"
 }
 
+render_global() {
+  helm template test . -f tests/values-sample-global.yaml "$@"
+}
+
 # --- Happy path: sample values render the Namespace + 3 <Family>Config objects -------------
 
 out=$(render)
@@ -61,6 +65,104 @@ for pair in "s3:S3Config" "sqs:SQSConfig" "rds:RDSConfig"; do
   fi
 done
 
+kpc_name=$(echo "$out" | yq 'select(.kind == "KropathConfig") | .metadata.name')
+kpc_ns=$(echo "$out" | yq 'select(.kind == "KropathConfig") | .metadata.namespace')
+kpc_spec=$(echo "$out" | yq -o=json 'select(.kind == "KropathConfig") | .spec')
+if [ "$kpc_name" = "baseline" ] && [ "$kpc_ns" = "payments-dev" ] && [ "$kpc_spec" = "{}" ]; then
+  pass "KropathConfig/baseline rendered correctly"
+else
+  fail "KropathConfig/baseline rendering wrong (name=$kpc_name ns=$kpc_ns spec=$kpc_spec)"
+fi
+
+# --- Happy path: "global" (governance-only) namespace renders NO placement annotations, -----
+# --- but still renders KropathConfig/baseline and every declared <Family>Config (ADR-019 D-5,
+# --- KRO-1175) ------------------------------------------------------------------------------
+
+gout=$(render_global)
+
+if echo "$gout" | yq -e 'select(.kind == "Namespace") | .metadata.name == "platform-governance"' >/dev/null 2>&1; then
+  pass "global-role Namespace platform-governance rendered"
+else
+  fail "global-role Namespace platform-governance not rendered"
+fi
+
+gann=$(echo "$gout" | yq -o=json 'select(.kind == "Namespace") | .metadata.annotations // {}')
+if [ "$gann" = "{}" ] || [ "$gann" = "null" ]; then
+  pass "global-role Namespace renders no placement annotations"
+else
+  fail "global-role Namespace should render no annotations, got: $gann"
+fi
+
+for pair in "s3:S3Config" "sqs:SQSConfig" "rds:RDSConfig"; do
+  slug="${pair%%:*}"
+  kind="${pair##*:}"
+  match=$(echo "$gout" | yq "select(.kind == \"$kind\") | .metadata.name")
+  ns=$(echo "$gout" | yq "select(.kind == \"$kind\") | .metadata.namespace")
+  if [ "$match" = "general-policy" ] && [ "$ns" = "platform-governance" ]; then
+    pass "global-role $kind rendered correctly for family $slug"
+  else
+    fail "global-role $kind rendering wrong (name=$match ns=$ns)"
+  fi
+done
+
+gkpc_name=$(echo "$gout" | yq 'select(.kind == "KropathConfig") | .metadata.name')
+gkpc_ns=$(echo "$gout" | yq 'select(.kind == "KropathConfig") | .metadata.namespace')
+if [ "$gkpc_name" = "baseline" ] && [ "$gkpc_ns" = "platform-governance" ]; then
+  pass "global-role KropathConfig/baseline rendered correctly"
+else
+  fail "global-role KropathConfig/baseline rendering wrong (name=$gkpc_name ns=$gkpc_ns)"
+fi
+
+# --- Happy path: configRef override renders a differently-named profile --------------------
+
+cout=$(render --set configRef=team-custom-policy)
+cname=$(echo "$cout" | yq 'select(.kind == "S3Config") | .metadata.name')
+[ "$cname" = "team-custom-policy" ] && pass "configRef override renders custom profile name" || fail "configRef override wrong: $cname"
+
+# --- Happy path: a family with enabled=false is declared but not rendered (KRO-1175 review) -
+
+dout=$(render --set families.rds.enabled=false)
+if echo "$dout" | yq -e 'select(.kind == "RDSConfig")' >/dev/null 2>&1; then
+  fail "RDSConfig rendered despite families.rds.enabled=false"
+else
+  pass "families.<slug>.enabled=false correctly skips rendering that <Family>Config"
+fi
+# the other two declared families are unaffected
+if echo "$dout" | yq -e 'select(.kind == "S3Config")' >/dev/null 2>&1; then
+  pass "other declared families still render when one is disabled"
+else
+  fail "S3Config missing when only rds was disabled"
+fi
+
+# --- Happy path: per-family mandatory/defaults overrides render explicitly (KRO-1175 review) -
+
+mout=$(render --set families.s3.mandatory.tags.team=payments --set families.s3.defaults.tags.env=prod)
+s3_mandatory_team=$(echo "$mout" | yq 'select(.kind == "S3Config") | .spec.mandatory.tags.team')
+s3_defaults_env=$(echo "$mout" | yq 'select(.kind == "S3Config") | .spec.defaults.tags.env')
+if [ "$s3_mandatory_team" = "payments" ] && [ "$s3_defaults_env" = "prod" ]; then
+  pass "families.<slug>.mandatory/defaults render into <Family>Config spec"
+else
+  fail "families.<slug>.mandatory/defaults rendering wrong (mandatory.tags.team=$s3_mandatory_team defaults.tags.env=$s3_defaults_env)"
+fi
+# a family with no overrides still renders spec: {} (backward compatible with KRO-1140 default)
+sqs_spec=$(echo "$mout" | yq -o=json 'select(.kind == "SQSConfig") | .spec')
+[ "$sqs_spec" = "{}" ] && pass "family with no mandatory/defaults still renders spec: {}" || fail "family with no overrides rendered non-empty spec: $sqs_spec"
+
+# --- Happy path: a bare 'slug:' (null) family entry behaves like {} — enabled, empty spec ---
+
+nout=$(render --set 'families.efs=null')
+if echo "$nout" | yq -e 'select(.kind == "EFSConfig") | .metadata.name == "general-policy"' >/dev/null 2>&1; then
+  pass "bare null family entry renders like an enabled, empty-override family"
+else
+  fail "bare null family entry did not render EFSConfig"
+fi
+
+# --- Happy path: kropathConfig.mandatory/defaults render into KropathConfig/baseline spec ---
+
+kout=$(render --set kropathConfig.mandatory.tags.team=payments)
+kpc_mandatory_team=$(echo "$kout" | yq 'select(.kind == "KropathConfig") | .spec.mandatory.tags.team')
+[ "$kpc_mandatory_team" = "payments" ] && pass "kropathConfig.mandatory renders into KropathConfig/baseline spec" || fail "kropathConfig.mandatory rendering wrong: $kpc_mandatory_team"
+
 # --- Negative: malformed accountId must fail schema validation -----------------------------
 
 if render --set accountId=not-twelve-digits >/dev/null 2>&1; then
@@ -71,10 +173,34 @@ fi
 
 # --- Negative: unknown family slug must fail with a clear message --------------------------
 
-if err=$(render --set 'families={s3,not-a-real-family}' 2>&1 >/dev/null); then
+if err=$(render --set 'families.not-a-real-family.enabled=true' 2>&1 >/dev/null); then
   fail "unknown family slug did not fail render"
 else
   echo "$err" | grep -q "unknown family" && pass "unknown family slug correctly fails render" || fail "unknown family slug failed with unexpected error: $err"
+fi
+
+# --- Negative: unknown family slug fails even when declared with enabled=false -------------
+
+if err=$(render --set 'families.not-a-real-family.enabled=false' 2>&1 >/dev/null); then
+  fail "unknown family slug with enabled=false did not fail render"
+else
+  echo "$err" | grep -q "unknown family" && pass "unknown family slug with enabled=false still correctly fails render" || fail "unknown family slug with enabled=false failed with unexpected error: $err"
+fi
+
+# --- Negative: families.<slug>.enabled must be a boolean ------------------------------------
+
+if render --set families.s3.enabled=notabool >/dev/null 2>&1; then
+  fail "non-boolean families.<slug>.enabled did not fail render"
+else
+  pass "non-boolean families.<slug>.enabled correctly fails render"
+fi
+
+# --- Negative: unknown key under families.<slug> must fail (additionalProperties: false) ---
+
+if render --set families.s3.bogusKey=true >/dev/null 2>&1; then
+  fail "unknown families.<slug> key did not fail render"
+else
+  pass "unknown families.<slug> key correctly fails render"
 fi
 
 # --- Negative: missing required namespace must fail ----------------------------------------
@@ -83,6 +209,32 @@ if render --set namespace= >/dev/null 2>&1; then
   fail "empty namespace did not fail render"
 else
   pass "empty namespace correctly fails render"
+fi
+
+# --- Negative: invalid namespaceRole must fail --------------------------------------------
+
+if render --set namespaceRole=bogus >/dev/null 2>&1; then
+  fail "invalid namespaceRole did not fail render"
+else
+  pass "invalid namespaceRole correctly fails render"
+fi
+
+# --- Negative: namespaceRole=local with accountId/region/globalConfigNamespace unset must ---
+# --- fail schema validation (ADR-019 D-5, KRO-1175) -----------------------------------------
+
+if render_global --set namespaceRole=local >/dev/null 2>&1; then
+  fail "local role without accountId/region/globalConfigNamespace did not fail render"
+else
+  pass "local role without accountId/region/globalConfigNamespace correctly fails render"
+fi
+
+# --- Negative: namespaceRole=global must still render if accountId/region/globalConfigNamespace
+# --- are absent entirely (they are optional, not merely ignored) ---------------------------
+
+if render_global >/dev/null 2>&1; then
+  pass "global role with no placement fields still renders"
+else
+  fail "global role with no placement fields unexpectedly failed to render"
 fi
 
 echo "---"
