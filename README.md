@@ -216,3 +216,5 @@ are implemented by the maintainers; feature PRs are not being accepted yet. See
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+<!-- scratch: KRO-1194 AC-1 verification commit, touches only README.md (non-matching path). Not for merge. -->
