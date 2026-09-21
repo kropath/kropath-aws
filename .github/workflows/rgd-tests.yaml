@@ -23,12 +23,13 @@ on:
       - "crds/**"
       - "tests/**"
       - ".github/workflows/**"
-  pull_request:
-    paths:
-      - "rgds/**"
-      - "crds/**"
-      - "tests/**"
-      - ".github/workflows/**"
+  # No path filter on pull_request: the "Chainsaw E2E Tests" job below is a required
+  # status check (ruleset 20332263), and GitHub treats a required check that never
+  # reports a status for the PR's head SHA as permanently blocking, not as "not
+  # applicable" (KRO-1194). Every PR must trigger this workflow so the check always
+  # reports; the "Detect relevant path changes" step decides at runtime whether the
+  # real suite needs to run, mirroring the same four path globs used above.
+  pull_request: {}
 
 jobs:
   test:
@@ -47,13 +48,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Full history so tests/select-tests.sh can diff against the base commit
-          # to determine which resource families actually changed.
+          # Full history so tests/select-tests.sh (and the path filter below) can diff
+          # against the base commit to determine which resource families actually changed.
           fetch-depth: 0
+
+      # Determines whether this change touches any of the paths that the Chainsaw suite
+      # actually covers. Runs before any cluster/test setup so a PR that only touches,
+      # say, onboarding/** skips straight to a passing job (KRO-1194 AC-1) instead of
+      # paying for a kind cluster it doesn't need. On push, the trigger's own `paths:`
+      # filter above already guarantees relevance, so this step is a no-op confirmation
+      # there. On pull_request (no path filter — see above), this is the sole gate, and
+      # a mix of matching and non-matching paths still resolves to "relevant" (AC-3)
+      # because paths-filter reports true if ANY listed pattern matches.
+      - name: Detect relevant path changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            relevant:
+              - "rgds/**"
+              - "crds/**"
+              - "tests/**"
+              - ".github/workflows/**"
 
       # kind runs via Docker on ubuntu-latest — no remote cluster or cloud credentials needed.
       # Single-node control-plane uses under 2 GB of the 7 GB runner RAM.
       - name: Set up kind cluster
+        if: steps.filter.outputs.relevant == 'true'
         uses: helm/kind-action@v1
         with:
           cluster_name: kropath-aws-test
@@ -61,6 +82,7 @@ jobs:
           config: tests/fixtures/kind-config.yaml
 
       - name: Setup test environment
+        if: steps.filter.outputs.relevant == 'true'
         env:
           # Authenticated API calls for ACK chart version resolution (5000 req/hr vs 60/hr unauthenticated).
           # Without this, GitHub API rate limits cause cognitoidentityprovider and other late-alphabet
@@ -71,23 +93,28 @@ jobs:
           (cd tests && make setup)
 
       - name: Lint Chainsaw test scripts
+        if: steps.filter.outputs.relevant == 'true'
         run: |
           (cd tests && make lint-test-scripts)
 
       # Guards the suite-selection logic below. A wrong answer there skips suites
       # silently, so it is verified before it is trusted. No cluster needed, ~1s.
       - name: Test suite-selection script
+        if: steps.filter.outputs.relevant == 'true'
         run: |
           (cd tests && make test-select-tests)
 
       - name: Install Chainsaw (pinned v0.2.15)
+        if: steps.filter.outputs.relevant == 'true'
         uses: kyverno/action-install-chainsaw@v0.2.15
 
       - name: Run Chainsaw E2E tests
+        if: steps.filter.outputs.relevant == 'true'
         run: |
           (cd tests && make chainsaw-e2e)
 
       - name: Select tests for changed files
+        if: steps.filter.outputs.relevant == 'true'
         id: select
         env:
           # BASE_REF and BASE_SHA are mutually exclusive by event type — each expands
@@ -117,7 +144,7 @@ jobs:
           fi
 
       - name: Run tests
-        if: steps.select.outputs.targets != ''
+        if: steps.filter.outputs.relevant == 'true' && steps.select.outputs.targets != ''
         run: |
           (cd tests && make ${{ steps.select.outputs.targets }})
 
@@ -173,7 +200,10 @@ jobs:
 
       - name: Publish test results to PR
         uses: dorny/test-reporter@v1
-        if: always()
+        # always() so results still publish after a mid-suite failure, but only when the
+        # suite actually ran — otherwise tests/test-results/ never exists and this step
+        # has nothing to report.
+        if: always() && steps.filter.outputs.relevant == 'true'
         with:
           name: RGD Tests
           path: tests/test-results/*.xml
@@ -182,7 +212,7 @@ jobs:
 
       - name: Upload test artifacts
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.filter.outputs.relevant == 'true'
         with:
           name: test-results
           path: tests/test-results/
