@@ -2182,3 +2182,43 @@ intelligentTiering: >-
   carries `eventBridgeConfiguration` and the bucket reaches `Ready`.
 
 ---
+
+## 14. Always Verify `kubectl config current-context` Before the RGD-Compiles Gate or `make test-*`
+
+* **What Fails:** Running the RGD-compiles gate (`kubectl delete/apply rgd` + `kubectl delete crd`)
+  or `cd tests && make test-<service>` while the current kubeconfig context is silently pointed at
+  `kind-kropath-aws-integration-test` instead of the intended local sandbox,
+  `kind-kropath-aws-test`. Both contexts expose an identically-named `LambdaFunction`/etc. CRD, so
+  every command succeeds with no error — there is no failure signal at the point of the mistake.
+* **Why it is dangerous:** `kind-kropath-aws-integration-test` is a **live, shared, ArgoCD
+  `selfHeal: true`-managed** cluster with real ACK controllers running (ack-chart-lambda, -kms,
+  -iam, …) and ArgoCD Applications (`kropath-aws`, `kro`, `ack`, …) reconciling it continuously
+  across all sessions. Applying a work-in-progress RGD schema there, then running a Chainsaw suite
+  against it, does real damage: the live `kropath-controller` overwrites the Chainsaw suite's mock
+  `kubectl patch --subresource=status` calls with real cascade output (every assert then fails with
+  a 5-minute timeout, not a clear error), test-namespace clutter is created on a cluster other
+  sessions share, and — worst — a later `kubectl delete crd` to "fix" a schema mismatch leaves the
+  RGD stuck `Inactive` (`cannot update CRD ...: breaking changes detected`) because kro only
+  re-validates on CRD re-**create**, and the CRD itself can wedge in `Terminating` if any
+  kro-managed instances from the polluted test run still exist (each holds a `kro.run/finalizer`
+  that only the RGD's own controller — currently confused by the schema mismatch — can remove,
+  a real deadlock requiring a manual `kubectl patch ... --type=merge -p '{"metadata":{"finalizers":[]}}'`
+  on every stuck instance to break).
+* **Confirm it in one command, every session, before the first `kubectl apply`/`make test-*`:**
+  ```bash
+  kubectl config current-context   # MUST print: kind-kropath-aws-test
+  ```
+  If it prints anything else (including `kind-kropath-aws-integration-test`), run
+  `kubectl config use-context kind-kropath-aws-test` first. Never pass `--context
+  kind-kropath-aws-integration-test` to the RGD-compiles gate or `make test-*` — that cluster is
+  reserved for the `kropath-aws-integration-tests` repo's post-merge live verification (KRO-1110),
+  not for `kropath-aws` local RGD/Chainsaw iteration.
+* **If you already ran something against the wrong context:** do not just move on. Diff what
+  changed (`kubectl --context kind-kropath-aws-integration-test get ns` for namespaces created in
+  the last few minutes is a fast signal), delete any namespaces your session created there, and
+  restore any RGD you touched to the `git show HEAD:<path>` content (delete CRD + delete RGD +
+  re-apply the original) so the ArgoCD `kropath-aws` Application returns to `Synced`/`Healthy` on
+  its own `selfHeal` pass. Confirm with
+  `kubectl --context kind-kropath-aws-integration-test get application kropath-aws -n argocd -o jsonpath='{.status.sync.status}'`.
+
+---
