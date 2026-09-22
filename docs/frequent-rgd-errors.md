@@ -2103,3 +2103,49 @@ intelligentTiering: >-
   verifies it.
 
 ---
+
+## 12. No Lambda Resource-Based Policy (`Permission`) CRD — Upstream ACK Gap
+
+*Discovered in KRO-1202, surfaced by the data-team integration-test story (KRO-1182/KRO-1184).*
+
+* **What's missing:** ACK's lambda-controller has no CRD for a Lambda resource-based policy — the
+  thing `aws lambda add-permission` / `AWS::Lambda::Permission` creates, which is how an AWS
+  service principal (`events.amazonaws.com`, `s3.amazonaws.com`, `sns.amazonaws.com`,
+  `apigateway.amazonaws.com`, …) is granted `lambda:InvokeFunction` rights on a function. This is
+  **not** an RGD/CEL bug — an RGD cannot create a resource ACK does not model — so there is nothing
+  to fix in this repo. Confirmed live (controller `v1.17.3`, and still true against the current
+  upstream `main` branch CRD bases as of 2026-09-22):
+    ```bash
+    $ kubectl get crd -o name | grep lambda.services.k8s.aws
+    aliases.lambda.services.k8s.aws
+    codesigningconfigs.lambda.services.k8s.aws
+    eventsourcemappings.lambda.services.k8s.aws
+    functions.lambda.services.k8s.aws
+    functionurlconfigs.lambda.services.k8s.aws
+    layerversions.lambda.services.k8s.aws
+    versions.lambda.services.k8s.aws
+    # no `permissions.lambda.services.k8s.aws`
+
+    $ kubectl get crd functions.lambda.services.k8s.aws -o json \
+        | jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | keys'
+    # no "permissions" key — full list in docs/deferred-capabilities.md
+    ```
+  The only `permissions` array in the whole controller is `Alias.spec.permissions`, which is
+  alias-scoped and cannot grant a principal invoke rights on the function itself.
+* **Upstream issue:** [aws-controllers-k8s/community#3051](https://github.com/aws-controllers-k8s/community/issues/3051)
+  (lambda-controller has GitHub Issues disabled; ACK centralizes issues in the `community` repo).
+* **Supported alternative — EventBridge only:** for an EventBridge rule invoking a function, point
+  the rule target's `roleARN` at an IAM role holding `lambda:InvokeFunction`, instead of a
+  resource policy on the function. EventBridge is the one caller type that supports role
+  assumption as a target property; this is what KRO-1184's guide uses and it is a fully
+  supported, reconciled, declarative path today.
+* **No supported declarative option — S3 / SNS / API Gateway and any other resource-policy-only
+  invoker:** these principals have no role-assumption mechanism; AWS requires a resource-based
+  policy on the function. Until the upstream CRD lands, there is no way to grant this via kro/ACK.
+  Options, in order of preference, are recorded in `docs/deferred-capabilities.md`; scoping the
+  story to EventBridge is preferred over an unreconciled out-of-band `aws lambda add-permission`
+  call.
+* **Full analysis:** `docs/deferred-capabilities.md` § "AWS Lambda — Resource-Based Policy
+  (`Permission`)".
+
+---

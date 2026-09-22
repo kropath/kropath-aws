@@ -133,3 +133,76 @@ supply and merge the role ARN by hand. Full detail and rationale:
 **To unblock:** either a platform-owned reconciler for `ack-role-account-map` (out of scope —
 ADR-003 keeps kropath-controller a pure config store with no such write surface), or rely on
 the KRO-1141 install-conformance checker to catch a mismatched entry after the fact.
+
+---
+
+## AWS Lambda — Resource-Based Policy (`Permission`) (KRO-1202)
+
+### Granting an AWS service principal invoke rights on a Function via a declarative resource policy
+
+**Spec requirement:** the data-team integration-test story (KRO-1182, documented in KRO-1184)
+needs an EventBridge rule to invoke `file-process-lambda`. More generally, any story where an AWS
+service (S3 bucket notifications, SNS topic subscriptions, API Gateway integrations, etc.) invokes
+a Lambda function needs the equivalent of `aws lambda add-permission` /
+`AWS::Lambda::Permission` — a resource-based policy statement on the function granting
+`lambda:InvokeFunction` to a named principal, scoped by `SourceArn`/`SourceAccount`.
+
+**Blocking constraint:** the ACK lambda-controller has no CRD for this. Confirmed live against
+controller `v1.17.3` and against the current upstream `main` branch CRD bases (2026-09-22):
+
+```bash
+$ kubectl get crd -o name | grep lambda.services.k8s.aws
+aliases.lambda.services.k8s.aws
+codesigningconfigs.lambda.services.k8s.aws
+eventsourcemappings.lambda.services.k8s.aws
+functions.lambda.services.k8s.aws
+functionurlconfigs.lambda.services.k8s.aws
+layerversions.lambda.services.k8s.aws
+versions.lambda.services.k8s.aws
+# no permissions.lambda.services.k8s.aws
+
+$ kubectl get crd functions.lambda.services.k8s.aws -o json \
+    | jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | keys'
+[
+  "architectures", "code", "codeSigningConfigARN", "codeSigningConfigRef", "deadLetterConfig",
+  "description", "durableConfig", "environment", "ephemeralStorage", "fileSystemConfigs",
+  "functionEventInvokeConfig", "handler", "imageConfig", "kmsKeyARN", "kmsKeyRef", "layerRefs",
+  "layers", "loggingConfig", "memorySize", "name", "packageType", "publish",
+  "reservedConcurrentExecutions", "role", "roleRef", "runtime", "snapStart", "tags",
+  "tenancyConfig", "timeout", "tracingConfig", "vpcConfig"
+]
+# no "permissions" field
+```
+
+The only `permissions` array anywhere in the controller is `Alias.spec.permissions`, which is
+scoped to a specific alias and cannot grant a principal invoke rights on the function itself (or
+on other aliases/`$LATEST`). This is upstream, not a kro/CEL/RGD limitation — an RGD cannot create
+a resource ACK does not model — so kropath-aws cannot close this gap alone.
+
+**Upstream issue:** [aws-controllers-k8s/community#3051](https://github.com/aws-controllers-k8s/community/issues/3051)
+requests a `Permission` CRD (or a `Function.spec.permissions` array analogous to
+`Alias.spec.permissions`). `lambda-controller` itself has GitHub Issues disabled — ACK centralizes
+issue tracking in the `community` repo.
+
+**Current behaviour / interim position, by invoke path:**
+
+- **EventBridge → Lambda:** fully supported today. Point the EventBridge rule target's `roleARN`
+  at an IAM role holding `lambda:InvokeFunction`, instead of relying on a resource policy on the
+  function. EventBridge is the one target type that supports role assumption in place of a
+  resource policy. This is what the KRO-1184 guide uses.
+- **S3 bucket notifications, SNS topic subscriptions, API Gateway integrations, and any other
+  principal that requires a resource-based policy (no role-assumption option):** **not supported
+  today.** There is no declarative (reconciled) way to grant this. In order of preference:
+  1. Scope the story to EventBridge-mediated invocation, as KRO-1184 does. Preferred — no drift
+     risk, fully reconciled.
+  2. An out-of-band, imperative `aws lambda add-permission` step run outside kropath, with the
+     explicit caveat that kro/ACK will never reconcile or detect drift on it, and a deletion of
+     the kropath-managed function will not clean it up.
+  3. A kropath-owned CRD plus controller support for `Permission` — a much larger commitment
+     (new CRD, new controller reconciliation logic, its own AWS SDK calls) that should not be
+     taken on without a second blocked story to justify the investment beyond this one.
+
+**To unblock:** upstream `aws-controllers-k8s/lambda-controller` ships a `Permission` CRD (or
+`Function.spec.permissions`) per the linked issue. Re-open this entry and wire the RGD once that
+lands and the cache in `kropath-core/docs/crd-cache/aws/lambda-controller-v*.md` is refreshed to
+include it.
