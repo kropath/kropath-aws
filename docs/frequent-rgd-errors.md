@@ -2149,3 +2149,36 @@ intelligentTiering: >-
   (`Permission`)".
 
 ---
+
+## 13. Known Upstream ACK Gap: S3 Bucket Notification Has No `eventBridgeConfiguration`
+
+*Discovered in KRO-1200. Blocks the data-team integration-test story (KRO-1182/KRO-1184) that wants
+`S3 → EventBridge → fan-out to Lambda/SQS/SNS`.*
+
+* **What's missing:** `s3.services.k8s.aws/Bucket`'s `spec.notification` does **not** expose
+  `eventBridgeConfiguration`. Confirmed against the live CRD (`s3-controller:1.12.2`):
+  ```bash
+  kubectl get crd buckets.s3.services.k8s.aws -o json \
+    | jq '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.notification.properties | keys'
+  # ["lambdaFunctionConfigurations", "queueConfigurations", "topicConfigurations"]
+  ```
+  The upstream S3 `PutBucketNotificationConfiguration` API models a fourth target,
+  `NotificationConfiguration.EventBridgeConfiguration` (an empty/presence-only struct that turns on
+  S3 → EventBridge event notifications for the bucket), but the ACK CRD/controller has never
+  generated or wired that field.
+* **Why it matters:** routing S3 events through EventBridge — rather than binding one
+  Lambda/SQS/SNS target directly via `lambdaFunctionConfigurations`/`queueConfigurations`/
+  `topicConfigurations` — is what lets the routing rule live in configuration and lets extra
+  consumers be added without touching the bucket. There is no kropath-side workaround: this is not
+  a kropath RGD/CEL gap, it is an upstream ACK schema gap. Do not attempt to fake it by adding a
+  `notification.eventBridge` field to `rgds/s3bucket.aws.kropath.run.yaml` — there is no ACK field
+  for the RGD to map it to.
+* **Tracking:** upstream feature request opened at
+  https://github.com/aws-controllers-k8s/community/issues/3050. Re-run the `jq` command above
+  against the live CRD whenever the `s3-controller` image is upgraded — once
+  `eventBridgeConfiguration` appears in `spec.notification.properties`, add
+  `notification.eventBridge: boolean | default=false` to the `S3Bucket` RGD schema, map it into
+  every `ackBucket` template `includeWhen` branch, and add a Chainsaw scenario asserting the ACK CR
+  carries `eventBridgeConfiguration` and the bucket reaches `Ready`.
+
+---
