@@ -1,0 +1,487 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+# RDSProxy RGD
+#
+# Composes: rds.services.k8s.aws/DBProxy (ACK RDS Controller v1.10.2)
+# ACK CRD cache: docs/crd-cache/aws/rds-controller-v1.10.2.md §DBProxy
+# Spec: kropath-core docs/specs/aws/aws-rds-08-rdsproxy.md
+# Family design: kropath-core docs/families/aws/rds.md §4.6
+#
+# Governance: Tags, syncedLabels, syncedAnnotations flow through RDSConfig
+# effectiveConfig cascade (ADR-010). No proxy-specific governance fields
+# (spec §"RDSConfig additions": none). requireTLS/idleClientTimeout/debugLogging
+# are plain instance-spec fields with no governance cascade (spec §"Governance").
+#
+# NO status.predictedArn (family design §4.6, spec §"Status Outputs"). A DBProxy
+# ARN contains an AWS-generated proxyId that cannot be predicted from effectiveName.
+# Do NOT copy the predictedArn block from a sibling RDS RGD. status.proxyArn is
+# populated from the ACK child's status.ackResourceMetadata.arn instead, and is
+# empty until the proxy reaches proxyStatus: available (spec AC-17/AC-18).
+#
+# Naming: effectiveName = {namespace}-{name} by default (overridable via
+# spec.nameOverride or mandatory/defaults namingTemplate), .lowerAscii()
+# applied as the final step — AWS stores DB proxy names lowercase and unique
+# per account.
+#
+# idleClientTimeout must never be forwarded as a bare 0 from an omitted field —
+# AWS treats 0 as "disconnect immediately", not "unset". The CRD default of 1800
+# does this work: an omitted instance field materializes as 1800 via the schema
+# default, never as a literal 0 (spec §"Zero-value sentinels").
+#
+# roleARN and vpcSecurityGroupIDs must be rendered ABSENT (not "" / []) from the
+# ACK CR when the developer omits them (spec AC-12). kro v0.9.2 cannot
+# conditionally omit a single field within one resource template (KRO-928 — see
+# docs/frequent-rgd-errors.md §"optional.none() in Write Position Is Rejected
+# by kro v0.9.2"). Omission is only achievable at the resource level, so the
+# ACK child is variant-split on both independent fields (2x2 = 4 variants),
+# mirroring rgds/dsqlcluster.aws.kropath.run.yaml's WithKms/NoKms x WithWitness/
+# NoWitness grid. Status fields that must stay stable across variants
+# (proxyArn, endpoint, proxyStatus, vpcID, conditions) use the always-bound
+# self-lookup externalRef pattern (ackDBProxyRef) — see docs/frequent-rgd-errors.md
+# §"Variant-Split Resources Freeze Combined Status Expressions".
+#
+# auth[].clientPasswordAuthType is emitted verbatim (defaulting to "" via the
+# CRD's own field default) rather than omitted per-entry when unset. Per-entry
+# field omission inside a transformList-built array hits the same KRO-928 wall
+# as top-level field omission, and — unlike a bounded 2x2 top-level grid —
+# variant-splitting per auth entry does not scale (unbounded auth list length).
+# No spec AC asserts clientPasswordAuthType omission; this is a documented
+# KRO-928 limitation, not an oversight.
+#
+# spec.engineFamily, "no empty auth entries", and "no empty vpcSubnetIDs" cannot
+# be enforced via real CRD admission — kro v0.9.2 SimpleSchema supports only
+# default/required/min/max markers (no enum=, no minItems= — confirmed absent
+# across every RGD in this repo; see rgds/rdsclusterparametergroup.aws.kropath.run.yaml
+# header). An explicit empty string/array still satisfies "required" presence.
+# These are therefore handled with the in-graph ConfigMap advisory pattern
+# (validationErrorCm below), mirroring rgds/rdsparametergroup.aws.kropath.run.yaml
+# and rgds/rdsclusterparametergroup.aws.kropath.run.yaml.
+#
+# auth[] is a nested array-of-typed-object schema field, declared via kro's
+# `types:` block (SimpleSchema custom type) — see rgds/elbrule.aws.kropath.run.yaml
+# RuleCondition/RuleAction for the established pattern in this repo.
+#
+# Tags: ACK DBProxy.spec.tags is array<{key, value}> — CONFIRMED against the live
+# CRD (kubectl get crd dbproxies.rds.services.k8s.aws -o json | jq
+# '.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.tags'),
+# NOT map[string]string. The aws-rds-phase1-tasks.md planning-doc note ("ACK RDS
+# resources use map[string]string for tags") does not hold for DBProxy — the CRD
+# cache's own DBProxy table already documented array<object>; trust the specific
+# per-resource cache table over the general planning-doc note. allCloudMetadata is
+# merged as a map first, then `.transformList(k, v, {"key": k, "value": v})` +
+# `.sortBy(x, x.key)` at the very end (same pattern as
+# rgds/rdsclusterparametergroup.aws.kropath.run.yaml) — sortBy keeps the rendered
+# list order deterministic so Chainsaw can assert it positionally (see
+# docs/frequent-rgd-errors.md §6 "Flaky List/Array Asserts").
+#
+# Config lookup: selector.matchLabels (Theme 28 / KRO-221) — CEL not evaluated
+# in externalRef.metadata.name. rsrcCfg is a list; always guard with
+# rsrcCfg.size() > 0 before indexing rsrcCfg[0].
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: rdsproxy.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: RDSProxy
+    scope: Namespaced
+    spec:
+      # Standard kropath governance fields
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Engine family — required. No CEL-enforced enum (kro v0.9.2 has no enum=
+      # marker); invalid values are caught by validationErrorCm below.
+      engineFamily: string | required=true
+      # Auth mechanisms — required, at least one entry expected (minItems not
+      # enforceable in kro v0.9.2; empty list caught by validationErrorCm).
+      auth: "[]ProxyAuth | required=true"
+      # VPC subnets to deploy the proxy into — required, at least one expected.
+      vpcSubnetIDs: "[]string | required=true"
+      # VPC security groups — optional; omitted from the ACK CR entirely when
+      # empty (spec AC-12), via the 4-way variant split below.
+      vpcSecurityGroupIDs: "[]string | default=[]"
+      # IAM role for Secrets Manager access — optional; omitted from the ACK CR
+      # entirely when empty (spec AC-12), via the 4-way variant split below.
+      roleARN: string | default=""
+      # requireTLS — meaningful false (TLS not required); always emitted.
+      requireTLS: boolean | default=false
+      # idleClientTimeout — CRD default 1800 ensures an omitted field never
+      # forwards a bare 0 (spec §"Zero-value sentinels").
+      idleClientTimeout: integer | default=1800
+      # debugLogging — meaningful false (debug logging off); always emitted.
+      debugLogging: boolean | default=false
+    types:
+      ProxyAuth:
+        authScheme: string | default="SECRETS"
+        iamAuth: string | default="DISABLED"
+        secretARN: string | default=""
+        clientPasswordAuthType: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.effectiveName}
+      namingStatus: >-
+        ${naming.data.effectiveName.contains("{") ? "invalid-unresolved-tokens" : "valid"}
+      proxyArn: >-
+        ${ackDBProxyRef.size() > 0 ? ackDBProxyRef[0].?status.?ackResourceMetadata.?arn.orValue("") : ""}
+      endpoint: >-
+        ${ackDBProxyRef.size() > 0 ? ackDBProxyRef[0].?status.?endpoint.orValue("") : ""}
+      proxyStatus: >-
+        ${ackDBProxyRef.size() > 0 ? ackDBProxyRef[0].?status.?status.orValue("") : ""}
+      vpcID: >-
+        ${ackDBProxyRef.size() > 0 ? ackDBProxyRef[0].?status.?vpcID.orValue("") : ""}
+      validationError: >-
+        ${validationErrorCm.data.error}
+      conditions: >-
+        ${ackDBProxyRef.size() > 0 ? ackDBProxyRef[0].?status.?conditions.orValue([]) : []}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: ProxyStatus
+        type: string
+        jsonPath: .status.proxyStatus
+      - name: Endpoint
+        type: string
+        jsonPath: .status.endpoint
+
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: RDSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap that materialises effectiveName with full {tag.X} dynamic substitution support.
+    # DB proxy names must be lowercase and unique per account — .lowerAscii() applied as final step.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSProxy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{name}", schema.metadata.name)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef)
+              .lowerAscii())}
+
+    # Advisory ConfigMap — always created (never includeWhen-gated, so status
+    # can reference it directly with no Unbound Variable Freeze risk).
+    # data.error is "" when engineFamily/auth/vpcSubnetIDs are all valid.
+    - id: validationErrorCm
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSProxy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${schema.spec.engineFamily == ""
+              ? "spec.engineFamily is required and must be non-empty"
+              : (schema.spec.engineFamily != "MYSQL" && schema.spec.engineFamily != "POSTGRESQL"
+                  ? "spec.engineFamily must be one of: MYSQL, POSTGRESQL"
+                  : (size(schema.spec.auth) == 0
+                      ? "spec.auth requires at least one entry"
+                      : (schema.spec.auth.exists(a, a.secretARN == "")
+                          ? "spec.auth[].secretARN is required and must be non-empty on every entry"
+                          : (size(schema.spec.vpcSubnetIDs) == 0
+                              ? "spec.vpcSubnetIDs requires at least one entry"
+                              : ""))))}
+
+    # ACK DBProxy CR — variant WITH roleARN, WITH vpcSecurityGroupIDs.
+    - id: ackDBProxyWithRoleWithSg
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{") && validationErrorCm.data.error == "" && schema.spec.roleARN != "" && size(schema.spec.vpcSecurityGroupIDs) > 0}'
+      template:
+        apiVersion: rds.services.k8s.aws/v1alpha1
+        kind: DBProxy
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSProxy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          engineFamily: ${schema.spec.engineFamily}
+          auth: >-
+            ${schema.spec.auth.transformList(i, a, {"authScheme": a.authScheme, "iamAuth": a.iamAuth, "secretARN": a.secretARN, "clientPasswordAuthType": a.clientPasswordAuthType})}
+          vpcSubnetIDs: ${schema.spec.vpcSubnetIDs}
+          vpcSecurityGroupIDs: ${schema.spec.vpcSecurityGroupIDs}
+          roleARN: ${schema.spec.roleARN}
+          requireTLS: ${schema.spec.requireTLS}
+          idleClientTimeout: ${schema.spec.idleClientTimeout}
+          debugLogging: ${schema.spec.debugLogging}
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK DBProxy CR — variant WITH roleARN, WITHOUT vpcSecurityGroupIDs.
+    - id: ackDBProxyWithRoleNoSg
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{") && validationErrorCm.data.error == "" && schema.spec.roleARN != "" && size(schema.spec.vpcSecurityGroupIDs) == 0}'
+      template:
+        apiVersion: rds.services.k8s.aws/v1alpha1
+        kind: DBProxy
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSProxy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          engineFamily: ${schema.spec.engineFamily}
+          auth: >-
+            ${schema.spec.auth.transformList(i, a, {"authScheme": a.authScheme, "iamAuth": a.iamAuth, "secretARN": a.secretARN, "clientPasswordAuthType": a.clientPasswordAuthType})}
+          vpcSubnetIDs: ${schema.spec.vpcSubnetIDs}
+          roleARN: ${schema.spec.roleARN}
+          requireTLS: ${schema.spec.requireTLS}
+          idleClientTimeout: ${schema.spec.idleClientTimeout}
+          debugLogging: ${schema.spec.debugLogging}
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK DBProxy CR — variant WITHOUT roleARN, WITH vpcSecurityGroupIDs.
+    - id: ackDBProxyNoRoleWithSg
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{") && validationErrorCm.data.error == "" && schema.spec.roleARN == "" && size(schema.spec.vpcSecurityGroupIDs) > 0}'
+      template:
+        apiVersion: rds.services.k8s.aws/v1alpha1
+        kind: DBProxy
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSProxy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          engineFamily: ${schema.spec.engineFamily}
+          auth: >-
+            ${schema.spec.auth.transformList(i, a, {"authScheme": a.authScheme, "iamAuth": a.iamAuth, "secretARN": a.secretARN, "clientPasswordAuthType": a.clientPasswordAuthType})}
+          vpcSubnetIDs: ${schema.spec.vpcSubnetIDs}
+          vpcSecurityGroupIDs: ${schema.spec.vpcSecurityGroupIDs}
+          requireTLS: ${schema.spec.requireTLS}
+          idleClientTimeout: ${schema.spec.idleClientTimeout}
+          debugLogging: ${schema.spec.debugLogging}
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK DBProxy CR — variant WITHOUT roleARN, WITHOUT vpcSecurityGroupIDs.
+    - id: ackDBProxyNoRoleNoSg
+      includeWhen:
+        - '${!naming.data.effectiveName.contains("{") && validationErrorCm.data.error == "" && schema.spec.roleARN == "" && size(schema.spec.vpcSecurityGroupIDs) == 0}'
+      template:
+        apiVersion: rds.services.k8s.aws/v1alpha1
+        kind: DBProxy
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: RDSProxy
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.effectiveName}
+          engineFamily: ${schema.spec.engineFamily}
+          auth: >-
+            ${schema.spec.auth.transformList(i, a, {"authScheme": a.authScheme, "iamAuth": a.iamAuth, "secretARN": a.secretARN, "clientPasswordAuthType": a.clientPasswordAuthType})}
+          vpcSubnetIDs: ${schema.spec.vpcSubnetIDs}
+          requireTLS: ${schema.spec.requireTLS}
+          idleClientTimeout: ${schema.spec.idleClientTimeout}
+          debugLogging: ${schema.spec.debugLogging}
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # Always-bound lookup of this instance's own ACK child, regardless of which
+    # variant fired — see docs/frequent-rgd-errors.md §"Variant-Split Resources
+    # Freeze Combined Status Expressions". Used only by the status block.
+    - id: ackDBProxyRef
+      externalRef:
+        apiVersion: rds.services.k8s.aws/v1alpha1
+        kind: DBProxy
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
