@@ -117,6 +117,45 @@ This document tracks technical friction points, syntax limitations, and runtime 
             ${roleWithDefaultTrust.?status.?conditions.orValue([])}
         ```
 
+### The Status Field Named `state` Is Reserved by kro — It Silently Overwrites Your CEL
+
+* **What Fails:** Declaring a status field literally named `state`, wired the same way as every
+  other status field on the object:
+    ```yaml
+    status:
+      vpcID: >-
+        ${ackVpc.?status.?vpcID.orValue("")}
+      state: >-
+        ${ackVpc.?status.?state.orValue("")}
+    ```
+  A brand-new instance shows `status.state: "ACTIVE"` before its child ACK resource has *any*
+  status at all — the CEL should evaluate to `""` at that point. Patching the child's real
+  `status.state` afterward never changes the parent's `status.state`, while sibling fields wired
+  identically (`vpcID`, `clusterArn`, `bootstrapBrokerString*`, …) correctly track their child on
+  the same reconcile pass.
+* **Why:** kro v0.9.2 appears to reserve the exact status field name `state` for its own
+  instance-lifecycle summary (mirroring the `state` field kro already exposes on
+  `ResourceGraphDefinition` objects) and overwrites it regardless of the RGD author's CEL
+  expression. This is a hypothesis confirmed by reproduction on two unrelated resource families
+  (`EC2VPC`, `MSKCluster`) with a clean before/after comparison against sibling fields on the same
+  object — not by reading kro's source. It affects **every** RGD in this repo that currently
+  declares `state` directly from a child resource (`ec2vpc`, `ec2instance`, `ec2natgateway`,
+  `ec2prefixlist`, `ec2subnet`, `ec2transitgateway`, `ec2transitgatewayattachment`,
+  `ec2vpcendpoint`, `emrjobrun`, `emrserverlessapplication` as of 2026-09-24), none of which caught
+  it because no Chainsaw scenario asserts a `status.state` transition away from the reconciler's
+  own default — asserting mere presence of a `state` key isn't enough to catch this.
+* **What Works Instead:** Use a more specific field name — `clusterState`, `instanceState`,
+  `<child>State`, etc.:
+    ```yaml
+    status:
+      clusterState: >-
+        ${cluster.?status.?state.orValue("")}
+    ```
+    Verify the rename actually fixes it (don't just trust the theory): patch the child's real
+    status to a non-default value and confirm the renamed field tracks it on the next reconcile —
+    see `docs/troubleshooting-logs/2026-09-24-mskcluster-state-field-reserved-by-kro.md` for the
+    full before/after reproduction on both `EC2VPC` and `MSKCluster`.
+
 ---
 
 ## 4. Troubleshooting: Runtime Validation & Testing Errors
