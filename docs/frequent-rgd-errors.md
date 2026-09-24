@@ -156,6 +156,19 @@ This document tracks technical friction points, syntax limitations, and runtime 
     see `docs/troubleshooting-logs/2026-09-24-mskcluster-state-field-reserved-by-kro.md` for the
     full before/after reproduction on both `EC2VPC` and `MSKCluster`.
 
+* **`conditions` is reserved the same way — confirmed on `autoscalinggroup` (KRO-1245).** Patching
+  the ACK child's `status.conditions` to a sentinel value (`kubectl patch ... --subresource=status
+  --type=merge -p '{"status":{"conditions":[{"type":"ACK.ResourceSynced", ...}]}}'`) never reaches
+  the kropath parent's `status.conditions`, regardless of what CEL expression the RGD declares for
+  it (`${asg.?status.?conditions.orValue([])}` and the always-bound `${asgRef[0].?status.?conditions
+  ...}` self-lookup pattern were both tried — same result). The parent's `status.conditions` always
+  shows kro's own four control-plane conditions (`InstanceManaged`, `GraphResolved`,
+  `ResourcesReady`, `Ready`) instead. This affects every RGD in this repo that declares a
+  `conditions` status field sourced from a child resource (`rdsparametergroup`,
+  `elasticachesubnetgroup`, `cloudwatchlogsloggroup`, `dsqlcluster`, `autoscalinggroup`, and likely
+  most others) — none of it was fixed here since renaming `status.conditions` on an already-shipped
+  CRD is a breaking API change outside this ticket's scope; flagging for a follow-up ticket instead.
+
 ---
 
 ## 4. Troubleshooting: Runtime Validation & Testing Errors

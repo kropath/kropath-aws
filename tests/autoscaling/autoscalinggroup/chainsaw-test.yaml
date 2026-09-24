@@ -548,8 +548,10 @@ spec:
               spec:
                 terminationPolicies: [OldestInstance, Default]
 
-    # AC-23: happy: instance newInstancesProtectedFromScaleIn=true propagated.
-    - name: ac23-scale-in-protection-instance
+    # Spec-AC-7a (amended spec, KRO-1245): the achievable direction of the boolean-OR cascade —
+    # instance sets true over a defaults tier that is off/unset. general-cfg carries no SIP setting
+    # in either tier, so this also covers "instance true, defaults unset".
+    - name: ac23-scale-in-protection-instance-enable-over-default-off
       try:
         - apply:
             resource:
@@ -797,9 +799,14 @@ spec:
                     defaultResult: CONTINUE
                     heartbeatTimeout: 120
 
-    # AC-34: happy: schema accepts warmPool fields (ACK autoscaling-chart v1.1.0 exposes
-    # warmPoolConfiguration only in status; forwarding to ACK deferred until spec support lands).
-    - name: ac34-warm-pool-schema-accepted
+    # Spec-AC-23 (amended spec, KRO-1245): warm pool values land on the kropath CR and are
+    # forwarded nowhere. The ACK autoscaling-controller CRD (v1.3.2) has no spec.warmPool /
+    # spec.warmPoolConfiguration field at all — warmPoolConfiguration exists only under status
+    # and is read-only (see kropath-core/docs/crd-cache/aws/autoscaling-controller-v1.3.2.md
+    # § "warmPoolConfiguration — status-only, no spec-level equivalent") — so the ACK child's
+    # rendered spec has no warmPool and no warmPoolConfiguration key at all. This is a kro/ACK
+    # architectural limit, not a defect; the RGD already omits it correctly (never templated).
+    - name: ac34-warm-pool-inert
       try:
         - apply:
             resource:
@@ -818,11 +825,82 @@ spec:
                   reuseOnScaleIn: true
         - assert:
             resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac34-asg, namespace: autoscalinggroup}
+              spec:
+                warmPool:
+                  poolState: Running
+                  minSize: 1
+                  maxGroupPreparedCapacity: 4
+                  reuseOnScaleIn: true
+        - assert:
+            resource:
               apiVersion: autoscaling.services.k8s.aws/v1alpha1
               kind: AutoScalingGroup
               metadata: {name: ac34-asg, namespace: autoscalinggroup}
               spec:
                 name: autoscalinggroup-ac34-asg
+                (warmPool == null): true
+                (warmPoolConfiguration == null): true
+
+    # Spec-AC-24 (amended spec, KRO-1245): two ASGs identical except one sets spec.warmPool and
+    # the other omits it — the two ACK children must be equivalent across their whole spec surface,
+    # proving setting spec.warmPool produces no observable difference in the child.
+    - name: ac34b-warm-pool-inert-parity
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac34b-with-warmpool, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+                warmPool:
+                  poolState: Running
+                  minSize: 1
+                  maxGroupPreparedCapacity: 4
+                  reuseOnScaleIn: true
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac34b-no-warmpool, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac34b-with-warmpool, namespace: autoscalinggroup}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac34b-no-warmpool, namespace: autoscalinggroup}
+        - script:
+            timeout: 60s
+            content: |
+              set -e
+              # Compare the two ACK children's spec (excluding metadata.name, which legitimately
+              # differs) — genuinely order-independent, per frequent-rgd-errors.md §6. Sorted with
+              # jq -S and diffed via plain files (no process substitution — the script shell is
+              # POSIX sh, not bash).
+              kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac34b-with-warmpool \
+                -n autoscalinggroup -o json | jq -S '.spec | del(.name)' > /tmp/ac34b-with.json
+              kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac34b-no-warmpool \
+                -n autoscalinggroup -o json | jq -S '.spec | del(.name)' > /tmp/ac34b-without.json
+              if ! diff /tmp/ac34b-with.json /tmp/ac34b-without.json; then
+                echo "MISMATCH: spec.warmPool changed the rendered ACK child"
+                exit 1
+              fi
+              echo "parity confirmed: spec.warmPool has no observable effect on the ACK child"
 
     # AC-35: happy: instanceMaintenancePolicy propagated.
     - name: ac35-instance-maintenance-policy
@@ -945,14 +1023,14 @@ spec:
                 annotations:
                   services.k8s.aws/deletion-policy: delete
 
-    # Spec-AC-7 (kro boolean limitation): defaults.newInstancesProtectedFromScaleIn=true +
-    # instance explicitly false → expected false per spec (instance wins), but actual true.
+    # Spec-AC-7 (amended spec, KRO-1245): defaults.newInstancesProtectedFromScaleIn=true +
+    # instance explicitly false → the default stands; an instance-level false cannot disable it.
     # kro v0.9.2 strips zero-value booleans on storage: has(schema.spec.newInstancesProtectedFromScaleIn)
     # returns false even for an explicit false, so OR-logic is: false||false||true = true.
-    # This test documents the actual behaviour. The spec acknowledges this limitation:
-    # boolean governance can enforce true but cannot weaken a defaults=true flag to false.
+    # This is documented spec behaviour (not a defect): boolean governance can enforce true but
+    # cannot weaken a defaults=true flag to false.
     # See docs/frequent-rgd-errors.md §"Boolean Cascade Cannot Disable a Default-True Flag".
-    - name: ac39-boolean-or-limitation
+    - name: ac39-scale-in-protection-instance-false-cannot-disable
       try:
         - apply:
             resource:
@@ -1120,3 +1198,169 @@ spec:
                     name: ac44-asg
                     controller: true
                     blockOwnerDeletion: true
+
+    # Spec-AC-5 (amended spec, KRO-1245): mixedInstancesPolicy absent from the instance — single
+    # launch-template mode is observable on the emitted zero-valued struct, never on its absence
+    # (kro renders every field the RGD template declares; see frequent-rgd-errors.md
+    # § "Observability of unset fields"). Values asserted here are the RGD schema's actual
+    # defaults (onDemandPercentageAboveBaseCapacity=100, spotAllocationStrategy=
+    # "capacity-optimized") as verified by manual reconcile — NOT the literal 0/"" example values
+    # in the merged spec text, which do not match this RGD's current schema defaults. Flagging
+    # this spec-text vs. schema-default mismatch for Design Reviewer as a follow-up; not fixed
+    # here since the ticket scope is desiredCapacity plus assertion-only AC-delta rewrites.
+    - name: ac45-no-mixed-instances-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac45-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac45-asg, namespace: autoscalinggroup}
+              spec:
+                launchTemplate:
+                  launchTemplateName: test-lt
+                mixedInstancesPolicy:
+                  instancesDistribution:
+                    onDemandBaseCapacity: 0
+                    onDemandPercentageAboveBaseCapacity: 100
+                    spotAllocationStrategy: capacity-optimized
+                    spotMaxPrice: ""
+                  launchTemplate:
+                    overrides: []
+
+    # Spec-AC-20 (amended spec, KRO-1245): no spec.targetGroupARNs on the instance — the ACK
+    # child's targetGroupARNs is present and empty ([]), never absent (kro architectural limit,
+    # see § "Observability of unset fields" above).
+    - name: ac46-no-target-groups
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac46-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac46-asg, namespace: autoscalinggroup}
+              spec:
+                targetGroupARNs: []
+
+    # Spec-AC-22 (amended spec, KRO-1245): no spec.lifecycleHooks on the instance — the ACK
+    # child's lifecycleHookSpecificationList is present and empty ([]), never absent.
+    - name: ac47-no-lifecycle-hooks
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac47-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac47-asg, namespace: autoscalinggroup}
+              spec:
+                lifecycleHookSpecificationList: []
+
+    # Bug fix (KRO-1245, not mapped to a numbered spec AC — flagged for Design Reviewer to route
+    # a follow-up spec AC addition): the confirmed desiredCapacity omission defect. Before this
+    # fix, `desiredCapacity: ${schema.spec.desiredCapacity}` was templated unconditionally, so
+    # omitting it on the instance forwarded a literal 0 to ACK. Any instance with minSize >= 1
+    # then failed AWS validation ("DesiredCapacity < MinSize"). Verified via the ACK
+    # autoscaling-controller generator.yaml that DesiredCapacity is NOT late_initialize (unlike
+    # NewInstancesProtectedFromScaleIn/AvailabilityZones/TerminationPolicies), so omission is safe:
+    # AWS will not write a contested value back into spec. The RGD now gates desiredCapacity via
+    # two mutually exclusive includeWhen variants keyed on schema.spec.desiredCapacity != 0/== 0.
+    - name: ac48-desired-capacity-omitted-defaults-to-min-size
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac48-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                minSize: 2
+                maxSize: 5
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac48-asg, namespace: autoscalinggroup}
+              spec:
+                minSize: 2
+                maxSize: 5
+                (desiredCapacity == null): true
+
+    # CRD-derived robustness check (KRO-1245, not tied to a numbered spec AC): the ACK CRD marks
+    # spec.name immutable (x-kubernetes-validations: self == oldSelf, verified against the live
+    # CRD — kropath-core/docs/crd-cache/aws/autoscaling-controller-v1.3.2.md). Changing
+    # nameOverride on an already-reconciled AutoScalingGroup must be rejected by the ACK CRD's own
+    # admission validation, not silently no-op or trigger a rename. Reproduced manually before
+    # writing this scenario: the ACK child's spec.name stays at the original value and the
+    # kropath parent surfaces the rejection via status.state=ERROR / status.conditions[Ready]=False.
+    - name: ac49-name-immutable-on-update
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac49-asg, namespace: autoscalinggroup}
+              spec:
+                configRef: general-cfg
+                nameOverride: ac49-original-name
+                minSize: 1
+                maxSize: 2
+                launchTemplate: {name: test-lt}
+        - assert:
+            resource:
+              apiVersion: autoscaling.services.k8s.aws/v1alpha1
+              kind: AutoScalingGroup
+              metadata: {name: ac49-asg, namespace: autoscalinggroup}
+              spec:
+                name: ac49-original-name
+        - script:
+            content: |
+              kubectl patch autoscalinggroup.aws.kropath.run ac49-asg -n autoscalinggroup \
+                --type=merge -p '{"spec":{"nameOverride":"ac49-renamed-name"}}'
+        - script:
+            timeout: 60s
+            content: |
+              set -e
+              # Wait for kro to attempt (and fail) the rename, then assert both halves of the
+              # rejection: the ACK child's spec.name is unchanged, and the kropath parent
+              # surfaces the CRD's immutability rejection rather than silently no-op'ing.
+              for i in $(seq 1 20); do
+                STATE=$(kubectl get autoscalinggroup.aws.kropath.run ac49-asg -n autoscalinggroup \
+                  -o jsonpath='{.status.state}' 2>/dev/null || echo "")
+                if [ "$STATE" = "ERROR" ]; then break; fi
+                sleep 3
+              done
+              kubectl get autoscalinggroup.autoscaling.services.k8s.aws ac49-asg \
+                -n autoscalinggroup -o json | jq -e '.spec.name == "ac49-original-name"'
+              kubectl get autoscalinggroup.aws.kropath.run ac49-asg -n autoscalinggroup -o json \
+                | jq -e '
+                    .status.state == "ERROR" and
+                    (.status.conditions | map(select(.type == "Ready" and .status == "False")) | length == 1)
+                  '
