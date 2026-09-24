@@ -1,0 +1,435 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: stepfunctionsstatemachinealias.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: StepFunctionsStateMachineAlias
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      # Optional; omitted (not "") from the ACK child when unset — frequent-rgd-errors.md §3.
+      description: string | default=""
+      # Required, 1..2 entries; weights must sum to 100. Deliberately ungoverned — no tier
+      # may pin/floor/cap routing (spec "Governance"). No spec.tags field — ACK StateMachineAlias
+      # exposes none (CRD cache); tag the underlying StateMachine instead.
+      routingConfiguration: "[]RoutingEntry | required=true"
+      # K8s-only exception to ADR-015 §6.1 dual-location invariant — no cloud tag sink exists
+      # on this ACK CRD, so these land only in metadata.labels/annotations, never in spec.tags.
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      RoutingEntry:
+        # kropath house style; ACK field is stateMachineVersionARN (all-caps suffix) — mapped
+        # explicitly in the child template (AC-5).
+        stateMachineVersionArn: string | required=true
+        weight: integer | required=true
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      # No predictedArn (OD-7) — the alias ARN embeds the parent state machine name, which is
+      # not part of the alias spec and cannot be derived from it (CRD cache: "Do not use
+      # predictedArn for StateMachineAlias"). Deliberately absent from this schema (AC-26).
+      #
+      # aliasArn/conditions read from only ONE gated resource ID each, never chained across both
+      # ackAliasWithDescription and ackAliasNoDescription in the same expression. Empirically
+      # confirmed (RGD-compiles-gate + a full Chainsaw run): a status CEL expression that
+      # references two independently includeWhen-gated resources — even via .orValue() chaining
+      # on a plain scalar field, not just the list-type-mismatch case documented for
+      # mwaaenvironment's conditions/noKmsConditions split — silently evaluates to "field absent"
+      # for the WHOLE field once one of the two resources has no observed state, rather than
+      # falling back to the other branch. `aliasArn`/`conditions` cover the common
+      # (description-set) path per AC-25; `aliasArnNoDescription`/`conditionsNoDescription` cover
+      # the no-description path (AC-16 default). Callers needing the ARN when description is
+      # unset read the second field — documented here since it deviates from the single-field
+      # status table in the spec doc, purely as a kro v0.9.2 workaround.
+      aliasArn: >-
+        ${ackAliasWithDescription.?status.?ackResourceMetadata.?arn.orValue("")}
+      aliasArnNoDescription: >-
+        ${ackAliasNoDescription.?status.?ackResourceMetadata.?arn.orValue("")}
+      conditions: >-
+        ${ackAliasWithDescription.?status.?conditions.orValue([])}
+      conditionsNoDescription: >-
+        ${ackAliasNoDescription.?status.?conditions.orValue([])}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: NamingStatus
+        type: string
+        jsonPath: .status.namingStatus
+      - name: AliasArn
+        type: string
+        jsonPath: .status.aliasArn
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not evaluated.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: StepFunctionsConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # ConfigMap to materialise effectiveName, resourceName, and namingStatus.
+    # Computed here so the status block can reference naming.data.* without requiring schema.* access
+    # (schema is out of scope in the status block — see frequent-rgd-errors.md §3).
+    # Unlike stepfunctionsactivity/stepfunctionsstatemachine, the {tag.X} resolution chain has no
+    # schema.spec.tags branch — this RGD has no spec.tags field (no cloud tag sink on the ACK CRD).
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: stepfunctions-statemachinealias-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          # effectiveName: base cloud resource name with full {tag.X} dynamic substitution support.
+          # Tag tokens resolved in cascade order: mandatory wins over spec, spec wins over defaults.
+          # Any {tag.X} token whose key is absent in all tiers is kept verbatim so namingStatus
+          # (computed below) reports "invalid-unresolved-tokens".
+          effectiveName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                      ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                  : "{tag." + part.split("}")[0] + "}"))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef))}
+          # resourceName: no suffix variant; equals effectiveName
+          resourceName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                      ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                  : "{tag." + part.split("}")[0] + "}"))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.syncedLabels
+                                  ? schema.spec.syncedLabels[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                      ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                          ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                  : "{tag." + part.split("}")[0] + "}"))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ── Routing validation (family design G-19) — advisory ConfigMaps, gate ACK child creation ──
+
+    # AC-3: weights must sum to 100.
+    - id: routingWeightSumError
+      includeWhen:
+        - '${schema.spec.routingConfiguration.map(e, e.weight).sum() != 100}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-routing-weight-sum-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "routingConfiguration weights must sum to 100"
+
+    # AC-7/AC-8: at most two versions, at least one version.
+    - id: routingSizeError
+      includeWhen:
+        - '${size(schema.spec.routingConfiguration) < 1 || size(schema.spec.routingConfiguration) > 2}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-routing-size-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "routingConfiguration must have 1 or 2 entries"
+
+    # Per-entry weight bound 0..100 (spec "Routing validation" — caught before the sum rule).
+    - id: routingWeightRangeError
+      includeWhen:
+        - '${schema.spec.routingConfiguration.exists(e, e.weight < 0 || e.weight > 100)}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-routing-weight-range-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "routingConfiguration[].weight must be in range 0..100"
+
+    # AC-6: version-ARN shape, partition segment matched permissively (do not anchor on literal
+    # "aws" — docs/frequent-rgd-errors.md §6). Trailing :\d+ distinguishes a version ARN from a
+    # bare state machine ARN. NOTE: no lookahead in this expression — CEL .matches() compiles via
+    # RE2, which does not support (?=...); the equivalent constraint here is a plain anchored match.
+    - id: routingArnFormatError
+      includeWhen:
+        - '${schema.spec.routingConfiguration.exists(e, !e.stateMachineVersionArn.matches("^arn:aws[a-z\\-]*:states:[a-z0-9\\-]+:[0-9]{12}:stateMachine:[a-zA-Z0-9_\\-]+:[0-9]+$"))}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-routing-arn-format-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "routingConfiguration[].stateMachineVersionArn must be a state machine VERSION arn (arn:<partition>:states:<region>:<accountId>:stateMachine:<name>:<versionNumber>), not a bare state machine arn"
+
+    # AC-9: alias name pattern — charset + at least one non-digit character, max 80 chars.
+    # CEL .matches() has no lookahead support (RE2), so the CRD cache's
+    # ^(?=.*[a-zA-Z_\-\.])[a-zA-Z0-9_\-\.]+$ is split into two plain-anchored checks: charset+length,
+    # and a separate all-digit rejection. Only evaluated once naming has resolved (no {tag.X} left).
+    - id: aliasNameFormatError
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+        - '${!naming.data.resourceName.matches("^[a-zA-Z0-9_\\-\\.]{1,80}$") || naming.data.resourceName.matches("^[0-9]+$")}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-alias-name-format-error
+          namespace: ${schema.metadata.namespace}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "resolved alias name must be 1-80 characters of [a-zA-Z0-9_-.] and contain at least one non-digit character"
+
+    # ── ACK StateMachineAlias CR — primary cloud resource ──
+    # Split into two mutually-exclusive template variants on spec.description presence, because
+    # kro cannot omit a single field within one template (optional.none() in write position is
+    # rejected — KRO-928); the field must be omitted at the resource level instead
+    # (frequent-rgd-errors.md §"optional.none() in Write Position Is Rejected..."). Both variants
+    # share the identical routing/naming validity gate.
+    - id: ackAliasWithDescription
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+        - '${schema.spec.routingConfiguration.map(e, e.weight).sum() == 100}'
+        - '${size(schema.spec.routingConfiguration) >= 1 && size(schema.spec.routingConfiguration) <= 2}'
+        - '${!schema.spec.routingConfiguration.exists(e, e.weight < 0 || e.weight > 100)}'
+        - '${!schema.spec.routingConfiguration.exists(e, !e.stateMachineVersionArn.matches("^arn:aws[a-z\\-]*:states:[a-z0-9\\-]+:[0-9]{12}:stateMachine:[a-zA-Z0-9_\\-]+:[0-9]+$"))}'
+        - '${naming.data.resourceName.matches("^[a-zA-Z0-9_\\-\\.]{1,80}$") && !naming.data.resourceName.matches("^[0-9]+$")}'
+        - '${schema.spec.description != ""}'
+      template:
+        apiVersion: sfn.services.k8s.aws/v1alpha1
+        kind: StateMachineAlias
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # spec.name on the ACK CRD is required and immutable
+          # (x-kubernetes-validations: self == oldSelf) — enforced by ACK, not by this RGD
+          # (frequent-rgd-errors.md §"x-kubernetes-validations Cannot Be Auto-Generated by kro").
+          name: ${naming.data.resourceName}
+          description: ${schema.spec.description}
+          # ACK field is stateMachineVersionARN (all-caps suffix) — explicit kropath -> ACK mapping (AC-5).
+          # ARN passed through verbatim — no CR resolution of version ARNs (family design §4.3, AC-4).
+          routingConfiguration: >-
+            ${schema.spec.routingConfiguration.map(e, {"stateMachineVersionARN": e.stateMachineVersionArn, "weight": e.weight})}
+
+    - id: ackAliasNoDescription
+      includeWhen:
+        - '${!naming.data.resourceName.contains("{")}'
+        - '${schema.spec.routingConfiguration.map(e, e.weight).sum() == 100}'
+        - '${size(schema.spec.routingConfiguration) >= 1 && size(schema.spec.routingConfiguration) <= 2}'
+        - '${!schema.spec.routingConfiguration.exists(e, e.weight < 0 || e.weight > 100)}'
+        - '${!schema.spec.routingConfiguration.exists(e, !e.stateMachineVersionArn.matches("^arn:aws[a-z\\-]*:states:[a-z0-9\\-]+:[0-9]{12}:stateMachine:[a-zA-Z0-9_\\-]+:[0-9]+$"))}'
+        - '${naming.data.resourceName.matches("^[a-zA-Z0-9_\\-\\.]{1,80}$") && !naming.data.resourceName.matches("^[0-9]+$")}'
+        - '${schema.spec.description == ""}'
+      template:
+        apiVersion: sfn.services.k8s.aws/v1alpha1
+        kind: StateMachineAlias
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: StepFunctionsStateMachineAlias
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          # spec.name on the ACK CRD is required and immutable
+          # (x-kubernetes-validations: self == oldSelf) — enforced by ACK, not by this RGD.
+          name: ${naming.data.resourceName}
+          # description intentionally omitted (not "") — frequent-rgd-errors.md §3 (AC-16).
+          routingConfiguration: >-
+            ${schema.spec.routingConfiguration.map(e, {"stateMachineVersionARN": e.stateMachineVersionArn, "weight": e.weight})}
