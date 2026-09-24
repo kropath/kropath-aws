@@ -1,0 +1,308 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# CloudFrontConnectionGroup RGD — wraps ACK cloudfront.services.k8s.aws/ConnectionGroup.
+# No ACK config wrapper — all fields are top-level on spec (unlike VPCOrigin/policy kinds).
+#
+# Spec-vs-schema note (same resolution as cloudfrontvpcorigin.yaml): the spec's "Resource CR
+# Fields" table lists a `name` field, but the "Naming" section states the ACK child's
+# `spec.name` = effectiveName (nameOverride/namingTemplate resolution), never a raw `spec.name`
+# on the kropath CR. No AC exercises a plain `name` field. Resolved the same way as
+# cloudfrontvpcorigin.yaml: no raw `spec.name` in this schema; `nameOverride` + the naming
+# template drive `effectiveName`, which becomes the ACK child's (immutable) `spec.name`.
+#
+# Boolean tri-state (enabled, ipv6Enabled — both AWS-default true): NOT governed by
+# CloudFrontConfig (spec: "CloudFrontConfig additions: None"), so the OR-cascade limitation in
+# frequent-rgd-errors.md §"Boolean Cascade Cannot Disable a Default-True Flag" (which only
+# applies to 3-tier mandatory/instance/defaults merges) does not apply here. Declared as bare
+# `boolean` (no `| default=` marker) per §"Boolean Field Presence Check (has()) Broken by CRD
+# Defaults" so `has()` correctly distinguishes "explicitly set" from "omitted", then a direct
+# has()-ternary against schema.spec preserves explicit `false` (AC-2) while still defaulting
+# omitted fields to AWS's documented `true` (AC-4, AC-5).
+#
+# anycastIPListID has no managed default and no governance tier; omit the field entirely when
+# unset via a 2-way includeWhen split (only one field needs omission here, unlike VPCOrigin's
+# two fields / four variants). status: uses an always-bound self-lookup (ackConnectionGroupRef)
+# per frequent-rgd-errors.md §"Variant-Split Resources Freeze Combined Status Expressions".
+#
+# name immutability (`self == oldSelf` on the ACK CRD, confirmed live via
+# `kubectl get crd connectiongroups.cloudfront.services.k8s.aws`) is enforced entirely by the
+# ACK CRD already; this RGD does not attempt to work around a post-creation namingTemplate
+# change being rejected on the child (AC-11) — that rejection is expected behavior.
+#
+# Spec: kropath-core/docs/specs/aws/aws-cloudfront-09-cloudfrontconnectiongroup.md
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cloudfrontconnectiongroup.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: CloudFrontConnectionGroup
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      enabled: boolean
+      ipv6Enabled: boolean
+      anycastIPListID: string | default=""
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      id: >-
+        ${ackConnectionGroupRef.size() > 0 ? ackConnectionGroupRef[0].?status.?id.orValue("") : ""}
+      routingEndpoint: >-
+        ${ackConnectionGroupRef.size() > 0 ? ackConnectionGroupRef[0].?status.?routingEndpoint.orValue("") : ""}
+      isDefault: >-
+        ${ackConnectionGroupRef.size() > 0 ? ackConnectionGroupRef[0].?status.?isDefault.orValue(false) : false}
+      conditions: >-
+        ${ackConnectionGroupRef.size() > 0 ? ackConnectionGroupRef[0].?status.?conditions.orValue([]) : []}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: ConnectionGroupID
+        type: string
+        jsonPath: .status.id
+      - name: RoutingEndpoint
+        type: string
+        jsonPath: .status.routingEndpoint
+
+  resources:
+    # Governance config lookup — single effCfg pattern (ADR-010, Theme 28).
+    # rsrcCfg is a list; always use rsrcCfg.size() > 0 guard before accessing rsrcCfg[0].
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Naming ConfigMap: resolves effectiveName (nameOverride > mandatory template > defaults
+    # template > "{namespace}-{name}") with {tag.X} token substitution.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: cloudfrontconnectiongroup-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontConnectionGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          resourceName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+
+    # ACK ConnectionGroup — variant: anycastIPListID set.
+    - id: ackConnectionGroupWithAnycast
+      includeWhen:
+        - >-
+          ${!naming.data.resourceName.contains("{") && schema.spec.anycastIPListID != ""}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: ConnectionGroup
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontConnectionGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          enabled: '${has(schema.spec.enabled) ? schema.spec.enabled : true}'
+          ipv6Enabled: '${has(schema.spec.ipv6Enabled) ? schema.spec.ipv6Enabled : true}'
+          anycastIPListID: "${schema.spec.anycastIPListID}"
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK ConnectionGroup — variant: anycastIPListID unset (key omitted entirely, not "").
+    - id: ackConnectionGroupNoAnycast
+      includeWhen:
+        - >-
+          ${!naming.data.resourceName.contains("{") && schema.spec.anycastIPListID == ""}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: ConnectionGroup
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontConnectionGroup
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          enabled: '${has(schema.spec.enabled) ? schema.spec.enabled : true}'
+          ipv6Enabled: '${has(schema.spec.ipv6Enabled) ? schema.spec.ipv6Enabled : true}'
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # Always-bound self-lookup of this instance's own ACK child, used exclusively by status:
+    # below. An externalRef is never excluded by includeWhen — it resolves to [] until the
+    # child exists — so status keeps one stable field per value no matter which variant fired.
+    - id: ackConnectionGroupRef
+      externalRef:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: ConnectionGroup
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
