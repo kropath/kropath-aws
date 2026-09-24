@@ -206,3 +206,57 @@ issue tracking in the `community` repo.
 `Function.spec.permissions`) per the linked issue. Re-open this entry and wire the RGD once that
 lands and the cache in `kropath-core/docs/crd-cache/aws/lambda-controller-v*.md` is refreshed to
 include it.
+
+---
+
+## AWS Auto Scaling — `AutoScalingGroup` (aws-autoscaling-02)
+
+### AC-23 / AC-24 — warm pool (`spec.warmPool`) is accepted but reaches nothing
+
+**What the user can set.** The kropath `AutoScalingGroup` CRD exposes a full `spec.warmPool` block
+and the API server accepts every field:
+
+```yaml
+spec:
+  warmPool:
+    poolState: Stopped              # Stopped | Running | Hibernated
+    minSize: 1
+    maxGroupPreparedCapacity: 3
+    reuseOnScaleIn: true
+```
+
+**What actually happens.** Nothing. `rgds/autoscalinggroup.aws.kropath.run.yaml` never templates
+these fields into the ACK `AutoScalingGroup` child, so no warm pool is created and no error is
+raised. The CR reports `Ready`, `status.warmPoolSize` is never populated, and the only way a user
+discovers the gap is by looking for a warm pool in the AWS console. This is a **silent no-op on a
+user-visible field** — the most costly shape of gap in this register.
+
+**Blocking constraint.** The ACK `autoscaling-controller` CRD has no spec-level warm pool field at
+any version from `v1.0.1` through `v1.3.2`. `warmPoolConfiguration` and `warmPoolSize` exist **only
+under `status`** and are read-only, populated by the controller from the AWS API:
+
+```
+docs/crd-cache/aws/autoscaling-controller-v1.3.2.md
+  § "`warmPoolConfiguration` — status-only, no spec-level equivalent"
+  "There is no `spec.warmPool` (or `spec.warmPoolConfiguration`) field in this CRD version."
+```
+
+An RGD cannot create a resource or set a field ACK does not model, so kropath-aws cannot close this
+gap alone. The underlying AWS API (`PutWarmPool`) is a separate call from `CreateAutoScalingGroup`,
+which is why ACK models the result but not the input.
+
+**Interim position.** Leave the schema block in place — it is already part of the shipped CRD
+surface and removing it is a breaking change for any CR that sets it. Document it as inert in
+customer docs. There is no supported declarative alternative; an out-of-band
+`aws autoscaling put-warm-pool` is possible but will never be reconciled, drift-detected, or cleaned
+up when the kropath-managed group is deleted.
+
+**To unblock.** Upstream `aws-controllers-k8s/autoscaling-controller` adds a spec-level warm pool
+field (`spec.warmPool` or `spec.warmPoolConfiguration`) to the `AutoScalingGroup` CRD. When it does:
+refresh `kropath-core/docs/crd-cache/aws/autoscaling-controller-v*.md`, wire the existing kropath
+`spec.warmPool` fields straight through in the RGD, and replace AC-23/AC-24 (currently
+`negative: warm-pool-inert` and `negative: warm-pool-inert-parity`) with happy-path scenarios that
+assert the forwarded configuration.
+
+**Spec reference:** `kropath-core/docs/specs/aws/aws-autoscaling-02-autoscalinggroup.md` —
+AC-23, AC-24, and the `[Post-implementation discovery]` callout in § Schema Surface.
