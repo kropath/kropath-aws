@@ -1,0 +1,773 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SNSSubscription — binds a delivery endpoint (SQS/Lambda/HTTP(S)/email/SMS/Firehose/application)
+# to an SNSTopic. No naming fields (KRO-236 exemption — see docs/crd-cache/aws/sns-controller-v1.7.1.md
+# "Subscription" ARN construction: <subscriptionId> is an AWS-assigned UUID, not predictable).
+#
+# No spec.tags on the ACK Subscription CR — the ACK SNS Subscription CRD has no tags field
+# (only Topic and PlatformApplication support spec.tags). Merged tags/syncedLabels/syncedAnnotations
+# apply only to K8s metadata.labels/metadata.annotations here (ADR-015 §6), never to a
+# non-existent ACK spec.tags field (see spec §Governance "Tag list format conversion").
+#
+# filterPolicy / deliveryPolicy / redrivePolicy / subscriptionRoleARN are attribute-passthrough
+# fields forwarded verbatim to the SNS Subscribe/SetSubscriptionAttributes API (like SNS Topic and
+# SQS Queue — docs/frequent-rgd-errors.md "Attribute-Passthrough Resources (SNS/SQS)"). Sending an
+# empty string is not the same as omitting the field, and kro v0.9.2 cannot omit a field within a
+# single template (KRO-928) — so the ACK child is split into 16 mutually exclusive includeWhen
+# variants, one per combination of the four fields' presence (2^4). Every variant renders identical
+# metadata/protocol/endpoint/topicARN/filterPolicyScope/rawMessageDelivery; only the presence of
+# filterPolicy/deliveryPolicy/redrivePolicy/subscriptionRoleARN differs. Variant id suffix encodes
+# presence: uppercase letter = field present, lowercase = field absent, in order F(ilterPolicy)
+# D(eliveryPolicy) R(edrivePolicy) S(ubscriptionRoleARN) — e.g. ackSubFDRS has all four,
+# ackSubfdrs has none.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: snssubscription.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: SNSSubscription
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      deletionPolicy: string | default=retain
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+      # Topic association — exactly one of topicRef/topicArn must be set (enforced via the
+      # topicMutexError advisory ConfigMap; x-kubernetes-validations cannot be preserved by kro
+      # v0.9.2 — docs/frequent-rgd-errors.md "x-kubernetes-validations Cannot Be Auto-Generated").
+      topicRef: string | default=""
+      topicArn: string | default=""
+      # Delivery target — endpoint immutability (self == oldSelf) is enforced by the ACK
+      # Subscription CRD itself (verified live: kubectl get crd subscriptions.sns.services.k8s.aws),
+      # not by anything kro generates, so no in-graph workaround is needed for AC-8.
+      protocol: string | required=true
+      endpoint: string | required=true
+      # Filtering
+      filterPolicy: string | default=""
+      filterPolicyScope: string | default="MessageAttributes"
+      # Delivery behaviour
+      rawMessageDelivery: boolean | default=false
+      deliveryPolicy: string | default=""
+      # Dead-letter queue — entire block optional; presence decided on leaf content
+      # (schema.spec.redrivePolicy.deadLetterQueueRef != ""), never on has(), because kro
+      # auto-defaults every object field to {} (frequent-rgd-errors.md §10.1).
+      redrivePolicy:
+        deadLetterQueueRef: string | default=""
+      # Firehose delivery role — required only when protocol == "firehose" (enforced via the
+      # firehoseRoleError advisory ConfigMap).
+      subscriptionRoleArn: string | default=""
+    status:
+      subscriptionArn: >-
+        ${ackSubRef.size() > 0 ? ackSubRef[0].?status.?ackResourceMetadata.?arn.orValue("") : ""}
+      pendingConfirmation: >-
+        ${ackSubRef.size() > 0 ? ackSubRef[0].?status.?pendingConfirmation.orValue("") : ""}
+      conditions: >-
+        ${ackSubRef.size() > 0 ? ackSubRef[0].?status.?conditions.orValue([]) : []}
+    additionalPrinterColumns:
+      - name: SubscriptionArn
+        type: string
+        jsonPath: .status.subscriptionArn
+      - name: PendingConfirmation
+        type: string
+        jsonPath: .status.pendingConfirmation
+  resources:
+    # Single governance config lookup — controller pre-merges all cascade layers (ADR-010 D-1).
+    # Uses selector.matchLabels (Theme 28/KRO-221) — CEL in externalRef.metadata.name is not
+    # evaluated. kro infers rsrcCfg as a list; access via rsrcCfg[0].* with rsrcCfg.size() > 0 guards.
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: SNSConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Optional SNSTopic lookup — resolves topicRef to the referenced topic's status.predictedArn
+    # (never reconstructed from the CR name — handles naming-template/nameOverride/.fifo correctly,
+    # matching the SQS DLQ redrive precedent in aws-sqs-02). Sentinel pattern: when topicRef is
+    # empty, the selector never matches and topicCr resolves to [] rather than deadlocking.
+    - id: topicCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: SNSTopic
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.topicRef != "" ? schema.spec.topicRef : "kro-empty-fallback-sentinel"}'
+
+    # Optional SQSQueue lookup for redrivePolicy.deadLetterQueueRef — same-namespace only
+    # (matches aws-sqs-02 OD-1). Sentinel pattern as above.
+    - id: dlqCr
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: SQSQueue
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.redrivePolicy.deadLetterQueueRef != "" ? schema.spec.redrivePolicy.deadLetterQueueRef : "kro-empty-fallback-sentinel"}'
+
+    # Always-bound self-lookup of this instance's own ACK Subscription child, by the
+    # app.kubernetes.io/instance label every one of the 16 variants below sets. Required because
+    # the 16-way includeWhen split freezes any status expression that names a variant id directly
+    # when that variant is excluded (docs/frequent-rgd-errors.md "Variant-Split Resources Freeze
+    # Combined Status Expressions") — an externalRef is never excluded, so status always exposes
+    # one stable subscriptionArn/pendingConfirmation/conditions whichever variant fired.
+    - id: ackSubRef
+      externalRef:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
+
+    # Advisory ConfigMap: exactly one of topicRef/topicArn must be set (AC-3, AC-4).
+    # x-kubernetes-validations cannot be preserved by kro v0.9.2 — in-graph ConfigMap advisory
+    # pattern used instead (docs/frequent-rgd-errors.md, rgds/iampolicy.yaml mutualExclusionError).
+    - id: topicMutexError
+      includeWhen:
+        - '${(schema.spec.topicRef != "") == (schema.spec.topicArn != "")}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-topic-ref-arn-exclusion-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "exactly one of topicRef or topicArn must be set"
+
+    # Advisory ConfigMap: subscriptionRoleArn is required when protocol == "firehose" (AC-19).
+    - id: firehoseRoleError
+      includeWhen:
+        - '${schema.spec.protocol == "firehose" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-firehose-role-required-error
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: "subscriptionRoleArn is required when protocol is 'firehose'"
+
+    - id: ackSubFDRS
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubFDRs
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+
+    - id: ackSubFDrS
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubFDrs
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+
+    - id: ackSubFdRS
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubFdRs
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+
+    - id: ackSubFdrS
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubFdrs
+      includeWhen:
+        - '${schema.spec.filterPolicy != "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          filterPolicy: ${schema.spec.filterPolicy}
+
+    - id: ackSubfDRS
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubfDRs
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+
+    - id: ackSubfDrS
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubfDrs
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy != "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          deliveryPolicy: ${schema.spec.deliveryPolicy}
+
+    - id: ackSubfdRS
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubfdRs
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef != "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          redrivePolicy: >-
+            ${dlqCr.size() > 0 ? "{\"deadLetterTargetArn\":\"" + dlqCr[0].status.predictedArn + "\"}" : ""}
+
+    - id: ackSubfdrS
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn != ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
+          subscriptionRoleARN: ${schema.spec.subscriptionRoleArn}
+
+    - id: ackSubfdrs
+      includeWhen:
+        - '${schema.spec.filterPolicy == "" && schema.spec.deliveryPolicy == "" && schema.spec.redrivePolicy.deadLetterQueueRef == "" && schema.spec.subscriptionRoleArn == ""}'
+      template:
+        apiVersion: sns.services.k8s.aws/v1alpha1
+        kind: Subscription
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: SNSSubscription
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          protocol: ${schema.spec.protocol}
+          endpoint: ${schema.spec.endpoint}
+          topicARN: >-
+            ${topicCr.size() > 0 && schema.spec.topicRef != "" ? topicCr[0].status.predictedArn : schema.spec.topicArn}
+          filterPolicyScope: ${schema.spec.filterPolicyScope}
+          rawMessageDelivery: '${schema.spec.rawMessageDelivery ? "true" : "false"}'
