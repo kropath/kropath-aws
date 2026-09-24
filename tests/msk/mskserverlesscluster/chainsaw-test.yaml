@@ -1,0 +1,959 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-msk-04 MSKServerlessCluster RGD Chainsaw tests — ACs 1-21.
+# Wraps ACK kafka.services.k8s.aws/ServerlessCluster.
+#
+# Canonical pattern: unique resource name per step, spec.skipDelete: true, no inter-step
+# ACK deletes. Governance effectiveConfig is set via kubectl patch --subresource=status
+# (controller stub) directly on the MSKConfig seeds below.
+#
+# Seeds (created once, never mutated after their initial patch — reused read-only by many ACs):
+#   general-policy            defaults.namingTemplate="{namespace}-{name}", mandatory empty
+#   mandatory-naming-policy   mandatory.namingTemplate="corp-{namespace}-{name}"
+#   unresolved-naming-policy  defaults.namingTemplate has an unresolvable {tag.env} token
+#   tags-merge-policy         mandatory.tags simulates a pre-merged KropathConfig+MSKConfig result
+#   synced-dual-policy        mandatory.syncedLabels + defaults.syncedLabels (mixed tiers)
+#   synced-annotations-policy mandatory.syncedAnnotations
+#
+# MSKServerlessCluster only consumes namingTemplate/tags/syncedLabels/syncedAnnotations from
+# MSKConfig — kafkaVersion/instanceType/encryption/monitoring fields are intentionally omitted
+# from every seed below (the CRD does not require them).
+#
+# NOTE: status.state is NOT used — kro v0.9.2 reserves that exact field name for its own
+# instance-lifecycle summary (verified empirically; see
+# docs/troubleshooting-logs/2026-09-24-mskcluster-state-field-reserved-by-kro.md). The real ACK
+# ServerlessCluster lifecycle state is surfaced as status.clusterState instead (AC-19 asserts
+# clusterState, not state).
+#
+# NOTE: AC-3 (saslIamEnabled: false) and AC-6 (vpcConfigs empty) are NOT literal admission
+# rejections — kro discards hand-authored x-kubernetes-validations on every regeneration (see
+# docs/frequent-rgd-errors.md). Both are enforced via an includeWhen guard on the ACK
+# ServerlessCluster child instead (same precedent as rgds/apigatewayvpclink.aws.kropath.run.yaml
+# AC-8): the parent MSKServerlessCluster CR is created, but the ACK child is never created.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mskserverlesscluster
+spec:
+  skipDelete: true
+  namespace: mskserverlesscluster
+  steps:
+    # ── Namespace ──────────────────────────────────────────────────────────────
+    - name: setup-namespace
+      try:
+        - apply:
+            file: 00-mskserverlesscluster-namespace.yaml
+
+    # ── Seed: general-policy (defaults.namingTemplate set, mandatory empty) ────
+    - name: seed-general-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: general-policy
+                name: general-policy
+                namespace: mskserverlesscluster
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig general-policy -n mskserverlesscluster --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "namingTemplate":"{namespace}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2","partition":"aws"}
+                    }
+                  }
+                }'
+
+    # ── Seed: mandatory-naming-policy (AC-9) ────────────────────────────────────
+    - name: seed-mandatory-naming-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: mandatory-naming-policy
+                name: mandatory-naming-policy
+                namespace: mskserverlesscluster
+              spec:
+                mandatory:
+                  namingTemplate: "corp-{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig mandatory-naming-policy -n mskserverlesscluster --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "namingTemplate":"corp-{namespace}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2","partition":"aws"}
+                    }
+                  }
+                }'
+
+    # ── Seed: unresolved-naming-policy (AC-11) ──────────────────────────────────
+    - name: seed-unresolved-naming-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: unresolved-naming-policy
+                name: unresolved-naming-policy
+                namespace: mskserverlesscluster
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{tag.env}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig unresolved-naming-policy -n mskserverlesscluster --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "namingTemplate":"{tag.env}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2","partition":"aws"}
+                    }
+                  }
+                }'
+
+    # ── Seed: tags-merge-policy (AC-12) — simulates pre-merged KropathConfig+MSKConfig ──
+    - name: seed-tags-merge-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: tags-merge-policy
+                name: tags-merge-policy
+                namespace: mskserverlesscluster
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags:
+                    cost-centre: platform
+                    stream-type: serverless
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig tags-merge-policy -n mskserverlesscluster --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "namingTemplate":"",
+                        "tags":{"cost-centre":"platform","stream-type":"serverless"},
+                        "syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "namingTemplate":"{namespace}-{name}",
+                        "tags":{},"syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2","partition":"aws"}
+                    }
+                  }
+                }'
+
+    # ── Seed: synced-dual-policy (AC-13) — mixed tiers ──────────────────────────
+    - name: seed-synced-dual-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: synced-dual-policy
+                name: synced-dual-policy
+                namespace: mskserverlesscluster
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels:
+                    environment: production
+                  syncedAnnotations: {}
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels:
+                    data-class: internal
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig synced-dual-policy -n mskserverlesscluster --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "namingTemplate":"","tags":{},
+                        "syncedLabels":{"environment":"production"},"syncedAnnotations":{}
+                      },
+                      "defaults":{
+                        "namingTemplate":"{namespace}-{name}","tags":{},
+                        "syncedLabels":{"data-class":"internal"},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2","partition":"aws"}
+                    }
+                  }
+                }'
+
+    # ── Seed: synced-annotations-policy (AC-14) ─────────────────────────────────
+    - name: seed-synced-annotations-policy
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKConfig
+              metadata:
+                labels:
+                  aws.kropath.run/resource-name: synced-annotations-policy
+                name: synced-annotations-policy
+                namespace: mskserverlesscluster
+              spec:
+                mandatory:
+                  namingTemplate: ""
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations:
+                    team: streaming
+                defaults:
+                  namingTemplate: "{namespace}-{name}"
+                  tags: {}
+                  syncedLabels: {}
+                  syncedAnnotations: {}
+        - script:
+            content: |
+              kubectl patch mskconfig synced-annotations-policy -n mskserverlesscluster --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "effectiveConfig":{
+                      "mandatory":{
+                        "namingTemplate":"","tags":{},"syncedLabels":{},
+                        "syncedAnnotations":{"team":"streaming"}
+                      },
+                      "defaults":{
+                        "namingTemplate":"{namespace}-{name}","tags":{},
+                        "syncedLabels":{},"syncedAnnotations":{}
+                      },
+                      "aws":{"accountId":"123456789012","region":"ap-southeast-2","partition":"aws"}
+                    }
+                  }
+                }'
+
+    # ═══════════════════════ Happy path — serverless creation (AC-1) ═══════════
+
+    - name: ac1-serverless-create
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac1-serverless-create
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+                    securityGroupIds: ["sg-abc123"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac1-serverless-create
+                namespace: mskserverlesscluster
+              spec:
+                serverless:
+                  vpcConfigs:
+                    - subnetIDs: ["subnet-abc123"]
+                      securityGroupIDs: ["sg-abc123"]
+        - script:
+            content: |
+              kubectl get serverlesscluster ac1-serverless-create -n mskserverlesscluster -o json \
+                | jq -e '(.spec | has("provisioned")) | not' \
+                || { echo "FAIL: spec.provisioned should not be set on a serverless cluster"; exit 1; }
+              echo "PASS: spec.provisioned is not set"
+
+    # ═══════════════════ IAM authentication (mandatory) (AC-2 to AC-4) ═════════
+
+    - name: ac2-iam-default-true
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac2-iam-default
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac2-iam-default
+                namespace: mskserverlesscluster
+              spec:
+                serverless:
+                  clientAuthentication:
+                    sasl:
+                      iam:
+                        enabled: true
+
+    - name: ac3-iam-reject-false
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac3-iam-reject-false
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+                saslIamEnabled: false
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac3-iam-reject-false
+                namespace: mskserverlesscluster
+        - script:
+            content: |
+              # includeWhen guard: saslIamEnabled == false → ACK ServerlessCluster NOT created.
+              if kubectl get serverlesscluster ac3-iam-reject-false -n mskserverlesscluster 2>/dev/null; then
+                echo "FAIL: ACK ServerlessCluster should not be created when saslIamEnabled=false"
+                exit 1
+              fi
+              echo "PASS: ACK ServerlessCluster not created for saslIamEnabled=false"
+
+    - name: ac4-iam-explicit-true
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac4-iam-explicit-true
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+                saslIamEnabled: true
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac4-iam-explicit-true
+                namespace: mskserverlesscluster
+              spec:
+                serverless:
+                  clientAuthentication:
+                    sasl:
+                      iam:
+                        enabled: true
+
+    # ═══════════════════════ Multiple VPC configs (AC-5 to AC-7) ═══════════════
+
+    - name: ac5-multi-vpc-config
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac5-multi-vpc
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-a1", "subnet-a2"]
+                    securityGroupIds: ["sg-a1"]
+                  - subnetIds: ["subnet-b1"]
+                    securityGroupIds: ["sg-b1", "sg-b2"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac5-multi-vpc
+                namespace: mskserverlesscluster
+              spec:
+                serverless:
+                  vpcConfigs:
+                    - subnetIDs: ["subnet-a1", "subnet-a2"]
+                      securityGroupIDs: ["sg-a1"]
+                    - subnetIDs: ["subnet-b1"]
+                      securityGroupIDs: ["sg-b1", "sg-b2"]
+
+    - name: ac6-vpc-configs-empty
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac6-vpc-empty
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac6-vpc-empty
+                namespace: mskserverlesscluster
+        - script:
+            content: |
+              # includeWhen guard: size(vpcConfigs) == 0 → ACK ServerlessCluster NOT created.
+              if kubectl get serverlesscluster ac6-vpc-empty -n mskserverlesscluster 2>/dev/null; then
+                echo "FAIL: ACK ServerlessCluster should not be created when vpcConfigs is empty"
+                exit 1
+              fi
+              echo "PASS: ACK ServerlessCluster not created for empty vpcConfigs"
+
+    - name: ac7-vpc-config-default-sg
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac7-vpc-default-sg
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-a"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac7-vpc-default-sg
+                namespace: mskserverlesscluster
+              spec:
+                serverless:
+                  vpcConfigs:
+                    - subnetIDs: ["subnet-a"]
+                      securityGroupIDs: []
+
+    # ═══════════════════════════════════ Naming (AC-8 to AC-11) ════════════════
+
+    - name: ac8-naming-standard
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: orders-serverless
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: orders-serverless
+                namespace: mskserverlesscluster
+              status:
+                resourceName: "mskserverlesscluster-orders-serverless"
+                namingStatus: "valid"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: orders-serverless
+                namespace: mskserverlesscluster
+              spec:
+                name: "mskserverlesscluster-orders-serverless"
+
+    - name: ac9-naming-mandatory-template
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac9-naming-mandatory
+                namespace: mskserverlesscluster
+              spec:
+                configRef: mandatory-naming-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac9-naming-mandatory
+                namespace: mskserverlesscluster
+              status:
+                namingStatus: "valid"
+        - script:
+            content: |
+              NAME=$(kubectl get mskserverlesscluster ac9-naming-mandatory -n mskserverlesscluster -o jsonpath='{.status.resourceName}')
+              case "$NAME" in
+                corp-*) echo "PASS: resourceName=$NAME starts with corp-" ;;
+                *) echo "FAIL: expected resourceName to start with corp-, got: $NAME"; exit 1 ;;
+              esac
+
+    - name: ac10-naming-override
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac10-naming-override
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+                nameOverride: "my-serverless-cluster"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac10-naming-override
+                namespace: mskserverlesscluster
+              status:
+                resourceName: "my-serverless-cluster"
+                namingStatus: "valid"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac10-naming-override
+                namespace: mskserverlesscluster
+              spec:
+                name: "my-serverless-cluster"
+
+    - name: ac11-naming-unresolved-token
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac11-naming-unresolved
+                namespace: mskserverlesscluster
+              spec:
+                configRef: unresolved-naming-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac11-naming-unresolved
+                namespace: mskserverlesscluster
+              status:
+                namingStatus: "invalid-unresolved-tokens"
+        - script:
+            content: |
+              if kubectl get serverlesscluster ac11-naming-unresolved -n mskserverlesscluster 2>/dev/null; then
+                echo "FAIL: ACK ServerlessCluster should not exist when namingStatus=invalid-unresolved-tokens"
+                exit 1
+              fi
+              echo "PASS: ACK ServerlessCluster not created for invalid naming"
+
+    # ═══════════════════════════════ Tags and labels (AC-12 to AC-15) ══════════
+
+    - name: ac12-tags-merge
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac12-tags-merge
+                namespace: mskserverlesscluster
+              spec:
+                configRef: tags-merge-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+                tags:
+                  app: orders
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac12-tags-merge
+                namespace: mskserverlesscluster
+        - script:
+            content: |
+              TAGS=$(kubectl get serverlesscluster ac12-tags-merge -n mskserverlesscluster -o json | jq -c '.spec.tags')
+              echo "$TAGS" | jq -e '.["cost-centre"] == "platform"' >/dev/null || { echo "FAIL: missing cost-centre=platform in $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e '.["stream-type"] == "serverless"' >/dev/null || { echo "FAIL: missing stream-type=serverless in $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e '.["app"] == "orders"' >/dev/null || { echo "FAIL: missing app=orders in $TAGS"; exit 1; }
+              echo "PASS: all three tags present: $TAGS"
+
+    - name: ac13-synced-labels-dual
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac13-synced-dual
+                namespace: mskserverlesscluster
+              spec:
+                configRef: synced-dual-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac13-synced-dual
+                namespace: mskserverlesscluster
+                labels:
+                  aws.kropath.run/environment: "production"
+                  aws.kropath.run/data-class: "internal"
+        - script:
+            content: |
+              TAGS=$(kubectl get serverlesscluster ac13-synced-dual -n mskserverlesscluster -o json | jq -c '.spec.tags')
+              echo "$TAGS" | jq -e '.["environment"] == "production"' >/dev/null || { echo "FAIL: missing environment=production in cloud tags: $TAGS"; exit 1; }
+              echo "$TAGS" | jq -e '.["data-class"] == "internal"' >/dev/null || { echo "FAIL: missing data-class=internal in cloud tags: $TAGS"; exit 1; }
+              echo "PASS: synced labels present in both K8s labels and cloud tags: $TAGS"
+
+    - name: ac14-synced-annotations
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac14-synced-annotations
+                namespace: mskserverlesscluster
+              spec:
+                configRef: synced-annotations-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac14-synced-annotations
+                namespace: mskserverlesscluster
+                annotations:
+                  aws.kropath.run/team: "streaming"
+
+    - name: ac15-tags-map-format
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac15-tags-format
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+                tags:
+                  app: orders
+                  env: prod
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac15-tags-format
+                namespace: mskserverlesscluster
+        - script:
+            content: |
+              TYPE=$(kubectl get serverlesscluster ac15-tags-format -n mskserverlesscluster -o json | jq -r '.spec.tags | type')
+              if [ "$TYPE" != "object" ]; then
+                echo "FAIL: expected spec.tags to be a map (object), got: $TYPE"
+                exit 1
+              fi
+              APP=$(kubectl get serverlesscluster ac15-tags-format -n mskserverlesscluster -o jsonpath='{.spec.tags.app}')
+              ENV=$(kubectl get serverlesscluster ac15-tags-format -n mskserverlesscluster -o jsonpath='{.spec.tags.env}')
+              if [ "$APP" != "orders" ] || [ "$ENV" != "prod" ]; then
+                echo "FAIL: expected app=orders env=prod, got app=$APP env=$ENV"
+                exit 1
+              fi
+              echo "PASS: spec.tags is a map with app=$APP env=$ENV"
+
+    # ═════════════════════════════════ Standard metadata (AC-16) ══════════════
+
+    - name: ac16-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac16-std-meta
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac16-std-meta
+                namespace: mskserverlesscluster
+                labels:
+                  app.kubernetes.io/managed-by: "kro"
+                  app.kubernetes.io/instance: "ac16-std-meta"
+                annotations:
+                  services.k8s.aws/deletion-policy: "retain"
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: MSKServerlessCluster
+                    name: ac16-std-meta
+                    controller: true
+                    blockOwnerDeletion: true
+
+    # ═══════════════════════════════════ Deletion policy (AC-17 to AC-18) ═════
+
+    - name: ac17-deletion-policy-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac17-deletion-delete
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+                deletionPolicy: "delete"
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac17-deletion-delete
+                namespace: mskserverlesscluster
+                annotations:
+                  services.k8s.aws/deletion-policy: "delete"
+
+    - name: ac18-deletion-policy-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac18-deletion-retain
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac18-deletion-retain
+                namespace: mskserverlesscluster
+                annotations:
+                  services.k8s.aws/deletion-policy: "retain"
+
+    # ═══════════════════════════════════ Status fields (AC-19 to AC-20) ═══════
+
+    - name: ac19-cluster-arn-from-status
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac19-status-arn
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: kafka.services.k8s.aws/v1alpha1
+              kind: ServerlessCluster
+              metadata:
+                name: ac19-status-arn
+                namespace: mskserverlesscluster
+        - script:
+            content: |
+              kubectl patch serverlesscluster ac19-status-arn -n mskserverlesscluster --subresource=status \
+                --type=merge -p '{
+                  "status":{
+                    "state":"ACTIVE",
+                    "ackResourceMetadata":{
+                      "arn":"arn:aws:kafka:ap-southeast-2:123456789012:cluster/mskserverlesscluster-ac19-status-arn/test-uuid",
+                      "ownerAccountID":"123456789012","region":"ap-southeast-2"
+                    }
+                  }
+                }'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac19-status-arn
+                namespace: mskserverlesscluster
+              status:
+                clusterArn: "arn:aws:kafka:ap-southeast-2:123456789012:cluster/mskserverlesscluster-ac19-status-arn/test-uuid"
+                clusterState: "ACTIVE"
+
+    - name: ac20-cluster-arn-pending
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac20-status-pending
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac20-status-pending
+                namespace: mskserverlesscluster
+              status:
+                clusterArn: ""
+        - script:
+            content: |
+              kubectl get crd mskserverlessclusters.aws.kropath.run -o json \
+                | jq -e '(.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("predictedArn")) | not' \
+                || { echo "FAIL: status.predictedArn should not exist on the MSKServerlessCluster CRD schema"; exit 1; }
+              echo "PASS: no predictedArn field on the CRD schema"
+
+    # ═══════════════════ Configuration reference not applicable (AC-21) ═══════
+
+    - name: ac21-no-configuration-ref-field
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac21-no-config-ref
+                namespace: mskserverlesscluster
+              spec:
+                configRef: general-policy
+                vpcConfigs:
+                  - subnetIds: ["subnet-abc123"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: MSKServerlessCluster
+              metadata:
+                name: ac21-no-config-ref
+                namespace: mskserverlesscluster
+        - script:
+            content: |
+              kubectl get crd mskserverlessclusters.aws.kropath.run -o json \
+                | jq -e '(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | has("configurationRef") or has("configurationArn")) | not' \
+                || { echo "FAIL: configurationRef/configurationArn should not exist on the MSKServerlessCluster schema"; exit 1; }
+              echo "PASS: no configurationRef/configurationArn fields on the CRD schema; admission succeeded without them"
