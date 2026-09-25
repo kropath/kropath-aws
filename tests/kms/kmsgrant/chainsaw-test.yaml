@@ -1,0 +1,1072 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# aws-kms-03 Chainsaw tests — one scenario per acceptance criterion.
+# Namespace: kmsgrant (fixed). accountId: 123456789012 | region: us-east-1.
+# Effective config is injected via kubectl patch --subresource=status to simulate
+# kropath-controller (which is not running in the local test cluster).
+#
+# Three scenarios (grant-key-mutual-exclusion, grant-key-required, grant-operations-
+# empty) assert status.validationError rather than API-server rejection,
+# grant-configref-fallthrough asserts the ADR-015 "tier empty" behavior rather than a
+# redirect to general-policy, and grant-waits-for-key asserts the child renders
+# immediately with keyID: "" rather than being withheld until the key resolves
+# (KRO-919 includeWhen graph-read safety) — see docs/deferred-capabilities.md §
+# KMSGrant for why.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: kmsgrant
+spec:
+  # Canonical pattern (docs/frequent-rgd-errors.md §"CANONICAL: Unique-Name-Per-Step +
+  # skipDelete"): unique grant name per step, delete nothing between steps.
+  skipDelete: true
+  namespace: kmsgrant
+  steps:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Seed: namespace + general-policy KMSConfig (empty tiers, no restriction) +
+    # app-key KMSKey with a resolved status.keyID.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: seed-general-policy-and-app-key
+      try:
+        - apply:
+            file: 00-kmsgrant-namespace.yaml
+        - apply:
+            file: 01-general-policy-config.yaml
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            file: 02-app-key.yaml
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Key
+              metadata:
+                name: app-key
+                namespace: kmsgrant
+        - script:
+            content: |
+              kubectl patch key app-key -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"keyID":"1234abcd-12ab-34cd-56ef-1234567890ab"}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-1: happy-path: grant-keyref-resolution
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac1-grant-keyref-resolution
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: keyref-resolution
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/snapshot-copier"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: keyref-resolution
+                namespace: kmsgrant
+              spec:
+                keyID: "1234abcd-12ab-34cd-56ef-1234567890ab"
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: keyref-resolution
+                namespace: kmsgrant
+              status:
+                resolvedKeyID: "1234abcd-12ab-34cd-56ef-1234567890ab"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-2: happy-path: grant-keyarn-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac2-grant-keyarn-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: keyarn-passthrough
+                namespace: kmsgrant
+              spec:
+                keyArn: "arn:aws:kms:eu-west-1:111122223333:key/9876fedc-98fe-76dc-54ba-9876543210ba"
+                granteePrincipal: "arn:aws:iam::111122223333:role/snapshot-copier"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: keyarn-passthrough
+                namespace: kmsgrant
+              spec:
+                keyID: "arn:aws:kms:eu-west-1:111122223333:key/9876fedc-98fe-76dc-54ba-9876543210ba"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-3: negative: grant-key-mutual-exclusion (advisory substitute — see header)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac3-grant-key-mutual-exclusion
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: key-mutual-exclusion
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                keyArn: "arn:aws:kms:us-east-1:111122223333:key/aaaa1111-bbbb-2222-cccc-333344445555"
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: key-mutual-exclusion
+                namespace: kmsgrant
+              status:
+                validationError: "keyRef and keyArn are mutually exclusive"
+        - script:
+            content: |
+              set -eu
+              if kubectl get grant key-mutual-exclusion -n kmsgrant >/dev/null 2>&1; then
+                echo "expected no ACK Grant child to be created" >&2
+                exit 1
+              fi
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-4: negative: grant-key-required (advisory substitute — see header)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac4-grant-key-required
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: key-required
+                namespace: kmsgrant
+              spec:
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: key-required
+                namespace: kmsgrant
+              status:
+                validationError: "one of keyRef or keyArn is required"
+        - script:
+            content: |
+              set -eu
+              if kubectl get grant key-required -n kmsgrant >/dev/null 2>&1; then
+                echo "expected no ACK Grant child to be created" >&2
+                exit 1
+              fi
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-5: happy-path: grant-waits-for-key
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac5-grant-waits-for-key
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSKey
+              metadata:
+                name: pending-key
+                namespace: kmsgrant
+                labels:
+                  aws.kropath.run/resource-name: pending-key
+              spec: {}
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: waits-for-key
+                namespace: kmsgrant
+              spec:
+                keyRef: pending-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        # Deviation from the spec's literal AC-5 wording (docs/deferred-capabilities.md
+        # § KMSGrant, flagged in Implementation Reviewer's PR #311 review): the ACK
+        # Grant child is no longer withheld while the key is unresolved — gating
+        # includeWhen on keySrc[0].status.keyID (a sibling KMSKey CR's observed state)
+        # is the exact hazard kropath-core/docs/checklists/pre-review.md's includeWhen
+        # graph-read safety check prohibits (KRO-919): if the referenced KMSKey were
+        # deleted while a KMSGrant still existed, that gate would flip and the instance
+        # could hang in DELETING holding kro.run/finalizer. The Grant CR now renders as
+        # soon as the KMSGrant CR itself is valid, and an unresolved key degrades the
+        # rendered keyID to "" instead of withholding the child.
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: waits-for-key
+                namespace: kmsgrant
+              spec:
+                keyID: ""
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: waits-for-key
+                namespace: kmsgrant
+              status:
+                resolvedKeyID: ""
+        # Wait for kro to render the ACK Key child from the KMSKey CR before patching
+        # its status — under parallel-suite load kro's reconcile of a just-applied CR
+        # is not instantaneous, and patching a child that does not exist yet errors
+        # with NotFound rather than racing cleanly.
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Key
+              metadata:
+                name: pending-key
+                namespace: kmsgrant
+        - script:
+            content: |
+              kubectl patch key pending-key -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"keyID":"aaaa1111-bbbb-2222-cccc-333344445555"}}'
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: waits-for-key
+                namespace: kmsgrant
+              spec:
+                keyID: "aaaa1111-bbbb-2222-cccc-333344445555"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-6: happy-path: grant-basic-passthrough
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac6-grant-basic-passthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: basic-passthrough
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/snapshot-copier"
+                operations: ["Decrypt", "ReEncryptFrom"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: basic-passthrough
+                namespace: kmsgrant
+              spec:
+                granteePrincipal: "arn:aws:iam::111122223333:role/snapshot-copier"
+                operations: ["Decrypt", "ReEncryptFrom"]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-7: happy-path: grant-retiring-principal
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac7-grant-retiring-principal
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: retiring-principal
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                retiringPrincipal: "arn:aws:iam::111122223333:role/key-admin"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: retiring-principal
+                namespace: kmsgrant
+              spec:
+                retiringPrincipal: "arn:aws:iam::111122223333:role/key-admin"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-8: negative: grant-no-retiring-principal — assert key absence, not "".
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac8-grant-no-retiring-principal
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: no-retiring-principal
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: no-retiring-principal
+                namespace: kmsgrant
+        - script:
+            timeout: 60s
+            content: |
+              kubectl get grants.kms.services.k8s.aws no-retiring-principal -n kmsgrant -o json \
+                | jq -e '(.spec | has("retiringPrincipal")) == false'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-9: negative: grant-operations-empty (advisory substitute — see header)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac9-grant-operations-empty
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: operations-empty
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: []
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: operations-empty
+                namespace: kmsgrant
+              status:
+                validationError: "operations must contain at least one entry"
+        - script:
+            content: |
+              set -eu
+              if kubectl get grant operations-empty -n kmsgrant >/dev/null 2>&1; then
+                echo "expected no ACK Grant child to be created" >&2
+                exit 1
+              fi
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-10: happy-path: grant-context-equals
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac10-grant-context-equals
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: context-equals
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+                constraints:
+                  encryptionContextEquals:
+                    tenant: acme
+                    purpose: backup
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: context-equals
+                namespace: kmsgrant
+              spec:
+                constraints:
+                  encryptionContextEquals:
+                    tenant: acme
+                    purpose: backup
+        - script:
+            timeout: 60s
+            content: |
+              kubectl get grants.kms.services.k8s.aws context-equals -n kmsgrant -o json \
+                | jq -e '(.spec.constraints | has("encryptionContextSubset")) == false'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-11: happy-path: grant-context-subset
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac11-grant-context-subset
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: context-subset
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+                constraints:
+                  encryptionContextSubset:
+                    tenant: acme
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: context-subset
+                namespace: kmsgrant
+              spec:
+                constraints:
+                  encryptionContextSubset:
+                    tenant: acme
+        - script:
+            timeout: 60s
+            content: |
+              kubectl get grants.kms.services.k8s.aws context-subset -n kmsgrant -o json \
+                | jq -e '(.spec.constraints | has("encryptionContextEquals")) == false'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-12: negative: grant-no-constraints — assert the whole key is absent.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac12-grant-no-constraints
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: no-constraints
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: no-constraints
+                namespace: kmsgrant
+        - script:
+            timeout: 60s
+            content: |
+              kubectl get grants.kms.services.k8s.aws no-constraints -n kmsgrant -o json \
+                | jq -e '(.spec | has("constraints")) == false'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-13: happy-path: grant-ops-mandatory-allowlist
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac13-grant-ops-mandatory-allowlist
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":["Decrypt","DescribeKey"],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: ops-mandatory-allowlist
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt", "Encrypt", "DescribeKey"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: ops-mandatory-allowlist
+                namespace: kmsgrant
+              spec:
+                operations: ["Decrypt", "DescribeKey"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: ops-mandatory-allowlist
+                namespace: kmsgrant
+              status:
+                droppedOperations: ["Encrypt"]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-14: happy-path: grant-ops-defaults-allowlist
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac14-grant-ops-defaults-allowlist
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":["Decrypt"],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: ops-defaults-allowlist
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt", "CreateGrant"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: ops-defaults-allowlist
+                namespace: kmsgrant
+              spec:
+                operations: ["Decrypt"]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-15: happy-path: grant-ops-no-allowlist
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac15-grant-ops-no-allowlist
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: ops-no-allowlist
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt", "CreateGrant", "RetireGrant"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: ops-no-allowlist
+                namespace: kmsgrant
+              spec:
+                operations: ["Decrypt", "CreateGrant", "RetireGrant"]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-16: negative: grant-ops-empty-intersection (advisory substitute)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac16-grant-ops-empty-intersection
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":["Decrypt"],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: ops-empty-intersection
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Encrypt"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: ops-empty-intersection
+                namespace: kmsgrant
+              status:
+                validationError: "no requested operation in spec.operations is permitted by the allowedGrantOperations policy for this KMSConfig profile"
+        - script:
+            content: |
+              set -eu
+              if kubectl get grant ops-empty-intersection -n kmsgrant >/dev/null 2>&1; then
+                echo "expected no ACK Grant child to be created" >&2
+                exit 1
+              fi
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-17: negative: grant-ops-both-tiers — real CRD-level rejection (KMSConfig is
+    # hand-authored, not RGD-derived). Already covered by tests/kms/kmsconfig ac13;
+    # repeated here so the kmsgrant suite is self-contained (Theme 25).
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac17-grant-ops-both-tiers
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSConfig
+              metadata:
+                name: grant-ops-conflict
+                namespace: kmsgrant
+              spec:
+                mandatory:
+                  allowedGrantOperations: ["Decrypt"]
+                defaults:
+                  allowedGrantOperations: ["Encrypt"]
+            expect:
+              - match:
+                  apiVersion: aws.kropath.run/v1alpha1
+                  kind: KMSConfig
+                check:
+                  ($error != null): true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-18: happy-path: grant-name-derived
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac18-grant-name-derived
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: name-derived
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: name-derived
+                namespace: kmsgrant
+              spec:
+                name: "kmsgrant-name-derived"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-19: happy-path: grant-name-explicit
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac19-grant-name-explicit
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: name-explicit
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+                grantName: "ebs-copy-token"
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: name-explicit
+                namespace: kmsgrant
+              spec:
+                name: "ebs-copy-token"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-20: happy-path: grant-name-ignores-naming-template
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac20-grant-name-ignores-naming-template
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"{namespace}-{name}-kms","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: name-ignores-naming-template
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: name-ignores-naming-template
+                namespace: kmsgrant
+              spec:
+                name: "kmsgrant-name-ignores-naming-template"
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-21: negative: grant-no-naming-fields — inspect the RGD-derived CRD schema.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac21-grant-no-naming-fields
+      try:
+        - script:
+            content: |
+              set -eu
+              kubectl get crd kmsgrants.aws.kropath.run -o json > /tmp/kmsgrant-crd.json
+              jq -e '(.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties | has("nameOverride")) == false' /tmp/kmsgrant-crd.json
+              jq -e '(.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("resourceName")) == false' /tmp/kmsgrant-crd.json
+              jq -e '(.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("predictedArn")) == false' /tmp/kmsgrant-crd.json
+              jq -e '(.spec.versions[0].schema.openAPIV3Schema.properties.status.properties | has("namingStatus")) == false' /tmp/kmsgrant-crd.json
+              rm -f /tmp/kmsgrant-crd.json
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-22: happy-path: grant-tags-merge
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac22-grant-tags-merge
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{"cost-centre":"security","key-type":"encryption"},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: tags-merge
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+                tags:
+                  app: payments
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: tags-merge
+                namespace: kmsgrant
+                labels:
+                  aws.kropath.run/cost-centre: security
+                  aws.kropath.run/key-type: encryption
+                  aws.kropath.run/app: payments
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-23: negative: grant-no-cloud-tags — no spec.tags field on the ACK Grant.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac23-grant-no-cloud-tags
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: no-cloud-tags
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+                tags:
+                  app: payments
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: no-cloud-tags
+                namespace: kmsgrant
+        - script:
+            timeout: 60s
+            content: |
+              kubectl get grants.kms.services.k8s.aws no-cloud-tags -n kmsgrant -o json \
+                | jq -e '(.spec | has("tags")) == false'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-24: happy-path: grant-synced-labels
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac24-grant-synced-labels
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{"environment":"production"},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: synced-labels
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: synced-labels
+                namespace: kmsgrant
+                labels:
+                  aws.kropath.run/environment: production
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-25: happy-path: grant-synced-annotations
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac25-grant-synced-annotations
+      try:
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{"owner":"platform-team"}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: synced-annotations
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: synced-annotations
+                namespace: kmsgrant
+                annotations:
+                  aws.kropath.run/owner: platform-team
+        - script:
+            content: |
+              kubectl patch kmsconfig general-policy -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"effectiveConfig":{"mandatory":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"defaults":{"enableKeyRotation":false,"keySpec":"","keyUsage":"","allowedKeySpecs":[],"allowedGrantOperations":[],"namingTemplate":"","tags":{},"syncedLabels":{},"syncedAnnotations":{}},"aws":{"accountId":"123456789012","region":"us-east-1","partition":"aws"}}}}'
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-26: happy-path: grant-standard-metadata
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac26-grant-standard-metadata
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: standard-metadata
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: standard-metadata
+                namespace: kmsgrant
+                labels:
+                  app.kubernetes.io/managed-by: kro
+                  app.kubernetes.io/instance: standard-metadata
+                ownerReferences:
+                  - apiVersion: aws.kropath.run/v1alpha1
+                    kind: KMSGrant
+                    name: standard-metadata
+                    controller: true
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-27: happy-path: grant-deletion-retain (default)
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac27-grant-deletion-retain
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: deletion-retain
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: deletion-retain
+                namespace: kmsgrant
+                annotations:
+                  services.k8s.aws/deletion-policy: retain
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-28: happy-path: grant-deletion-delete
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac28-grant-deletion-delete
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: deletion-delete
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+                deletionPolicy: delete
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: deletion-delete
+                namespace: kmsgrant
+                annotations:
+                  services.k8s.aws/deletion-policy: delete
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-29: happy-path: grant-status-outputs
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac29-grant-status-outputs
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: status-outputs
+                namespace: kmsgrant
+              spec:
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: status-outputs
+                namespace: kmsgrant
+        - script:
+            content: |
+              kubectl patch grants.kms.services.k8s.aws status-outputs -n kmsgrant \
+                --subresource=status --type=merge \
+                -p '{"status":{"grantID":"0c237476b39f8bc44e45","grantToken":"AQpAM2RmZmY3ZjFhYjEyM2..."}}'
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: status-outputs
+                namespace: kmsgrant
+              status:
+                grantID: "0c237476b39f8bc44e45"
+                grantToken: "AQpAM2RmZmY3ZjFhYjEyM2..."
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # AC-30: happy-path: grant-configref-fallthrough — adjusted per the ADR-015
+    # deviation (docs/deferred-capabilities.md § KMSGrant): an unresolvable
+    # configRef makes the governance tier empty, not a redirect to general-policy.
+    # ──────────────────────────────────────────────────────────────────────────
+    - name: ac30-grant-configref-fallthrough
+      try:
+        - apply:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: configref-fallthrough
+                namespace: kmsgrant
+              spec:
+                configRef: does-not-exist
+                keyRef: app-key
+                granteePrincipal: "arn:aws:iam::111122223333:role/x"
+                operations: ["Decrypt", "Encrypt"]
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: configref-fallthrough
+                namespace: kmsgrant
+              spec:
+                operations: ["Decrypt", "Encrypt"]
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: configref-fallthrough
+                namespace: kmsgrant
+              status:
+                droppedOperations: []
+                validationError: ""
