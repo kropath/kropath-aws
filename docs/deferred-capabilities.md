@@ -314,4 +314,49 @@ ADR-015 to permit an RGD-level fallback chain (repo-wide change, well beyond thi
 the `aws-kms-03-kmsgrant.md` spec's AC-30 to match the platform-wide "tier empty" behavior. Flagged
 on KRO-1235 for Design Reviewer / human disposition.
 
-**Spec reference:** `kropath-core/docs/specs/aws/aws-kms-03-kmsgrant.md` — AC-3, AC-4, AC-9, AC-30.
+### AC-5 — withholding the ACK `Grant` child until `keyRef` resolves
+
+**Spec requirement:** when `spec.keyRef` points to a `KMSKey` whose `status.keyID` is not yet
+populated, no ACK `Grant` child CR should be created; the child should appear once the key
+resolves.
+
+**Blocking constraint:** not a kro/ACK limitation — an `includeWhen` graph-read safety violation
+(KRO-919 class), caught in Implementation Reviewer's PR #311 review. The only way to implement
+"no child until X" is to make X part of the `includeWhen` gate that selects which of the 8
+variants renders. But `keyRef` resolution requires reading `keySrc[0].status.keyID` — the
+*observed state* of an independently-lifecycled sibling `KMSKey` CR, not `schema.spec` or
+resolved config. `kropath-core/docs/checklists/pre-review.md`'s "includeWhen graph-read safety
+check" prohibits exactly this: a structural gate that reads a sibling node cannot be safely
+evaluated during that sibling's teardown — if `KMSKey/app-key` were deleted while a `KMSGrant`
+still referenced it, the gate would flip `false` on the next reconcile and kro would try to
+un-render an already-materialized variant, which is the "hangs in `DELETING` holding
+`kro.run/finalizer`, never self-heals" failure mode KRO-919 documents (same class as the
+`snssubscription.aws.kropath.run.yaml` `dlqCr` fix in
+`docs/troubleshooting-logs/2026-09-24-snssubscription-includewhen-graph-read-unsafe.md`).
+
+**Current behaviour:** `rgds/kmsgrant.aws.kropath.run.yaml`'s `childShouldExist` (the `includeWhen`
+gate) is schema/resolved-config-only — it no longer reads `keySrc`. The ACK `Grant` child now
+renders as soon as the `KMSGrant` CR itself is valid (key reference set, operations non-empty and
+allowlist-permitted), regardless of whether `keyRef` has resolved yet. `keySrc` is still read, but
+only in the `keyID` *template value* (`resolvedKeyID` in the `gate` ConfigMap) — an unresolved or
+subsequently-deleted key degrades the rendered `keyID` to `""` (mirrored on
+`status.resolvedKeyID`) instead of toggling the child's existence. Same tradeoff already accepted
+for `rgds/acmprivatecertificate.aws.kropath.run.yaml`'s `certificateAuthorityRef` (documented in
+`docs/frequent-rgd-errors.md`'s "Variant-Split Resources..." section: "`acmprivatecertificate`
+was not [gated on readiness]: its gate enforced 'exactly one of ARN/Ref is set' but not 'the
+referenced CA resolved'... an unresolved `caRefCr` fell through to `""`").
+
+Verified live: applying a `KMSGrant` with `keyRef` pointing at an unresolved `KMSKey` produces an
+ACK `Grant` child immediately with `spec.keyID: ""` and `status.resolvedKeyID: ""`; patching the
+key's `status.keyID` updates `spec.keyID` on the existing child (no re-create); deleting the
+referenced `KMSKey` afterward leaves the `Grant` child's `spec.keyID` unchanged (confirmed the
+KRO-919 hazard no longer applies — the child's existence is stable regardless of the sibling's
+lifecycle).
+
+**To unblock:** none needed — this is the correct, permanent behavior for kro v0.9.2's
+`includeWhen` model, not a version-gated limitation. Re-open only if kro adds a supported way to
+express "structural existence contingent on a sibling's resolved state" without the teardown
+hazard.
+
+**Spec reference:** `kropath-core/docs/specs/aws/aws-kms-03-kmsgrant.md` — AC-3, AC-4, AC-5, AC-9,
+AC-30.

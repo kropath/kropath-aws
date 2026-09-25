@@ -17,10 +17,13 @@
 # Effective config is injected via kubectl patch --subresource=status to simulate
 # kropath-controller (which is not running in the local test cluster).
 #
-# Two scenarios (grant-key-mutual-exclusion, grant-key-required, grant-operations-
-# empty) assert status.validationError rather than API-server rejection, and
+# Three scenarios (grant-key-mutual-exclusion, grant-key-required, grant-operations-
+# empty) assert status.validationError rather than API-server rejection,
 # grant-configref-fallthrough asserts the ADR-015 "tier empty" behavior rather than a
-# redirect to general-policy — see docs/deferred-capabilities.md § KMSGrant for why.
+# redirect to general-policy, and grant-waits-for-key asserts the child renders
+# immediately with keyID: "" rather than being withheld until the key resolves
+# (KRO-919 includeWhen graph-read safety) — see docs/deferred-capabilities.md §
+# KMSGrant for why.
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
@@ -214,18 +217,34 @@ spec:
                 keyRef: pending-key
                 granteePrincipal: "arn:aws:iam::111122223333:role/x"
                 operations: ["Decrypt"]
-        # No intermediate assert on status.resolvedKeyID == "" here — that window can
-        # close within the same reconcile pass under fast/local-cluster timing (no real
-        # AWS latency), making a status-field assert racy. Existence of the ACK Grant
-        # child is the stable signal for "not yet resolved" (mirrors rgds/kmskey.yaml
-        # AC-11's no-Alias-yet check, which uses the same existence-only pattern).
-        - script:
-            content: |
-              set -eu
-              if kubectl get grant waits-for-key -n kmsgrant >/dev/null 2>&1; then
-                echo "expected no ACK Grant child before the key resolves" >&2
-                exit 1
-              fi
+        # Deviation from the spec's literal AC-5 wording (docs/deferred-capabilities.md
+        # § KMSGrant, flagged in Implementation Reviewer's PR #311 review): the ACK
+        # Grant child is no longer withheld while the key is unresolved — gating
+        # includeWhen on keySrc[0].status.keyID (a sibling KMSKey CR's observed state)
+        # is the exact hazard kropath-core/docs/checklists/pre-review.md's includeWhen
+        # graph-read safety check prohibits (KRO-919): if the referenced KMSKey were
+        # deleted while a KMSGrant still existed, that gate would flip and the instance
+        # could hang in DELETING holding kro.run/finalizer. The Grant CR now renders as
+        # soon as the KMSGrant CR itself is valid, and an unresolved key degrades the
+        # rendered keyID to "" instead of withholding the child.
+        - assert:
+            resource:
+              apiVersion: kms.services.k8s.aws/v1alpha1
+              kind: Grant
+              metadata:
+                name: waits-for-key
+                namespace: kmsgrant
+              spec:
+                keyID: ""
+        - assert:
+            resource:
+              apiVersion: aws.kropath.run/v1alpha1
+              kind: KMSGrant
+              metadata:
+                name: waits-for-key
+                namespace: kmsgrant
+              status:
+                resolvedKeyID: ""
         # Wait for kro to render the ACK Key child from the KMSKey CR before patching
         # its status — under parallel-suite load kro's reconcile of a just-applied CR
         # is not instantaneous, and patching a child that does not exist yet errors

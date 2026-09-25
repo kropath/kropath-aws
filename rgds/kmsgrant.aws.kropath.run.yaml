@@ -44,6 +44,15 @@
 #      existing RGD in this repo follows that (single lookup, `.orValue("general-
 #      policy")` only for an *empty* configRef). Implemented per ADR-015: an
 #      unresolvable configRef makes the governance tier empty, not a second lookup.
+#   3. AC-5 asks for "no ACK Grant child CR until keySrc.status.keyID resolves".
+#      Gating child existence (includeWhen) on a sibling KMSKey CR's observed status
+#      is the exact hazard kropath-core/docs/checklists/pre-review.md's "includeWhen
+#      graph-read safety check" prohibits (KRO-919) — flagged in Implementation
+#      Reviewer's PR #311 review. childShouldExist is schema/resolved-config-only;
+#      the Grant CR now renders as soon as the KMSGrant CR itself is valid, and an
+#      unresolved keyRef degrades the rendered keyID to "" (status.resolvedKeyID
+#      mirrors it) instead of withholding the child. Same tradeoff already accepted
+#      for rgds/acmprivatecertificate.aws.kropath.run.yaml's certificateAuthorityRef.
 #
 # Config lookup: selector.matchLabels (Theme 28 / KRO-221) — CEL not evaluated in
 # externalRef.metadata.name. rsrcCfg/keySrc/ackGrantRef are lists; always guard with
@@ -209,12 +218,25 @@ spec:
                       : [])))
               ).join(",")}
           # "Exactly one of keyRef/keyArn" via XOR ternary, ANDed with operations
-          # non-empty, key actually resolved (AC-5), and the allowlist intersection
-          # non-empty (AC-16). Advisory substitute for x-kubernetes-validations.
+          # non-empty and the allowlist intersection non-empty (AC-16). Advisory
+          # substitute for x-kubernetes-validations. Deliberately schema/resolved-
+          # config-only (KRO-919 / kropath-core/docs/checklists/pre-review.md
+          # "includeWhen graph-read safety check") — does NOT read keySrc here. A
+          # gate used as includeWhen must never depend on an independently-
+          # lifecycled sibling CR's observed status: if it did, deleting the
+          # referenced KMSKey while a KMSGrant still exists would flip this false
+          # on the next reconcile, and kro would try to un-render an already-
+          # materialized variant, which is the exact "hangs in DELETING holding
+          # kro.run/finalizer" failure mode KRO-919 documents. keySrc is read only
+          # in the resolvedKeyID *value* below (template-value position, not a
+          # structural gate) so an unresolved/vanished key degrades the rendered
+          # keyID to "" instead of toggling the child's existence — mirrors
+          # rgds/acmprivatecertificate.aws.kropath.run.yaml's caRefCr handling and
+          # the redrivePolicy fix in docs/troubleshooting-logs/2026-09-24-
+          # snssubscription-includewhen-graph-read-unsafe.md.
           childShouldExist: >-
             ${((schema.spec.keyRef == "" ? schema.spec.keyArn != "" : schema.spec.keyArn == "")
                 && size(schema.spec.operations) > 0
-                && (schema.spec.keyArn != "" || (keySrc.size() > 0 && keySrc[0].?status.?keyID.orValue("") != ""))
                 && schema.spec.operations.filter(op,
                      size((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && size(rsrcCfg[0].status.effectiveConfig.mandatory.?allowedGrantOperations.orValue([])) > 0)
                        ? rsrcCfg[0].status.effectiveConfig.mandatory.allowedGrantOperations
