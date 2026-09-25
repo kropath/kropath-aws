@@ -1,0 +1,618 @@
+# Copyright 2026 kropath Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# CloudFrontDistributionTenant RGD — wraps ACK cloudfront.services.k8s.aws/DistributionTenant.
+# Attaches a per-tenant domain/certificate/geo/WAF customization set to a multi-tenant
+# CloudFrontDistribution via a CloudFrontConnectionGroup. Closes gap N-10 (KRO-1210).
+#
+# Spec-vs-schema note (same resolution as cloudfrontconnectiongroup.yaml/cloudfrontvpcorigin.yaml):
+# no raw `spec.name` field — `nameOverride` + naming template drive `effectiveName`, which becomes
+# the immutable ACK child `spec.name` (`self == oldSelf`, confirmed live via
+# `kubectl get crd distributiontenants.cloudfront.services.k8s.aws`). No AC exercises a raw `name`
+# field; this RGD does not attempt to work around a post-creation namingTemplate change being
+# rejected on the child (AC-18) — that rejection is expected/ACK-enforced behavior.
+#
+# OQ-1 resolution (verified against the live merged cloudfrontdistribution RGD, not just the spec
+# prose): CloudFrontDistribution surfaces the CloudFront-assigned ID as `status.distributionId`,
+# NOT `status.id` as the spec's CEL snippet shows. `resolvedDistributionID` below reads
+# `parentDistribution[0].status.distributionId`.
+#
+# Optional sub-tree omission (frequent-rgd-errors §"Monolithic Object Gating via Ternary Loops" /
+# KRO-902 family): `customizations` and `managedCertificateRequest` are optional object sub-trees
+# with no managed AWS default and must be entirely ABSENT from the child when unconfigured — kro
+# v0.9.2 cannot conditionally omit a nested object key via ternary (`optional.none()` in write
+# position is rejected), so the ACK child is split into 5 mutually-exclusive `includeWhen` variants
+# covering the 3 independent presence dimensions (certificate / managedCertificateRequest /
+# "other customizations" i.e. geoRestrictions+webACL), collapsed from a theoretical 8 down to 5 by
+# the AC-8 mutual-exclusion invariant (certificate and managedCertificateRequest can never both be
+# set once validationErrorCm blocks that combination):
+#   ackTenantCert                    — certificate.arn set (managedCertificateRequest never set here)
+#   ackTenantManagedCertWithExtras   — managedCertificateRequest set + geoRestriction/webACL non-trivial
+#   ackTenantManagedCertOnly         — managedCertificateRequest set, no other customizations
+#   ackTenantNoCertWithExtras        — neither cert source set, geoRestriction/webACL non-trivial
+#   ackTenantBare                    — nothing set (AC-10): customizations AND managedCertificateRequest absent
+# geoRestrictions/webACL are never independently split within `customizations` — no AC requires
+# them individually omitted, and geoRestrictionType is governed (near-always resolves to a non-empty
+# value via defaults), so they are rendered together whenever `customizations` itself is included.
+# `parameters` is a plain `[]TenantParameter` list — an empty list is a valid, non-"malformed" value
+# in CEL/kro (unlike an object with all-empty leaves), so it needs no variant split; it is passed
+# through directly.
+#
+# Domains cannot be validated for "at least one entry" via real CRD admission — kro v0.9.2
+# SimpleSchema has no minItems= marker (confirmed absent repo-wide; see
+# rgds/rdsproxy.aws.kropath.run.yaml header). Handled via the in-graph ConfigMap advisory pattern
+# (validationErrorCm below), which also carries the AC-8 mutual-exclusivity message (verbatim) and
+# the AC-7 sibling-ref-unresolved / AC-13 webACLRequired-gate errors — one aggregated advisory
+# ConfigMap, mirroring rgds/rdsproxy.aws.kropath.run.yaml's `validationErrorCm`, rather than one
+# ConfigMap per check.
+#
+# Tagged resource (ADR-015 §6.1): DistributionTenant supports cloud tags (`spec.tags`, array of
+# {key,value} — confirmed against the live ACK CRD, not map[string]string). syncedLabels/
+# syncedAnnotations apply to BOTH metadata.labels/annotations (aws.kropath.run/ prefixed) AND the
+# cloud tags list (plain keys), same dual-location pattern as cloudfrontconnectiongroup.yaml.
+#
+# domains[] is passed through verbatim — NOT name-templated (AC-19); these are real operator-owned
+# DNS names, unlike the naming-template-driven `name` field.
+#
+# Spec: kropath-core/docs/specs/aws/aws-cloudfront-10-cloudfrontdistributiontenant.md
+---
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cloudfrontdistributiontenant.aws.kropath.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: aws.kropath.run
+    kind: CloudFrontDistributionTenant
+    scope: Namespaced
+    spec:
+      configRef: string | default=general-policy
+      nameOverride: string | default=""
+      deletionPolicy: string | default=retain
+      domains: "[]TenantDomain | required=true"
+      distributionID: string | default=""
+      distributionRef: string | default=""
+      connectionGroupID: string | default=""
+      connectionGroupRef: string | default=""
+      enabled: boolean
+      customizations:
+        certificate:
+          arn: string | default=""
+        geoRestrictions:
+          restrictionType: string | default=""
+          locations: "[]string | default=[]"
+        webACL:
+          arn: string | default=""
+          action: string | default=""
+      managedCertificateRequest:
+        primaryDomainName: string | default=""
+        validationTokenHost: string | default=""
+        certificateTransparencyLoggingPreference: string | default=""
+      parameters: "[]TenantParameter | default=[]"
+      tags: map[string]string | default={}
+      syncedLabels: map[string]string | default={}
+      syncedAnnotations: map[string]string | default={}
+    types:
+      TenantDomain:
+        domain: string | default=""
+      TenantParameter:
+        name: string | default=""
+        value: string | default=""
+    status:
+      resourceName: >-
+        ${naming.data.resourceName}
+      namingStatus: >-
+        ${naming.data.namingStatus}
+      id: >-
+        ${ackTenantRef.size() > 0 ? ackTenantRef[0].?status.?id.orValue("") : ""}
+      validationError: >-
+        ${validationErrorCm.data.error}
+      conditions: >-
+        ${ackTenantRef.size() > 0 ? ackTenantRef[0].?status.?conditions.orValue([]) : []}
+    additionalPrinterColumns:
+      - name: ResourceName
+        type: string
+        jsonPath: .status.resourceName
+      - name: TenantID
+        type: string
+        jsonPath: .status.id
+      - name: ValidationError
+        type: string
+        jsonPath: .status.validationError
+
+  resources:
+    # Governance config lookup — single effCfg pattern (ADR-010, Theme 28).
+    # rsrcCfg is a list; always use rsrcCfg.size() > 0 guard before accessing rsrcCfg[0].
+    - id: rsrcCfg
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontConfig
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: ${schema.?spec.?configRef.orValue("general-policy")}
+
+    # Sibling CloudFrontDistribution ref resolution (OD-3, ref wins).
+    # Sentinel: when distributionRef is "", selector matches kro-empty-fallback-sentinel → [].
+    - id: parentDistribution
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontDistribution
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.distributionRef != "" ? schema.spec.distributionRef : "kro-empty-fallback-sentinel"}'
+
+    # Sibling CloudFrontConnectionGroup ref resolution (OD-3, ref wins).
+    - id: parentConnectionGroup
+      externalRef:
+        apiVersion: aws.kropath.run/v1alpha1
+        kind: CloudFrontConnectionGroup
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              aws.kropath.run/resource-name: '${schema.spec.connectionGroupRef != "" ? schema.spec.connectionGroupRef : "kro-empty-fallback-sentinel"}'
+
+    # Naming ConfigMap: resolves effectiveName (nameOverride > mandatory template > defaults
+    # template > "{namespace}-{name}") with {tag.X} token substitution, plus the sibling-ref-wins
+    # ID resolutions and the reused geoRestrictionType governance cascade — computed once here so
+    # every ACK child variant below reads the same resolved values.
+    - id: naming
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-naming
+          namespace: ${schema.metadata.namespace}
+          labels:
+            aws.kropath.run/resource-name: ${schema.metadata.name}
+            aws.kropath.run/kropath-type: cloudfrontdistributiontenant-naming
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistributionTenant
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          resourceName: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef))}
+          namingStatus: >-
+            ${((schema.spec.nameOverride != ""
+              ? schema.spec.nameOverride
+              : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?namingTemplate.orValue("") != "")
+                  ? rsrcCfg[0].status.effectiveConfig.mandatory.namingTemplate
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && rsrcCfg[0].status.effectiveConfig.defaults.?namingTemplate.orValue("") != "")
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.namingTemplate
+                      : "{namespace}-{name}")))
+              .split("{tag.")
+              .transformList(i, part,
+                i == 0 ? part
+                : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.tags
+                      ? rsrcCfg[0].status.effectiveConfig.mandatory.tags[part.split("}")[0]]
+                      : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({})
+                          ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels[part.split("}")[0]]
+                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({})
+                              ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations[part.split("}")[0]]
+                              : (part.split("}")[0] in schema.spec.tags
+                                  ? schema.spec.tags[part.split("}")[0]]
+                                  : (part.split("}")[0] in schema.spec.syncedLabels
+                                      ? schema.spec.syncedLabels[part.split("}")[0]]
+                                      : (part.split("}")[0] in schema.spec.syncedAnnotations
+                                          ? schema.spec.syncedAnnotations[part.split("}")[0]]
+                                          : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.tags
+                                              ? rsrcCfg[0].status.effectiveConfig.defaults.tags[part.split("}")[0]]
+                                              : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({})
+                                                  ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels[part.split("}")[0]]
+                                                  : (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults) && part.split("}")[0] in rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({})
+                                                      ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations[part.split("}")[0]]
+                                                      : "{tag." + part.split("}")[0] + "}")))))))))
+                  + (size(part.split("}")) > 1
+                      ? part.split("}").slice(1, size(part.split("}"))).join("}")
+                      : "")))
+              .join("")
+              .replace("{name}", schema.metadata.name)
+              .replace("{namespace}", schema.metadata.namespace)
+              .replace("{account_id}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?accountId.orValue("{account_id}") : "{account_id}")
+              .replace("{region}", (rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.aws.?region.orValue("{region}") : "{region}")
+              .replace("{configRef}", schema.spec.configRef)).contains("{")
+              ? "invalid-unresolved-tokens"
+              : "valid"}
+          resolvedDistributionID: >-
+            ${schema.spec.distributionRef != ""
+              ? (parentDistribution.size() > 0 ? parentDistribution[0].?status.?distributionId.orValue("") : "")
+              : schema.spec.distributionID}
+          resolvedConnectionGroupID: >-
+            ${schema.spec.connectionGroupRef != ""
+              ? (parentConnectionGroup.size() > 0 ? parentConnectionGroup[0].?status.?id.orValue("") : "")
+              : schema.spec.connectionGroupID}
+          resolvedGeoRestrictionType: >-
+            ${(rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory) && rsrcCfg[0].status.effectiveConfig.mandatory.?geoRestrictionType.orValue("") != "")
+              ? rsrcCfg[0].status.effectiveConfig.mandatory.geoRestrictionType
+              : (schema.spec.customizations.geoRestrictions.restrictionType != ""
+                  ? schema.spec.customizations.geoRestrictions.restrictionType
+                  : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults))
+                      ? rsrcCfg[0].status.effectiveConfig.defaults.?geoRestrictionType.orValue("")
+                      : ""))}
+
+    # Advisory ConfigMap — always created (never includeWhen-gated, so status.validationError can
+    # reference it directly with no Unbound Variable Freeze risk). data.error is "" when the
+    # instance is valid: at least one domain, sibling refs resolve, certificate sources are not
+    # both set, and webACLRequired (if mandatory) is satisfied.
+    - id: validationErrorCm
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-validation-error
+          namespace: ${schema.metadata.namespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            app.kubernetes.io/instance: ${schema.metadata.name}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistributionTenant
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        data:
+          error: >-
+            ${size(schema.spec.domains) == 0
+              ? "spec.domains requires at least one entry"
+              : ((schema.spec.customizations.certificate.arn != "" && (schema.spec.managedCertificateRequest.primaryDomainName != "" || schema.spec.managedCertificateRequest.validationTokenHost != "" || schema.spec.managedCertificateRequest.certificateTransparencyLoggingPreference != ""))
+                  ? "customizations.certificate.arn and managedCertificateRequest are mutually exclusive certificate sources"
+                  : ((schema.spec.distributionRef != "" && parentDistribution.size() == 0)
+                      ? "spec.distributionRef '" + schema.spec.distributionRef + "' did not resolve to an existing CloudFrontDistribution"
+                      : ((schema.spec.connectionGroupRef != "" && parentConnectionGroup.size() == 0)
+                          ? "spec.connectionGroupRef '" + schema.spec.connectionGroupRef + "' did not resolve to an existing CloudFrontConnectionGroup"
+                          : ((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && rsrcCfg[0].status.effectiveConfig.mandatory.?webACLRequired.orValue(false) && schema.spec.customizations.webACL.arn == "")
+                              ? "webACLRequired is true but customizations.webACL.arn is empty — a WAF WebACL ARN is required for this tenant"
+                              : ""))))}
+
+    # ACK DistributionTenant — variant: certificate.arn set (customizations WITH certificate,
+    # always paired with geoRestrictions+webACL; managedCertificateRequest never set here — the
+    # mutual-exclusion gate above already blocks the combination that would allow both).
+    - id: ackTenantCert
+      includeWhen:
+        - >-
+          ${!naming.data.resourceName.contains("{") && validationErrorCm.data.error == "" && schema.spec.customizations.certificate.arn != ""}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: DistributionTenant
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistributionTenant
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          domains: ${schema.spec.domains}
+          distributionID: "${naming.data.resolvedDistributionID}"
+          connectionGroupID: "${naming.data.resolvedConnectionGroupID}"
+          enabled: '${has(schema.spec.enabled) ? schema.spec.enabled : true}'
+          parameters: ${schema.spec.parameters}
+          customizations:
+            certificate:
+              arn: "${schema.spec.customizations.certificate.arn}"
+            geoRestrictions:
+              restrictionType: "${naming.data.resolvedGeoRestrictionType}"
+              locations: ${schema.spec.customizations.geoRestrictions.locations}
+            webACL:
+              arn: "${schema.spec.customizations.webACL.arn}"
+              action: "${schema.spec.customizations.webACL.action}"
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK DistributionTenant — variant: managedCertificateRequest set + geoRestriction/webACL
+    # non-trivial (customizations present WITHOUT certificate; managedCertificateRequest present).
+    - id: ackTenantManagedCertWithExtras
+      includeWhen:
+        - >-
+          ${!naming.data.resourceName.contains("{") && validationErrorCm.data.error == "" && schema.spec.customizations.certificate.arn == "" && (schema.spec.managedCertificateRequest.primaryDomainName != "" || schema.spec.managedCertificateRequest.validationTokenHost != "" || schema.spec.managedCertificateRequest.certificateTransparencyLoggingPreference != "") && (naming.data.resolvedGeoRestrictionType != "" || size(schema.spec.customizations.geoRestrictions.locations) > 0 || schema.spec.customizations.webACL.arn != "" || schema.spec.customizations.webACL.action != "")}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: DistributionTenant
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistributionTenant
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          domains: ${schema.spec.domains}
+          distributionID: "${naming.data.resolvedDistributionID}"
+          connectionGroupID: "${naming.data.resolvedConnectionGroupID}"
+          enabled: '${has(schema.spec.enabled) ? schema.spec.enabled : true}'
+          parameters: ${schema.spec.parameters}
+          customizations:
+            geoRestrictions:
+              restrictionType: "${naming.data.resolvedGeoRestrictionType}"
+              locations: ${schema.spec.customizations.geoRestrictions.locations}
+            webACL:
+              arn: "${schema.spec.customizations.webACL.arn}"
+              action: "${schema.spec.customizations.webACL.action}"
+          managedCertificateRequest:
+            primaryDomainName: "${schema.spec.managedCertificateRequest.primaryDomainName}"
+            validationTokenHost: "${schema.spec.managedCertificateRequest.validationTokenHost}"
+            certificateTransparencyLoggingPreference: "${schema.spec.managedCertificateRequest.certificateTransparencyLoggingPreference}"
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK DistributionTenant — variant: managedCertificateRequest set, no other customizations
+    # (customizations key entirely absent; managedCertificateRequest present).
+    - id: ackTenantManagedCertOnly
+      includeWhen:
+        - >-
+          ${!naming.data.resourceName.contains("{") && validationErrorCm.data.error == "" && schema.spec.customizations.certificate.arn == "" && (schema.spec.managedCertificateRequest.primaryDomainName != "" || schema.spec.managedCertificateRequest.validationTokenHost != "" || schema.spec.managedCertificateRequest.certificateTransparencyLoggingPreference != "") && !(naming.data.resolvedGeoRestrictionType != "" || size(schema.spec.customizations.geoRestrictions.locations) > 0 || schema.spec.customizations.webACL.arn != "" || schema.spec.customizations.webACL.action != "")}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: DistributionTenant
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistributionTenant
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          domains: ${schema.spec.domains}
+          distributionID: "${naming.data.resolvedDistributionID}"
+          connectionGroupID: "${naming.data.resolvedConnectionGroupID}"
+          enabled: '${has(schema.spec.enabled) ? schema.spec.enabled : true}'
+          parameters: ${schema.spec.parameters}
+          managedCertificateRequest:
+            primaryDomainName: "${schema.spec.managedCertificateRequest.primaryDomainName}"
+            validationTokenHost: "${schema.spec.managedCertificateRequest.validationTokenHost}"
+            certificateTransparencyLoggingPreference: "${schema.spec.managedCertificateRequest.certificateTransparencyLoggingPreference}"
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK DistributionTenant — variant: neither certificate source set, geoRestriction/webACL
+    # non-trivial (customizations present WITHOUT certificate; managedCertificateRequest absent).
+    - id: ackTenantNoCertWithExtras
+      includeWhen:
+        - >-
+          ${!naming.data.resourceName.contains("{") && validationErrorCm.data.error == "" && schema.spec.customizations.certificate.arn == "" && schema.spec.managedCertificateRequest.primaryDomainName == "" && schema.spec.managedCertificateRequest.validationTokenHost == "" && schema.spec.managedCertificateRequest.certificateTransparencyLoggingPreference == "" && (naming.data.resolvedGeoRestrictionType != "" || size(schema.spec.customizations.geoRestrictions.locations) > 0 || schema.spec.customizations.webACL.arn != "" || schema.spec.customizations.webACL.action != "")}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: DistributionTenant
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistributionTenant
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          domains: ${schema.spec.domains}
+          distributionID: "${naming.data.resolvedDistributionID}"
+          connectionGroupID: "${naming.data.resolvedConnectionGroupID}"
+          enabled: '${has(schema.spec.enabled) ? schema.spec.enabled : true}'
+          parameters: ${schema.spec.parameters}
+          customizations:
+            geoRestrictions:
+              restrictionType: "${naming.data.resolvedGeoRestrictionType}"
+              locations: ${schema.spec.customizations.geoRestrictions.locations}
+            webACL:
+              arn: "${schema.spec.customizations.webACL.arn}"
+              action: "${schema.spec.customizations.webACL.action}"
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # ACK DistributionTenant — variant: nothing configured (AC-10). Both customizations AND
+    # managedCertificateRequest keys are entirely absent from the child.
+    - id: ackTenantBare
+      includeWhen:
+        - >-
+          ${!naming.data.resourceName.contains("{") && validationErrorCm.data.error == "" && schema.spec.customizations.certificate.arn == "" && schema.spec.managedCertificateRequest.primaryDomainName == "" && schema.spec.managedCertificateRequest.validationTokenHost == "" && schema.spec.managedCertificateRequest.certificateTransparencyLoggingPreference == "" && !(naming.data.resolvedGeoRestrictionType != "" || size(schema.spec.customizations.geoRestrictions.locations) > 0 || schema.spec.customizations.webACL.arn != "" || schema.spec.customizations.webACL.action != "")}
+      template:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: DistributionTenant
+        metadata:
+          name: ${schema.metadata.name}
+          namespace: ${schema.metadata.namespace}
+          labels: >-
+            ${{"app.kubernetes.io/managed-by": "kro", "app.kubernetes.io/instance": schema.metadata.name,
+               "aws.kropath.run/resource-name": schema.metadata.name}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedLabels.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          annotations: >-
+            ${{"services.k8s.aws/deletion-policy": schema.spec.deletionPolicy}
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.defaults.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})
+              .merge(schema.spec.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}))
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig) && has(rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations)) ? rsrcCfg[0].status.effectiveConfig.mandatory.syncedAnnotations.transformMapEntry(k, v, {"aws.kropath.run/" + k: v}) : {})}
+          ownerReferences:
+            - apiVersion: aws.kropath.run/v1alpha1
+              kind: CloudFrontDistributionTenant
+              name: ${schema.metadata.name}
+              uid: ${schema.metadata.uid}
+              controller: true
+              blockOwnerDeletion: true
+        spec:
+          name: ${naming.data.resourceName}
+          domains: ${schema.spec.domains}
+          distributionID: "${naming.data.resolvedDistributionID}"
+          connectionGroupID: "${naming.data.resolvedConnectionGroupID}"
+          enabled: '${has(schema.spec.enabled) ? schema.spec.enabled : true}'
+          parameters: ${schema.spec.parameters}
+          tags: >-
+            ${(((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.defaults.?syncedAnnotations.orValue({}) : {})
+              .merge(schema.spec.tags)
+              .merge(schema.spec.syncedLabels)
+              .merge(schema.spec.syncedAnnotations)
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?tags.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedLabels.orValue({}) : {})
+              .merge((rsrcCfg.size() > 0 && has(rsrcCfg[0].status.effectiveConfig)) ? rsrcCfg[0].status.effectiveConfig.mandatory.?syncedAnnotations.orValue({}) : {}))
+              .transformList(k, v, {"key": k, "value": v})
+              .sortBy(x, x.key)}
+
+    # Always-bound self-lookup of this instance's own ACK child, used exclusively by status:
+    # above. An externalRef is never excluded by includeWhen — it resolves to [] until the
+    # child exists — so status keeps one stable field per value no matter which variant fired.
+    - id: ackTenantRef
+      externalRef:
+        apiVersion: cloudfront.services.k8s.aws/v1alpha1
+        kind: DistributionTenant
+        metadata:
+          namespace: ${schema.metadata.namespace}
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${schema.metadata.name}
