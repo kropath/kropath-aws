@@ -43,19 +43,22 @@ kropath-aws adds a governance layer on top:
 
 ## How it works
 
-```
-        ┌──────────────────────┐        ┌───────────────────────┐
-        │   KropathConfig      │        │  <Service>Config      │
-        │  (org / namespace)   │        │  (per resource type)  │
-        └──────────┬───────────┘        └───────────┬───────────┘
-                   │      mandatory / defaults / aws│
-                   └───────────────┬────────────────┘
-                                   │  status.effectiveConfig
-                                   ▼
-   ┌─────────────┐        ┌──────────────────┐        ┌──────────────────┐
-   │  S3Bucket   │───────▶│  kro RGD         │───────▶│  ACK Bucket CR   │──▶ AWS
-   │  (user CR)  │        │  (rgds/*.yaml)   │        │  (s3.services…)  │
-   └─────────────┘        └──────────────────┘        └──────────────────┘
+```mermaid
+flowchart TD
+    KC["KropathConfig<br/>org / namespace"]
+    SVC["&lt;Service&gt;Config<br/>per resource type"]
+    EFF["status.effectiveConfig<br/>mandatory / defaults / aws"]
+    CR["S3Bucket<br/>(user CR)"]
+    RGD["kro RGD<br/>rgds/*.yaml"]
+    ACK["ACK Bucket CR<br/>s3.services.k8s.aws"]
+    AWSCloud(["AWS"])
+
+    KC --> EFF
+    SVC --> EFF
+    EFF -->|externalRef lookup| RGD
+    CR --> RGD
+    RGD --> ACK
+    ACK --> AWSCloud
 ```
 
 Key conventions:
@@ -76,18 +79,18 @@ the canonical `kropath-core/docs/standards/engineering-standards.md`.
 
 | Path | Contents |
 |---|---|
-| `rgds/` | kro ResourceGraphDefinitions — one per AWS resource kind (46 kinds) |
-| `crds/` | Governance CRDs only: `KropathConfig` plus 23 per-service `<Service>Config` CRDs |
+| `rgds/` | kro ResourceGraphDefinitions — one per AWS resource kind (227 kinds) |
+| `crds/` | Governance CRDs only: `KropathConfig` plus 57 per-service `<Service>Config` CRDs |
 | `crds/policy/` | `PolicyDocument` CRD for reusable IAM policy documents |
-| `profiles/` | Ready-to-apply governance profiles — a `general-policy` baseline per service (22 services), plus stricter variants where they exist |
-| `tests/` | 74 Chainsaw suites, a `Makefile` per-service target, and cluster setup/teardown |
+| `profiles/` | Ready-to-apply governance profiles — a `general-policy` baseline per service (52 of 57 services; `athena`, `iam`, `managedprometheus`, `opensearch`, and `route53` don't have one yet), plus stricter variants where they exist |
+| `tests/` | 289 Chainsaw suites, a `Makefile` per-service target, and cluster setup/teardown |
 | `hack/` | Local cluster bootstrap and provider-CRD installation scripts |
 | `docs/` | Standards, the RGD error catalog, and dated troubleshooting logs |
 
 ## Implementation status
 
-**46 resource RGDs** across 15 services, **24 governance CRDs**, and **74 Chainsaw test suites**
-covering **1,149 test cases**.
+**227 resource RGDs** across 57 services, **59 governance CRDs**, and **289 Chainsaw test suites**
+covering **4,808 test cases**.
 
 ### Services with resource RGDs
 
@@ -103,33 +106,67 @@ still `⏳ Pending`.
 
 | Service | RGD kinds | Config CRD | Suites | Test cases | AWS integration |
 |---|---|---|---|---|---|
-| API Gateway v2 | `ApiGatewayV2HttpApi`, `ApiGatewayV2WebSocketApi`, `ApiGatewayV2Stage`, `ApiGatewayV2DomainName`, `ApiGatewayV2ApiMapping`, `ApiGatewayV2VpcLink` | `APIGatewayV2Config` | 7 | 86 | ⏳ Pending |
-| Auto Scaling | `AutoScalingGroup` | `AutoScalingConfig` | 2 | 55 | ⏳ Pending |
-| CloudFront | `CloudFrontDistribution`, `CloudFrontCachePolicy`, `CloudFrontOriginRequestPolicy`, `CloudFrontResponseHeadersPolicy`, `CloudFrontOriginAccessControl`, `CloudFrontFunction` | `CloudFrontConfig` | 7 | 84 | ⏳ Pending |
-| DynamoDB | `DynamoDBTable` | `DynamoDBConfig` | 2 | 54 | ⏳ Pending |
-| ECS | `ECSCluster`, `ECSService`, `ECSTaskDefinition`, `ECSCapacityProvider` | `ECSConfig` | 5 | 105 | ⏳ Pending |
-| ELBv2 | `ELBLoadBalancer`, `ELBTargetGroup`, `ELBListener`, `ELBRule` | `ELBConfig` | 5 | 111 | ⏳ Pending |
-| EventBridge | `EventBridgeEventBus`, `EventBridgeRule`, `EventBridgeArchive`, `EventBridgeEndpoint` | `EventBridgeConfig` | 5 | 65 | ⏳ Pending |
-| IAM | `IAMRole`, `IAMPolicy`, `IAMUser`, `IAMGroup`, `IAMIdentityProvider` | `IAMConfig` | 9 | 105 | ⏳ Pending |
-| KMS | `KMSKey` | `KMSConfig` | 2 | 38 | ⏳ Pending |
-| Lambda | `LambdaFunction`, `LambdaAlias`, `LambdaVersion`, `LambdaLayerVersion`, `LambdaEventSourceMapping`, `LambdaFunctionURLConfig`, `LambdaCodeSigningConfig` | `LambdaConfig` | 8 | 119 | ⏳ Pending |
-| RDS | `RDSCluster`, `RDSInstance`, `RDSSubnetGroup` | `RDSConfig` | 4 | 68 | ⏳ Pending |
-| S3 | `S3Bucket` | `S3Config` | 2 | 43 | ⏳ Pending |
-| Secrets Manager | `SecretsManagerSecret` | `SecretsManagerConfig` | 2 | 33 | ⏳ Pending |
-| SNS | `SNSTopic` | `SNSConfig` | 2 | 47 | ⏳ Pending |
-| SQS | `SQSQueue` | `SQSConfig` | 2 | 48 | ⏳ Pending |
+| ACM (Certificate Manager) | `ACMCertificate`, `ACMEDomainValidation`, `ACMEEndpoint`, `ACMPrivateCA`, `ACMPrivateCertificate` | `ACMConfig` | 6 | 83 | ⏳ Pending |
+| API Gateway (v1) | `APIGatewayAPIKey`, `APIGatewayAuthorizer`, `APIGatewayDeployment`, `APIGatewayRestAPI`, `APIGatewayVPCLink` | `APIGatewayConfig` | 6 | 94 | ⏳ Pending |
+| API Gateway v2 | `ApiGatewayV2ApiMapping`, `ApiGatewayV2DomainName`, `ApiGatewayV2HttpApi`, `ApiGatewayV2Stage`, `ApiGatewayV2VpcLink`, `ApiGatewayV2WebSocketApi` | `ApiGatewayV2Config` | 7 | 86 | ⏳ Pending |
+| Amazon MQ | `MQBroker` | `MQConfig` | 2 | 77 | ⏳ Pending |
+| Application Auto Scaling | `AppScalingPolicy`, `AppScalingTarget` | `AppScalingConfig` | 3 | 57 | ⏳ Pending |
+| Athena | `AthenaDataCatalog`, `AthenaPreparedStatement`, `AthenaWorkGroup` | `AthenaConfig` | 4 | 68 | ⏳ Pending |
+| Aurora DSQL | `DSQLCluster` | `DSQLConfig` | 2 | 30 | ⏳ Pending |
+| Auto Scaling | `AutoScalingGroup` | `AutoScalingConfig` | 2 | 61 | ⏳ Pending |
+| Backup | `BackupPlan`, `BackupSelection`, `BackupVault` | `BackupConfig` | 4 | 63 | ⏳ Pending |
+| Bedrock | `BedrockAPIKeyCredentialProvider`, `BedrockAgent`, `BedrockAgentRuntime`, `BedrockAgentRuntimeEndpoint`, `BedrockBrowser`, `BedrockBrowserProfile`, `BedrockCodeInterpreter`, `BedrockGateway`, `BedrockGatewayTarget`, `BedrockHarness`, `BedrockHarnessEndpoint`, `BedrockInferenceProfile`, `BedrockMemory`, `BedrockPolicy`, `BedrockPolicyEngine`, `BedrockWorkloadIdentity` | `BedrockConfig` | 17 | 273 | ⏳ Pending |
+| CloudFront | `CloudFrontCachePolicy`, `CloudFrontConnectionGroup`, `CloudFrontDistribution`, `CloudFrontDistributionTenant`, `CloudFrontFunction`, `CloudFrontOriginAccessControl`, `CloudFrontOriginRequestPolicy`, `CloudFrontResponseHeadersPolicy`, `CloudFrontVPCOrigin` | `CloudFrontConfig` | 10 | 163 | ⏳ Pending |
+| CloudTrail | `CloudTrailEventDataStore`, `CloudTrailTrail` | `CloudTrailConfig` | 3 | 73 | ⏳ Pending |
+| CloudWatch | `CloudWatchAlarm`, `CloudWatchDashboard`, `CloudWatchMetricStream` | `CloudWatchConfig` | 4 | 85 | ⏳ Pending |
+| CloudWatch Logs | `CloudWatchLogsLogGroup` | `CloudWatchLogsConfig` | 2 | 40 | ⏳ Pending |
+| CodeArtifact | `CodeArtifactDomain`, `CodeArtifactPackageGroup` | `CodeArtifactConfig` | 3 | 41 | ⏳ Pending |
+| Cognito | `CognitoUserPool` | `CognitoConfig` | 2 | 49 | ⏳ Pending |
+| DocumentDB | `DocumentDBCluster`, `DocumentDBInstance`, `DocumentDBSubnetGroup` | `DocumentDBConfig` | 4 | 90 | ⏳ Pending |
+| DynamoDB | `DynamoDBTable` | `DynamoDBConfig` | 2 | 56 | ⏳ Pending |
+| EC2 | `EC2DHCPOptions`, `EC2ElasticIP`, `EC2FlowLog`, `EC2Instance`, `EC2InternetGateway`, `EC2LaunchTemplate`, `EC2NATGateway`, `EC2NetworkACL`, `EC2PrefixList`, `EC2RouteTable`, `EC2SecurityGroup`, `EC2Subnet`, `EC2TransitGateway`, `EC2TransitGatewayAttachment`, `EC2VPC`, `EC2VPCEndpoint`, `EC2VPCPeering` | `EC2Config` | 18 | 206 | ⏳ Pending |
+| ECR | `ECRPullThroughCacheRule`, `ECRRepository`, `ECRRepositoryCreationTemplate` | `ECRConfig` | 4 | 68 | ⏳ Pending |
+| ECR Public | `ECRPublicRepository` | `ECRPublicConfig` | 2 | 19 | ⏳ Pending |
+| ECS | `ECSCapacityProvider`, `ECSCluster`, `ECSService`, `ECSTaskDefinition` | `ECSConfig` | 5 | 105 | ⏳ Pending |
+| EFS | `EFSAccessPoint`, `EFSFileSystem`, `EFSMountTarget` | `EFSConfig` | 4 | 70 | ⏳ Pending |
+| EKS | `EKSAccessEntry`, `EKSAddon`, `EKSCluster`, `EKSFargateProfile`, `EKSIdentityProviderConfig`, `EKSNodegroup`, `EKSPodIdentityAssociation` | `EKSConfig` | 8 | 88 | ⏳ Pending |
+| ELBv2 | `ELBListener`, `ELBLoadBalancer`, `ELBRule`, `ELBTargetGroup` | `ELBConfig` | 5 | 116 | ⏳ Pending |
+| EMR | `EMRJobRun`, `EMRServerlessApplication`, `EMRVirtualCluster` | `EMRConfig` | 4 | 87 | ⏳ Pending |
+| ElastiCache | `ElastiCacheCluster`, `ElastiCacheParameterGroup`, `ElastiCacheReplicationGroup`, `ElastiCacheServerless`, `ElastiCacheSubnetGroup`, `ElastiCacheUser`, `ElastiCacheUserGroup` | `ElastiCacheConfig` | 8 | 90 | ⏳ Pending |
+| EventBridge | `EventBridgeArchive`, `EventBridgeEndpoint`, `EventBridgeEventBus`, `EventBridgeRule` | `EventBridgeConfig` | 5 | 66 | ⏳ Pending |
+| EventBridge Pipes | `PipesPipe` | `PipesConfig` | 2 | 39 | ⏳ Pending |
+| Glue | `GlueJob` | `GlueConfig` | 2 | 55 | ⏳ Pending |
+| IAM | `IAMGroup`, `IAMIdentityProvider`, `IAMPolicy`, `IAMRole`, `IAMUser` | `IAMConfig` | 9 | 107 | ⏳ Pending |
+| KMS | `KMSGrant`, `KMSKey` | `KMSConfig` | 3 | 71 | ⏳ Pending |
+| Keyspaces | `KeyspacesKeyspace`, `KeyspacesTable` | `KeyspacesConfig` | 3 | 58 | ⏳ Pending |
+| Kinesis | `KinesisStream` | `KinesisConfig` | 2 | 33 | ⏳ Pending |
+| Lambda | `LambdaAlias`, `LambdaCodeSigningConfig`, `LambdaEventSourceMapping`, `LambdaFunction`, `LambdaFunctionURLConfig`, `LambdaLayerVersion`, `LambdaVersion` | `LambdaConfig` | 8 | 128 | ⏳ Pending |
+| MSK | `MSKCluster`, `MSKConfiguration`, `MSKServerlessCluster`, `MSKVPCConnection` | `MSKConfig` | 5 | 159 | ⏳ Pending |
+| MWAA (Managed Airflow) | `MWAAEnvironment` | `MWAAConfig` | 2 | 49 | ⏳ Pending |
+| Managed Prometheus (AMP) | `ManagedPrometheusAlertManagerDefinition`, `ManagedPrometheusLoggingConfiguration`, `ManagedPrometheusRuleGroupsNamespace`, `ManagedPrometheusWorkspace` | `ManagedPrometheusConfig` | 5 | 61 | ⏳ Pending |
+| MemoryDB | `MemoryDBACL`, `MemoryDBCluster`, `MemoryDBParameterGroup`, `MemoryDBSnapshot`, `MemoryDBSubnetGroup`, `MemoryDBUser` | `MemoryDBConfig` | 7 | 106 | ⏳ Pending |
+| Network Firewall | `NetworkFirewallFirewall`, `NetworkFirewallPolicy`, `NetworkFirewallRuleGroup` | `NetworkFirewallConfig` | 4 | 104 | ⏳ Pending |
+| OpenSearch | `OpenSearchCollection`, `OpenSearchDomain`, `OpenSearchSecurityPolicy`, `OpenSearchVPCEndpoint` | `OpenSearchConfig` | 5 | 92 | ⏳ Pending |
+| Organizations | `OrganizationsAccount`, `OrganizationsOU` | `OrganizationsConfig` | 3 | 52 | ⏳ Pending |
+| QuickSight | `QuickSightAnalysis`, `QuickSightDashboard`, `QuickSightDataSet`, `QuickSightDataSource` | `QuickSightConfig` | 5 | 94 | ⏳ Pending |
+| RAM (Resource Access Manager) | `RAMPermission`, `RAMResourceShare` | `RAMConfig` | 3 | 46 | ⏳ Pending |
+| RDS | `RDSCluster`, `RDSClusterParameterGroup`, `RDSInstance`, `RDSParameterGroup`, `RDSProxy`, `RDSSubnetGroup` | `RDSConfig` | 7 | 123 | ⏳ Pending |
+| Recycle Bin | `RecycleBinRule` | `RecycleBinConfig` | 2 | 37 | ⏳ Pending |
+| Route 53 | `Route53HealthCheck`, `Route53HostedZone`, `Route53RecordSet`, `Route53ResolverEndpoint`, `Route53ResolverQueryLogConfig`, `Route53ResolverQueryLogConfigAssociation`, `Route53ResolverRule`, `Route53ResolverRuleAssociation` | `Route53Config` | 9 | 134 | ⏳ Pending |
+| S3 | `S3Bucket` | `S3Config` | 2 | 97 | ⏳ Pending |
+| S3 Advanced (Tables, Vectors, Files, Control) | `S3ControlAccessPoint`, `S3FilesAccessPoint`, `S3FilesFileSystem`, `S3FilesMountTarget`, `S3TablesNamespace`, `S3TablesTable`, `S3TablesTableBucket`, `S3VectorsIndex`, `S3VectorsVectorBucket` | `S3AdvancedConfig` | 10 | 124 | ⏳ Pending |
+| SES | `SESConfigurationSet` | `SESConfig` | 2 | 22 | ⏳ Pending |
+| SNS | `SNSSubscription`, `SNSTopic` | `SNSConfig` | 3 | 83 | ⏳ Pending |
+| SQS | `SQSQueue` | `SQSConfig` | 2 | 56 | ⏳ Pending |
+| SageMaker | `SageMakerDataQualityJobDefinition`, `SageMakerDomain`, `SageMakerEndpoint`, `SageMakerEndpointConfig`, `SageMakerFeatureGroup`, `SageMakerHyperParameterTuningJob`, `SageMakerModel`, `SageMakerModelBiasJobDefinition`, `SageMakerModelExplainabilityJobDefinition`, `SageMakerModelPackage`, `SageMakerModelPackageGroup`, `SageMakerModelQualityJobDefinition`, `SageMakerMonitoringSchedule`, `SageMakerNotebookInstance`, `SageMakerPipeline`, `SageMakerProcessingJob`, `SageMakerSpace`, `SageMakerTrainingJob`, `SageMakerTransformJob`, `SageMakerUserProfile` | `SageMakerConfig` | 21 | 157 | ⏳ Pending |
+| Secrets Manager | `SecretsManagerSecret` | `SecretsManagerConfig` | 2 | 34 | ⏳ Pending |
+| Step Functions | `StepFunctionsActivity`, `StepFunctionsStateMachine`, `StepFunctionsStateMachineAlias` | `StepFunctionsConfig` | 4 | 85 | ⏳ Pending |
+| Systems Manager (SSM) | `SSMDocument`, `SSMParameter`, `SSMPatchBaseline`, `SSMResourceDataSync` | `SSMConfig` | 5 | 87 | ⏳ Pending |
+| WAF | `WAFIPSet`, `WAFRuleGroup`, `WAFWebACL` | `WAFConfig` | 4 | 101 | ⏳ Pending |
 
 All Chainsaw suites pass in CI (the [RGD Tests](https://github.com/kropath/kropath-aws/actions/workflows/rgd-tests.yaml)
 badge above), but they exercise kro's graph resolution and the resulting ACK CR shape only — no
 AWS API is ever called.
-
-### Governance config only (no resource RGDs yet)
-
-These services ship a `<Service>Config` CRD, a `general-policy` profile, and schema-level tests,
-but no resource RGDs have been implemented yet:
-
-`APIGatewayConfig` (v1) · `CloudWatchLogsConfig` · `EC2Config` · `ECRConfig` · `EFSConfig` ·
-`EKSConfig` · `ElastiCacheConfig` · `MSKConfig`
 
 ### Known gaps
 
