@@ -93,8 +93,13 @@ covering **1,149 test cases**.
 
 **Suites** counts `chainsaw-test.yaml` files; **Test cases** counts the behavioural steps inside
 them (setup and purge steps excluded). **AWS integration** tracks end-to-end validation against a
-live AWS account with real ACK controllers — that work is in progress outside CI, so every service
-is currently `⏳ Pending`.
+live AWS account with real ACK controllers, exercised outside this repo's CI in a separate
+integration-test harness (`kropath-aws-integration-tests`). That harness already maintains live
+resource fixtures for S3, SNS, and SQS, and has confirmed the governance cascade for Lambda against
+a real cluster, but the only fully-investigated resource run so far — S3 — surfaced a real,
+still-open reconciliation bug. A service only moves to `✅ Verified` once it has a confirmed, clean,
+end-to-end passing run with no open issues; none has reached that bar yet, so every row below is
+still `⏳ Pending`.
 
 | Service | RGD kinds | Config CRD | Suites | Test cases | AWS integration |
 |---|---|---|---|---|---|
