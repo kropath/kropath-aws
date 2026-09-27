@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-27
 **Issue:** KRO-1258 (follow-up bug found during verification)
-**Scope:** All 4 Route53Resolver RGDs (`Route53ResolverRuleAssociation`, `Route53ResolverEndpoint`, `Route53ResolverFirewallDomainList`, `Route53ResolverQueryLoggingConfig`)
+**Scope:** All 4 Route53Resolver RGDs (`Route53ResolverEndpoint`, `Route53ResolverQueryLogConfig`, `Route53ResolverRule`, `Route53ResolverRuleAssociation`)
 **Fixed in:** All 4 RGDs during KRO-1258 verification
 
 ## Problem
@@ -37,10 +37,10 @@ Changed all 4 Route53Resolver RGDs' status expression from `effectiveName != ""`
 
 | RGD | File | Change |
 |---|---|---|
-| Route53ResolverRuleAssociation | `rgds/route53resolverruleassociation.yaml` | Updated status.namingStatus CEL |
-| Route53ResolverEndpoint | `rgds/route53resolverendpoint.yaml` | Updated status.namingStatus CEL |
-| Route53ResolverFirewallDomainList | `rgds/route53resolverwallfiredomainlist.yaml` | Updated status.namingStatus CEL |
-| Route53ResolverQueryLoggingConfig | `rgds/route53resolverqueryloggingconfig.yaml` | Updated status.namingStatus CEL |
+| Route53ResolverEndpoint | `rgds/route53resolverendpoint.aws.kropath.run.yaml` | Updated status.namingStatus CEL |
+| Route53ResolverQueryLogConfig | `rgds/route53resolverquerylogconfig.aws.kropath.run.yaml` | Updated status.namingStatus CEL |
+| Route53ResolverRule | `rgds/route53resolverrule.aws.kropath.run.yaml` | Updated status.namingStatus CEL |
+| Route53ResolverRuleAssociation | `rgds/route53resolverruleassociation.aws.kropath.run.yaml` | Updated status.namingStatus CEL |
 
 ## Verification
 
@@ -82,5 +82,5 @@ Test structure per canonical pattern (unique name per step, `skipDelete: true`, 
 
 ## Related resources
 
-- **Pattern reference:** `docs/frequent-rgd-errors.md` § "namingStatus Validation for Unresolved {tag.X} Tokens"
+- **Pattern reference:** `docs/frequent-rgd-errors.md` § "String Template Substitution with `.replace()`" (documents the `result.contains("{")` unresolved-token check)
 - **Public docs:** [Dynamic Tag Fields in Naming Templates](https://github.com/kropath/kropath-docs/blob/main/content/en/docs/concepts/configuration/naming-templates.md) § Troubleshooting
