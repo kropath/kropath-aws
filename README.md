@@ -89,8 +89,10 @@ the canonical `kropath-core/docs/standards/engineering-standards.md`.
 
 ## Implementation status
 
-**227 resource RGDs** across 57 services, **59 governance CRDs**, and **289 Chainsaw test suites**
-covering **4,808 test cases**.
+**227 resource RGDs** across 57 services, **59 governance CRDs** (57 per-service `<Service>Config`
+CRDs, one per service, plus the org-wide `KropathConfig` and the cross-service `PolicyDocument`
+CRD used for reusable IAM policy documents), and **289 Chainsaw test suites** covering **4,808
+test cases**.
 
 ### Services with resource RGDs
 
