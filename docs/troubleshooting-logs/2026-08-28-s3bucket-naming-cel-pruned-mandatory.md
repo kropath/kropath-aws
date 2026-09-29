@@ -36,7 +36,7 @@ child is created — not cluster-wide readiness.
 ## Root Cause
 
 `rgds/s3bucket.yaml` was the only RGD still using unsafe direct CEL map access for
-`namingTemplate`. When the kropath-controller prunes empty values from
+`namingTemplate`. When the kropath-aws-controller prunes empty values from
 `status.effectiveConfig`, a tenant `S3Config` with `mandatory.namingTemplate: ""` results
 in a `mandatory` map that contains only `tags` — the `namingTemplate` key is absent
 entirely.

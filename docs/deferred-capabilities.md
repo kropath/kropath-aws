@@ -131,7 +131,7 @@ supply and merge the role ARN by hand. Full detail and rationale:
 `onboarding/tenant-namespace/README.md` § "Why `ack-role-account-map` is not rendered here".
 
 **To unblock:** either a platform-owned reconciler for `ack-role-account-map` (out of scope —
-ADR-003 keeps kropath-controller a pure config store with no such write surface), or rely on
+ADR-003 keeps kropath-aws-controller a pure config store with no such write surface), or rely on
 the KRO-1141 install-conformance checker to catch a mismatched entry after the fact.
 
 ---

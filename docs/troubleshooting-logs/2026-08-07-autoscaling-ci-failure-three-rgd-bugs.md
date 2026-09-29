@@ -57,7 +57,7 @@ field minSize: marker key 'required' without a value
 ### effectiveConfig not seeded (wait-for-controller pattern)
 
 The autoscaling test setup used a `until kubectl get autoscalingconfig ...` loop waiting for
-`kropath-controller` to populate `status.effectiveConfig`. No `kropath-controller` runs in the
+`kropath-aws-controller` to populate `status.effectiveConfig`. No `kropath-aws-controller` runs in the
 local kind cluster (matching all other suites). The loop timed out.
 
 **Fix:** replace with a `kubectl patch --subresource=status --type=merge` loop that seeds
