@@ -65,7 +65,7 @@ purely additive to the KRO-1140 baseline behavior.
 
 Three defects collapse into one artifact (full detail: `kropath-core` KRO-1139):
 
-- **No race.** kro and kropath-controller are independent reconcile loops with no ordering
+- **No race.** kro and kropath-aws-controller are independent reconcile loops with no ordering
   between them. A resource namespace with no local `<Family>Config` gets no reconcile at all
   (ADR-015 §5.9) — not a retry, a permanent stall — so the config CR must exist *before* the
   first resource instance, not be created lazily on first use.
@@ -157,5 +157,5 @@ the role ARN — but never the account ID half, and never hand-copy it into YAML
 strictly weaker than "unconstructible": a human can still bind `accountId` to a role ARN in
 the wrong account. It is the honest ceiling for a per-tenant, GitOps-rendered artifact; closing
 it fully needs either a platform-owned reconciler for that ConfigMap (out of scope — ADR-003
-keeps kropath-controller a pure config store with no such write surface) or the
+keeps kropath-aws-controller a pure config store with no such write surface) or the
 `kropath-aws` KRO-1141 install-conformance checker catching the mismatch after the fact.

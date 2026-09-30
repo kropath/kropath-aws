@@ -2246,7 +2246,7 @@ intelligentTiering: >-
   `selfHeal: true`-managed** cluster with real ACK controllers running (ack-chart-lambda, -kms,
   -iam, …) and ArgoCD Applications (`kropath-aws`, `kro`, `ack`, …) reconciling it continuously
   across all sessions. Applying a work-in-progress RGD schema there, then running a Chainsaw suite
-  against it, does real damage: the live `kropath-controller` overwrites the Chainsaw suite's mock
+  against it, does real damage: the live `kropath-aws-controller` overwrites the Chainsaw suite's mock
   `kubectl patch --subresource=status` calls with real cascade output (every assert then fails with
   a 5-minute timeout, not a clear error), test-namespace clutter is created on a cluster other
   sessions share, and — worst — a later `kubectl delete crd` to "fix" a schema mismatch leaves the

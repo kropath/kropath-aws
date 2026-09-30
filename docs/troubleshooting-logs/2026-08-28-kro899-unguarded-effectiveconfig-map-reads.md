@@ -18,7 +18,7 @@ error affects any integer, boolean, or string field with a zero/false/"" value i
 
 ## Root Cause
 
-The kropath-controller **prunes zero-value fields** from `status.effectiveConfig` when writing the
+The kropath-aws-controller **prunes zero-value fields** from `status.effectiveConfig` when writing the
 effective config back to the governance Config CR. A field set to `0`, `false`, or `""` in
 `spec.mandatory` or `spec.defaults` is omitted entirely from the corresponding
 `status.effectiveConfig.mandatory` / `status.effectiveConfig.defaults` map.
